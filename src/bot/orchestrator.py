@@ -1452,11 +1452,20 @@ class MessageOrchestrator:
 
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""
+        api_key_env = self.settings.voice_provider_api_key_env
+        if api_key_env:
+            return (
+                "Voice processing is not available. "
+                f"Set {api_key_env} "
+                f"for {self.settings.voice_provider_display_name} and install "
+                'voice extras with: pip install "claude-code-telegram[voice]"'
+            )
+        # Local provider (Parakeet) -- no API key, different install instructions
         return (
             "Voice processing is not available. "
-            f"Set {self.settings.voice_provider_api_key_env} "
-            f"for {self.settings.voice_provider_display_name} and install "
-            'voice extras with: pip install "claude-code-telegram[voice]"'
+            f"Install {self.settings.voice_provider_display_name} with: "
+            'pip install "claude-code-telegram[voice-local]" '
+            "and ensure ffmpeg is installed."
         )
 
     async def agentic_repo(
