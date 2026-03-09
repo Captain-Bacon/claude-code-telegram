@@ -112,9 +112,46 @@ def _tool_icon(name: str) -> str:
 class MessageOrchestrator:
     """Routes messages based on mode. Single entry point for all Telegram updates."""
 
+    _CONTEXT_THRESHOLDS = [70, 60, 50, 40, 35, 30, 25, 20, 15, 10, 5]
+
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+
+    @staticmethod
+    def _context_warning(
+        response: Any,
+        user_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Return a context-window warning if a NEW threshold is crossed."""
+        if not getattr(response, "context_window", None) or not getattr(
+            response, "total_input_tokens", None
+        ):
+            return None
+        used_pct = (response.total_input_tokens / response.context_window) * 100
+        remaining_pct = 100 - used_pct
+        if remaining_pct > MessageOrchestrator._CONTEXT_THRESHOLDS[0]:
+            return None
+        level = None
+        for threshold in MessageOrchestrator._CONTEXT_THRESHOLDS:
+            if remaining_pct <= threshold:
+                level = threshold
+            else:
+                break
+        if level is None:
+            return None
+        if user_data is not None:
+            last_warned = user_data.get("_context_last_warned")
+            if last_warned is not None and last_warned <= level:
+                return None
+            user_data["_context_last_warned"] = level
+        if level <= 15:
+            icon = "❗"
+        elif level <= 35:
+            icon = "⚠️"
+        else:
+            icon = "ℹ️"
+        return f"\n\n{icon} {level}% context remaining"
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -307,6 +344,7 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("model", self.agentic_model),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -416,6 +454,7 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("model", "Switch Claude model"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -505,8 +544,43 @@ class MessageOrchestrator:
         context.user_data["claude_session_id"] = None
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
+        context.user_data.pop("_context_last_warned", None)
 
         await update.message.reply_text("Session reset. What's next?")
+
+    async def agentic_model(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Switch Claude model at runtime."""
+        aliases = {
+            "opus": "claude-opus-4-6",
+            "sonnet": "claude-sonnet-4-6",
+            "haiku": "claude-haiku-4-5-20251001",
+        }
+        args = update.message.text.split()[1:] if update.message.text else []
+        if not args:
+            current = context.user_data.get("claude_model")
+            display = current or "default (CLI decides)"
+            await update.message.reply_text(
+                f"Model: <b>{escape_html(display)}</b>\n\n"
+                "Usage: <code>/model opus|sonnet|haiku|default</code>",
+                parse_mode="HTML",
+            )
+            return
+        choice = args[0].lower()
+        if choice == "default":
+            context.user_data.pop("claude_model", None)
+            await update.message.reply_text(
+                "Model reset to <b>default</b> (CLI decides)",
+                parse_mode="HTML",
+            )
+            return
+        model_id = aliases.get(choice, choice)
+        context.user_data["claude_model"] = model_id
+        await update.message.reply_text(
+            f"Model set to <b>{escape_html(model_id)}</b>",
+            parse_mode="HTML",
+        )
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -532,8 +606,13 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
+        model_str = ""
+        current_model = context.user_data.get("claude_model")
+        if current_model:
+            model_str = f" · Model: {current_model}"
+
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
+            f"📂 {dir_display} · Session: {session_status}{cost_str}{model_str}"
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -941,6 +1020,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                model=context.user_data.get("claude_model"),
             )
 
             # New session created successfully — clear the one-shot flag
@@ -977,6 +1057,11 @@ class MessageOrchestrator:
             formatted_messages = formatter.format_claude_response(
                 claude_response.content
             )
+
+            # Append context window warning if threshold crossed
+            ctx_warn = self._context_warning(claude_response, context.user_data)
+            if ctx_warn and formatted_messages:
+                formatted_messages[-1].text += ctx_warn
 
         except Exception as e:
             success = False
@@ -1185,6 +1270,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                model=context.user_data.get("claude_model"),
             )
 
             if force_new:
@@ -1204,6 +1290,11 @@ class MessageOrchestrator:
             formatted_messages = formatter.format_claude_response(
                 claude_response.content
             )
+
+            # Append context window warning if threshold crossed
+            ctx_warn = self._context_warning(claude_response, context.user_data)
+            if ctx_warn and formatted_messages:
+                formatted_messages[-1].text += ctx_warn
 
             try:
                 await progress_msg.delete()
@@ -1384,6 +1475,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                model=context.user_data.get("claude_model"),
             )
         finally:
             heartbeat.cancel()
@@ -1403,6 +1495,11 @@ class MessageOrchestrator:
 
         formatter = ResponseFormatter(self.settings)
         formatted_messages = formatter.format_claude_response(claude_response.content)
+
+        # Append context window warning if threshold crossed
+        ctx_warn = self._context_warning(claude_response, context.user_data)
+        if ctx_warn and formatted_messages:
+            formatted_messages[-1].text += ctx_warn
 
         try:
             await progress_msg.delete()

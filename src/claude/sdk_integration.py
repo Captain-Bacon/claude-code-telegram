@@ -53,6 +53,8 @@ class ClaudeResponse:
     is_error: bool = False
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    context_window: Optional[int] = None
+    total_input_tokens: Optional[int] = None
 
 
 @dataclass
@@ -153,6 +155,7 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        model: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -197,7 +200,7 @@ class ClaudeSDKManager:
             # Build Claude Agent options
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
-                model=self.config.claude_model or None,
+                model=model or self.config.claude_model or None,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,
@@ -240,8 +243,10 @@ class ClaudeSDKManager:
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
+            result_raw_data: Dict[str, Any] = {}
 
             async def _run_client() -> None:
+                nonlocal result_raw_data
                 # Use connect(None) + query(prompt) pattern because
                 # can_use_tool requires the prompt as AsyncIterable, not
                 # a plain string. connect(None) uses an empty async
@@ -271,6 +276,7 @@ class ClaudeSDKManager:
                         messages.append(message)
 
                         if isinstance(message, ResultMessage):
+                            result_raw_data.update(raw_data)
                             break
 
                         # Handle streaming callback
@@ -364,6 +370,19 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts)
 
+            # Extract context window info from modelUsage
+            context_window = None
+            total_input_tokens = None
+            model_usage = result_raw_data.get("modelUsage", {})
+            if model_usage:
+                first_model = next(iter(model_usage.values()), {})
+                context_window = first_model.get("contextWindow")
+                total_input_tokens = (
+                    first_model.get("inputTokens", 0)
+                    + first_model.get("cacheReadInputTokens", 0)
+                    + first_model.get("cacheCreationInputTokens", 0)
+                )
+
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
@@ -377,6 +396,8 @@ class ClaudeSDKManager:
                     ]
                 ),
                 tools_used=tools_used,
+                context_window=context_window,
+                total_input_tokens=total_input_tokens,
             )
 
         except asyncio.TimeoutError:
