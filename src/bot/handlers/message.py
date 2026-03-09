@@ -1021,13 +1021,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     voice_handler = features.get_voice_handler() if features else None
 
     if not voice_handler:
+        api_key_env = settings.voice_provider_api_key_env
+        if api_key_env:
+            setup_hint = (
+                f"Set <code>{api_key_env}</code> to enable.\n"
+                "Install optional voice deps with "
+                '<code>pip install "claude-code-telegram[voice]"</code>.'
+            )
+        else:
+            setup_hint = (
+                "Install with "
+                '<code>pip install "claude-code-telegram[voice-local]"</code> '
+                "and ensure ffmpeg is installed."
+            )
         await update.message.reply_text(
             "🎙️ <b>Voice Messages</b>\n\n"
             "Voice transcription is not available.\n"
             f"Provider: <code>{settings.voice_provider_display_name}</code>\n"
-            f"Set <code>{settings.voice_provider_api_key_env}</code> to enable.\n"
-            "Install optional voice deps with "
-            '<code>pip install "claude-code-telegram[voice]"</code>.',
+            f"{setup_hint}",
             parse_mode="HTML",
         )
         return

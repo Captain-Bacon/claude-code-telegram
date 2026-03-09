@@ -1,7 +1,11 @@
-"""Handle voice message transcription via Mistral (Voxtral) or OpenAI (Whisper)."""
+"""Handle voice message transcription via Mistral, OpenAI, or Parakeet MLX."""
 
+import asyncio
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Optional
 
 import structlog
@@ -22,12 +26,13 @@ class ProcessedVoice:
 
 
 class VoiceHandler:
-    """Transcribe Telegram voice messages using Mistral or OpenAI."""
+    """Transcribe Telegram voice messages using Mistral, OpenAI, or Parakeet MLX."""
 
     def __init__(self, config: Settings):
         self.config = config
         self._mistral_client: Optional[Any] = None
         self._openai_client: Optional[Any] = None
+        self._parakeet_available: Optional[bool] = None
 
     def _ensure_allowed_file_size(self, file_size: Optional[int]) -> None:
         """Reject files that exceed the configured max size."""
@@ -48,7 +53,7 @@ class VoiceHandler:
         """Download and transcribe a voice message.
 
         1. Download .ogg bytes from Telegram
-        2. Call the configured transcription API (Mistral or OpenAI)
+        2. Call the configured transcription provider (Mistral, OpenAI, or Parakeet)
         3. Build a prompt combining caption + transcription
         """
         initial_file_size = getattr(voice, "file_size", None)
@@ -79,7 +84,9 @@ class VoiceHandler:
             file_size=initial_file_size or resolved_file_size or len(voice_bytes),
         )
 
-        if self.config.voice_provider == "openai":
+        if self.config.voice_provider == "parakeet":
+            transcription = await self._transcribe_parakeet(voice_bytes)
+        elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
         else:
             transcription = await self._transcribe_mistral(voice_bytes)
@@ -102,6 +109,8 @@ class VoiceHandler:
             transcription=transcription,
             duration=duration_secs,
         )
+
+    # -- Mistral provider ---------------------------------------------------
 
     async def _transcribe_mistral(self, voice_bytes: bytes) -> str:
         """Transcribe audio using the Mistral API (Voxtral)."""
@@ -147,6 +156,8 @@ class VoiceHandler:
         self._mistral_client = Mistral(api_key=api_key)
         return self._mistral_client
 
+    # -- OpenAI provider ----------------------------------------------------
+
     async def _transcribe_openai(self, voice_bytes: bytes) -> str:
         """Transcribe audio using the OpenAI Whisper API."""
         client = self._get_openai_client()
@@ -187,3 +198,147 @@ class VoiceHandler:
 
         self._openai_client = AsyncOpenAI(api_key=api_key)
         return self._openai_client
+
+    # -- Parakeet MLX provider (local, Mac-only) ----------------------------
+
+    async def _transcribe_parakeet(self, voice_bytes: bytes) -> str:
+        """Transcribe audio locally using Parakeet MLX.
+
+        Parakeet runs on-device via Apple MLX -- no cloud API, no API key.
+        Requires ffmpeg for OGG-to-WAV conversion and the parakeet-mlx CLI.
+        """
+        self._check_parakeet_available()
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="parakeet_"))
+        ogg_path = tmp_dir / "voice.ogg"
+        wav_path = tmp_dir / "voice.wav"
+        txt_path = tmp_dir / "voice.txt"
+
+        try:
+            # Write OGG bytes to disk (Telegram sends voice as OGG/Opus)
+            ogg_path.write_bytes(voice_bytes)
+
+            # Convert OGG -> WAV via ffmpeg (Parakeet needs WAV input)
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            str(ogg_path),
+                            "-ar",
+                            "16000",
+                            "-ac",
+                            "1",
+                            str(wav_path),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    ),
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "ffmpeg is required for Parakeet voice transcription but was not "
+                    "found. Install it via: brew install ffmpeg (macOS) or "
+                    "apt install ffmpeg (Linux)"
+                ) from exc
+            except subprocess.CalledProcessError as exc:
+                logger.warning(
+                    "ffmpeg OGG-to-WAV conversion failed",
+                    error=getattr(exc, "stderr", b"").decode(errors="replace"),
+                )
+                raise RuntimeError(
+                    "Failed to convert voice message to WAV format."
+                ) from exc
+            finally:
+                ogg_path.unlink(missing_ok=True)
+
+            # Run parakeet-mlx CLI in executor (blocking ML inference)
+            model = self.config.resolved_voice_model
+            logger.info("Running Parakeet MLX transcription", model=model)
+
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        [
+                            "parakeet-mlx",
+                            str(wav_path),
+                            "--model",
+                            model,
+                            "--output-format",
+                            "txt",
+                            "--output-dir",
+                            str(tmp_dir),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ),
+                )
+            except subprocess.CalledProcessError as exc:
+                logger.warning(
+                    "Parakeet MLX transcription failed",
+                    error=getattr(exc, "stderr", ""),
+                )
+                raise RuntimeError(
+                    "Parakeet MLX transcription failed."
+                ) from exc
+
+            text = txt_path.read_text().strip() if txt_path.exists() else ""
+            if not text:
+                raise ValueError(
+                    "Parakeet MLX transcription returned an empty response."
+                )
+            return text
+
+        finally:
+            # Clean up temp files
+            for p in (ogg_path, wav_path, txt_path):
+                p.unlink(missing_ok=True)
+            try:
+                tmp_dir.rmdir()
+            except OSError:
+                pass
+
+    def _check_parakeet_available(self) -> None:
+        """Verify that parakeet-mlx CLI and ffmpeg are available."""
+        if self._parakeet_available is True:
+            return
+
+        # Check ffmpeg
+        try:
+            subprocess.run(
+                ["ffmpeg", "-version"],
+                check=True,
+                capture_output=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            self._parakeet_available = False
+            raise RuntimeError(
+                "ffmpeg is required for Parakeet voice transcription but was not "
+                "found. Install it via: brew install ffmpeg (macOS) or "
+                "apt install ffmpeg (Linux)"
+            ) from exc
+
+        # Check parakeet-mlx
+        try:
+            subprocess.run(
+                ["parakeet-mlx", "--help"],
+                check=True,
+                capture_output=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            self._parakeet_available = False
+            raise RuntimeError(
+                "parakeet-mlx is not installed. Install it via: "
+                'pip install "claude-code-telegram[voice-local]" '
+                "or: pip install parakeet-mlx"
+            ) from exc
+
+        self._parakeet_available = True
+        logger.info("Parakeet MLX voice provider available")

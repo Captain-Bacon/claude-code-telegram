@@ -169,9 +169,13 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
-    voice_provider: Literal["mistral", "openai"] = Field(
+    voice_provider: Literal["mistral", "openai", "parakeet"] = Field(
         "mistral",
-        description="Voice transcription provider: 'mistral' or 'openai'",
+        description="Voice transcription provider: 'mistral', 'openai', or 'parakeet'",
+    )
+    parakeet_model: str = Field(
+        "mlx-community/parakeet-tdt-0.6b-v2",
+        description="Parakeet MLX model for local voice transcription",
     )
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
@@ -395,8 +399,10 @@ class Settings(BaseSettings):
         if v is None:
             return "mistral"
         provider = str(v).strip().lower()
-        if provider not in {"mistral", "openai"}:
-            raise ValueError("voice_provider must be one of ['mistral', 'openai']")
+        if provider not in {"mistral", "openai", "parakeet"}:
+            raise ValueError(
+                "voice_provider must be one of ['mistral', 'openai', 'parakeet']"
+            )
         return provider
 
     @field_validator("project_threads_chat_id", mode="before")
@@ -503,6 +509,8 @@ class Settings(BaseSettings):
             return self.voice_transcription_model
         if self.voice_provider == "openai":
             return "whisper-1"
+        if self.voice_provider == "parakeet":
+            return self.parakeet_model
         return "voxtral-mini-latest"
 
     @property
@@ -511,8 +519,10 @@ class Settings(BaseSettings):
         return self.voice_max_file_size_mb * 1024 * 1024
 
     @property
-    def voice_provider_api_key_env(self) -> str:
+    def voice_provider_api_key_env(self) -> Optional[str]:
         """API key environment variable required for the configured voice provider."""
+        if self.voice_provider == "parakeet":
+            return None  # Local provider, no API key needed
         if self.voice_provider == "openai":
             return "OPENAI_API_KEY"
         return "MISTRAL_API_KEY"
@@ -520,6 +530,8 @@ class Settings(BaseSettings):
     @property
     def voice_provider_display_name(self) -> str:
         """Human-friendly label for the configured voice provider."""
+        if self.voice_provider == "parakeet":
+            return "Parakeet MLX (local)"
         if self.voice_provider == "openai":
             return "OpenAI Whisper"
         return "Mistral Voxtral"
