@@ -775,6 +775,7 @@ class MessageOrchestrator:
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
+        intermediate_texts: Optional[List[str]] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
@@ -786,13 +787,22 @@ class MessageOrchestrator:
         text are streamed to the user in real time via
         ``sendMessageDraft``.
 
+        When *intermediate_texts* is provided, full text from assistant
+        messages that accompany tool calls is collected so it can be
+        sent as persistent Telegram messages after streaming completes.
+
         Returns None when verbose_level is 0 **and** no MCP image
         collection or draft streaming is requested.
         Typing indicators are handled by a separate heartbeat task.
         """
         need_mcp_intercept = mcp_images is not None and approved_directory is not None
 
-        if verbose_level == 0 and not need_mcp_intercept and draft_streamer is None:
+        if (
+            verbose_level == 0
+            and not need_mcp_intercept
+            and draft_streamer is None
+            and intermediate_texts is None
+        ):
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
@@ -836,6 +846,14 @@ class MessageOrchestrator:
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text:
+                    # Collect full intermediate text when tool calls are
+                    # also present — this means Claude wrote reasoning
+                    # alongside/before tool use.  These blocks would
+                    # otherwise be lost because ResultMessage.result only
+                    # contains the final response text.
+                    if intermediate_texts is not None and update_obj.tool_calls:
+                        intermediate_texts.append(text)
+
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
                         if verbose_level >= 1:
@@ -867,6 +885,51 @@ class MessageOrchestrator:
                         pass
 
         return _on_stream
+
+    async def _send_intermediate_texts(
+        self,
+        update: Update,
+        intermediate_texts: List[str],
+    ) -> None:
+        """Send collected intermediate reasoning texts as persistent messages.
+
+        These are text blocks Claude wrote alongside tool calls — analysis,
+        reasoning, and commentary that would otherwise be lost because
+        ``ResultMessage.result`` only contains the final response.
+
+        Each text block is sent as a separate Telegram message with a
+        subtle prefix to distinguish it from the final response.
+        """
+        from .utils.formatting import ResponseFormatter
+
+        formatter = ResponseFormatter(self.settings)
+
+        for text in intermediate_texts:
+            if not text.strip():
+                continue
+            formatted = formatter.format_claude_response(text)
+            for msg in formatted:
+                if not msg.text or not msg.text.strip():
+                    continue
+                try:
+                    await update.message.reply_text(
+                        msg.text,
+                        parse_mode=msg.parse_mode,
+                        reply_markup=None,
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception as send_err:
+                    logger.warning(
+                        "Failed to send intermediate text",
+                        error=str(send_err),
+                    )
+                    try:
+                        await update.message.reply_text(
+                            text,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
 
     async def _send_images(
         self,
@@ -1004,6 +1067,7 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
+        intermediate_texts: List[str] = []
 
         # Stream drafts (private chats only)
         draft_streamer: Optional[DraftStreamer] = None
@@ -1024,6 +1088,7 @@ class MessageOrchestrator:
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
+            intermediate_texts=intermediate_texts,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -1110,6 +1175,10 @@ class MessageOrchestrator:
             await progress_msg.delete()
         except Exception:
             logger.debug("Failed to delete progress message, ignoring")
+
+        # Send intermediate reasoning texts as persistent messages
+        if success and intermediate_texts:
+            await self._send_intermediate_texts(update, intermediate_texts)
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         images: List[ImageAttachment] = mcp_images
@@ -1278,6 +1347,7 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_doc: List[ImageAttachment] = []
+        intermediate_texts_doc: List[str] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -1285,6 +1355,7 @@ class MessageOrchestrator:
             time.time(),
             mcp_images=mcp_images_doc,
             approved_directory=self.settings.approved_directory,
+            intermediate_texts=intermediate_texts_doc,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
@@ -1326,6 +1397,10 @@ class MessageOrchestrator:
                 await progress_msg.delete()
             except Exception:
                 logger.debug("Failed to delete progress message, ignoring")
+
+            # Send intermediate reasoning texts as persistent messages
+            if intermediate_texts_doc:
+                await self._send_intermediate_texts(update, intermediate_texts_doc)
 
             # Use MCP-collected images (from send_image_to_user tool calls)
             images: List[ImageAttachment] = mcp_images_doc
@@ -1490,6 +1565,7 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_media: List[ImageAttachment] = []
+        intermediate_texts_media: List[str] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -1497,6 +1573,7 @@ class MessageOrchestrator:
             time.time(),
             mcp_images=mcp_images_media,
             approved_directory=self.settings.approved_directory,
+            intermediate_texts=intermediate_texts_media,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
@@ -1548,6 +1625,10 @@ class MessageOrchestrator:
             await progress_msg.delete()
         except Exception:
             logger.debug("Failed to delete progress message, ignoring")
+
+        # Send intermediate reasoning texts as persistent messages
+        if intermediate_texts_media:
+            await self._send_intermediate_texts(update, intermediate_texts_media)
 
         # Use MCP-collected images (from send_image_to_user tool calls).
         images: List[ImageAttachment] = mcp_images_media
