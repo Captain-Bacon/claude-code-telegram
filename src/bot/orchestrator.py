@@ -115,6 +115,8 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        # Track active Claude tasks per user so /stop can cancel them
+        self._active_tasks: Dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -308,6 +310,7 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
+            ("stop", self.agentic_stop),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -417,6 +420,7 @@ class MessageOrchestrator:
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
+                BotCommand("stop", "Cancel the current Claude request"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -577,6 +581,20 @@ class MessageOrchestrator:
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
             parse_mode="HTML",
         )
+
+    async def agentic_stop(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Cancel the active Claude request for this user."""
+        user_id = update.effective_user.id
+        task = self._active_tasks.get(user_id)
+
+        if task and not task.done():
+            task.cancel()
+            await update.message.reply_text("Stopping current request...")
+            logger.info("User cancelled active task", user_id=user_id)
+        else:
+            await update.message.reply_text("Nothing running to stop.")
 
     def _format_verbose_progress(
         self,
@@ -933,6 +951,7 @@ class MessageOrchestrator:
         heartbeat = self._start_typing_heartbeat(chat)
 
         success = True
+        self._active_tasks[user_id] = asyncio.current_task()  # type: ignore[assignment]
         try:
             claude_response = await claude_integration.run_command(
                 prompt=message_text,
@@ -978,6 +997,12 @@ class MessageOrchestrator:
                 claude_response.content
             )
 
+        except asyncio.CancelledError:
+            success = False
+            logger.info("Claude request cancelled by user", user_id=user_id)
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [FormattedMessage("Stopped.", parse_mode=None)]
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
@@ -988,6 +1013,7 @@ class MessageOrchestrator:
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
         finally:
+            self._active_tasks.pop(user_id, None)
             heartbeat.cancel()
             if draft_streamer:
                 try:
@@ -1376,6 +1402,7 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
+        self._active_tasks[user_id] = asyncio.current_task()  # type: ignore[assignment]
         try:
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
@@ -1385,7 +1412,16 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
             )
+        except asyncio.CancelledError:
+            logger.info("Claude media request cancelled by user", user_id=user_id)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            await update.message.reply_text("Stopped.")
+            return
         finally:
+            self._active_tasks.pop(user_id, None)
             heartbeat.cancel()
 
         if force_new:
