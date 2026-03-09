@@ -1053,6 +1053,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             voice, update.message.caption
         )
 
+        # Show transcription so the user can see what was heard
+        transcription_text = escape_html(processed_voice.transcription)
+        await update.message.reply_text(
+            f"\U0001f3a4 <b>Transcription:</b>\n{transcription_text}",
+            parse_mode="HTML",
+        )
+
         await progress_msg.edit_text(
             "🤖 Processing transcription with Claude...", parse_mode="HTML"
         )
