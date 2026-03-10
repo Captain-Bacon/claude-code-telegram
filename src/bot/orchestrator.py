@@ -775,7 +775,7 @@ class MessageOrchestrator:
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
-        intermediate_texts: Optional[List[str]] = None,
+        telegram_update: Optional[Any] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
@@ -787,25 +787,119 @@ class MessageOrchestrator:
         text are streamed to the user in real time via
         ``sendMessageDraft``.
 
-        When *intermediate_texts* is provided, full text from assistant
-        messages that accompany tool calls is collected so it can be
-        sent as persistent Telegram messages after streaming completes.
+        When *telegram_update* is provided, Claude's text commentary
+        between tool calls is sent as persistent Telegram messages
+        immediately (not batched until the end).  Thinking blocks are
+        sent as ephemeral messages visible during streaming and deleted
+        once the final response is delivered.
 
         Returns None when verbose_level is 0 **and** no MCP image
         collection or draft streaming is requested.
         Typing indicators are handled by a separate heartbeat task.
         """
+        import html as html_mod
+
         need_mcp_intercept = mcp_images is not None and approved_directory is not None
 
         if (
             verbose_level == 0
             and not need_mcp_intercept
             and draft_streamer is None
-            and intermediate_texts is None
+            and telegram_update is None
         ):
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
+
+        # Batching state for rapid-fire text blocks (rate-limit safety).
+        # We accumulate text for up to _TEXT_BATCH_WINDOW seconds before
+        # sending a single persistent message.
+        _TEXT_BATCH_WINDOW = 1.5  # seconds
+        _pending_text: List[str] = []
+        _pending_thinking: List[str] = []
+        _thinking_message_ids: List[int] = []
+        _text_batch_task: List[Optional[asyncio.Task]] = [None]
+
+        async def _flush_pending_text() -> None:
+            """Send accumulated text/thinking as persistent messages."""
+            if not telegram_update:
+                return
+
+            # Flush thinking as ephemeral messages (deleted after final response)
+            if _pending_thinking:
+                from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+
+                thinking_text = "\n\n".join(_pending_thinking)
+                _pending_thinking.clear()
+                escaped = html_mod.escape(thinking_text)
+                # Reserve space for prefix "🧠 " (6 bytes encoded)
+                prefix = "\U0001f9e0 "
+                max_content = TELEGRAM_MAX_MESSAGE_LENGTH - len(prefix)
+                if len(escaped) > max_content:
+                    escaped = escaped[: max_content - 1] + "\u2026"
+                thinking_msg = f"{prefix}{escaped}"
+                try:
+                    sent = await telegram_update.effective_message.reply_text(
+                        thinking_msg,
+                        parse_mode="HTML",
+                    )
+                    _thinking_message_ids.append(sent.message_id)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.debug("Failed to send thinking message", error=str(e))
+
+            # Flush commentary text
+            if _pending_text:
+                combined = "\n\n".join(_pending_text)
+                _pending_text.clear()
+                if not combined.strip():
+                    return
+
+                from .utils.formatting import ResponseFormatter
+
+                formatter = ResponseFormatter(self.settings)
+                formatted = formatter.format_claude_response(combined)
+                for msg in formatted:
+                    if not msg.text or not msg.text.strip():
+                        continue
+                    try:
+                        await telegram_update.effective_message.reply_text(
+                            msg.text,
+                            parse_mode=msg.parse_mode,
+                            reply_markup=None,
+                        )
+                        await asyncio.sleep(0.3)
+                    except Exception as send_err:
+                        logger.warning(
+                            "Failed to send intermediate text",
+                            error=str(send_err),
+                        )
+                        # Fallback: send as plain text
+                        try:
+                            await telegram_update.effective_message.reply_text(
+                                combined,
+                                reply_markup=None,
+                            )
+                        except Exception:
+                            pass
+
+        async def _schedule_flush() -> None:
+            """Wait for the batch window then flush."""
+            await asyncio.sleep(_TEXT_BATCH_WINDOW)
+            await _flush_pending_text()
+            _text_batch_task[0] = None
+
+        async def _enqueue_text(text: str, is_thinking: bool = False) -> None:
+            """Add text to the pending batch and schedule a flush."""
+            if is_thinking:
+                _pending_thinking.append(text)
+            else:
+                _pending_text.append(text)
+
+            # Cancel any existing scheduled flush and restart the timer
+            if _text_batch_task[0] is not None:
+                _text_batch_task[0].cancel()
+            _text_batch_task[0] = asyncio.create_task(_schedule_flush())
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
             # Intercept send_image_to_user MCP tool calls.
@@ -842,17 +936,25 @@ class MessageOrchestrator:
                         )
                         await draft_streamer.append_tool(line)
 
+            # Send thinking blocks as ephemeral messages (deleted after response)
+            if update_obj.type == "thinking" and update_obj.content:
+                text = update_obj.content.strip()
+                if text and telegram_update:
+                    await _enqueue_text(text, is_thinking=True)
+                if draft_streamer:
+                    first_line = text.split("\n", 1)[0].strip() if text else ""
+                    if first_line:
+                        await draft_streamer.append_tool(
+                            f"\U0001f914 {first_line[:80]}"
+                        )
+
             # Capture assistant text (reasoning / commentary)
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text:
-                    # Collect full intermediate text when tool calls are
-                    # also present — this means Claude wrote reasoning
-                    # alongside/before tool use.  These blocks would
-                    # otherwise be lost because ResultMessage.result only
-                    # contains the final response text.
-                    if intermediate_texts is not None and update_obj.tool_calls:
-                        intermediate_texts.append(text)
+                    # Send text commentary as persistent message immediately
+                    if telegram_update and update_obj.tool_calls:
+                        await _enqueue_text(text)
 
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
@@ -884,52 +986,54 @@ class MessageOrchestrator:
                     except Exception:
                         pass
 
+        async def _delete_thinking_messages() -> None:
+            """Delete all ephemeral thinking messages sent during streaming."""
+            if not telegram_update or not _thinking_message_ids:
+                return
+            chat = telegram_update.effective_message.chat
+            for msg_id in _thinking_message_ids:
+                try:
+                    await chat.delete_message(msg_id)
+                except Exception as e:
+                    logger.debug(
+                        "Failed to delete thinking message",
+                        message_id=msg_id,
+                        error=str(e),
+                    )
+            _thinking_message_ids.clear()
+
+        # Attach flush function so callers can drain pending text
+        _on_stream.flush_pending = _flush_pending_text  # type: ignore[attr-defined]
+        _on_stream.delete_thinking = _delete_thinking_messages  # type: ignore[attr-defined]
+
         return _on_stream
 
-    async def _send_intermediate_texts(
+    async def _flush_stream_callback(
         self,
-        update: Update,
-        intermediate_texts: List[str],
+        on_stream: Optional[Callable],
     ) -> None:
-        """Send collected intermediate reasoning texts as persistent messages.
+        """Flush any pending batched text from the stream callback.
 
-        These are text blocks Claude wrote alongside tool calls — analysis,
-        reasoning, and commentary that would otherwise be lost because
-        ``ResultMessage.result`` only contains the final response.
-
-        Each text block is sent as a separate Telegram message with a
-        subtle prefix to distinguish it from the final response.
+        Call this after streaming completes to ensure any buffered
+        intermediate text or thinking blocks are sent before the
+        final response.
         """
-        from .utils.formatting import ResponseFormatter
+        if on_stream and hasattr(on_stream, "flush_pending"):
+            try:
+                await on_stream.flush_pending()
+            except Exception as e:
+                logger.debug("Failed to flush pending stream text", error=str(e))
 
-        formatter = ResponseFormatter(self.settings)
-
-        for text in intermediate_texts:
-            if not text.strip():
-                continue
-            formatted = formatter.format_claude_response(text)
-            for msg in formatted:
-                if not msg.text or not msg.text.strip():
-                    continue
-                try:
-                    await update.message.reply_text(
-                        msg.text,
-                        parse_mode=msg.parse_mode,
-                        reply_markup=None,
-                    )
-                    await asyncio.sleep(0.3)
-                except Exception as send_err:
-                    logger.warning(
-                        "Failed to send intermediate text",
-                        error=str(send_err),
-                    )
-                    try:
-                        await update.message.reply_text(
-                            text,
-                            reply_markup=None,
-                        )
-                    except Exception:
-                        pass
+    async def _cleanup_thinking_messages(
+        self,
+        on_stream: Optional[Callable],
+    ) -> None:
+        """Delete ephemeral thinking messages after the final response is sent."""
+        if on_stream and hasattr(on_stream, "delete_thinking"):
+            try:
+                await on_stream.delete_thinking()
+            except Exception as e:
+                logger.debug("Failed to delete thinking messages", error=str(e))
 
     async def _send_images(
         self,
@@ -1067,7 +1171,6 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
-        intermediate_texts: List[str] = []
 
         # Stream drafts (private chats only)
         draft_streamer: Optional[DraftStreamer] = None
@@ -1088,7 +1191,7 @@ class MessageOrchestrator:
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
-            intermediate_texts=intermediate_texts,
+            telegram_update=update,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -1171,14 +1274,14 @@ class MessageOrchestrator:
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
 
+        # Flush any pending batched intermediate text before final response
+        if success:
+            await self._flush_stream_callback(on_stream)
+
         try:
             await progress_msg.delete()
         except Exception:
             logger.debug("Failed to delete progress message, ignoring")
-
-        # Send intermediate reasoning texts as persistent messages
-        if success and intermediate_texts:
-            await self._send_intermediate_texts(update, intermediate_texts)
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         images: List[ImageAttachment] = mcp_images
@@ -1249,6 +1352,9 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Delete ephemeral thinking messages now that the final response is sent
+        await self._cleanup_thinking_messages(on_stream)
 
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
@@ -1347,7 +1453,6 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_doc: List[ImageAttachment] = []
-        intermediate_texts_doc: List[str] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -1355,7 +1460,7 @@ class MessageOrchestrator:
             time.time(),
             mcp_images=mcp_images_doc,
             approved_directory=self.settings.approved_directory,
-            intermediate_texts=intermediate_texts_doc,
+            telegram_update=update,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
@@ -1393,14 +1498,13 @@ class MessageOrchestrator:
             if ctx_warn and formatted_messages:
                 formatted_messages[-1].text += ctx_warn
 
+            # Flush any pending batched intermediate text
+            await self._flush_stream_callback(on_stream)
+
             try:
                 await progress_msg.delete()
             except Exception:
                 logger.debug("Failed to delete progress message, ignoring")
-
-            # Send intermediate reasoning texts as persistent messages
-            if intermediate_texts_doc:
-                await self._send_intermediate_texts(update, intermediate_texts_doc)
 
             # Use MCP-collected images (from send_image_to_user tool calls)
             images: List[ImageAttachment] = mcp_images_doc
@@ -1442,6 +1546,9 @@ class MessageOrchestrator:
                         )
                     except Exception as img_err:
                         logger.warning("Image send failed", error=str(img_err))
+
+            # Delete ephemeral thinking messages now that the final response is sent
+            await self._cleanup_thinking_messages(on_stream)
 
         except Exception as e:
             from .handlers.message import _format_error_message
@@ -1565,7 +1672,6 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_media: List[ImageAttachment] = []
-        intermediate_texts_media: List[str] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -1573,7 +1679,7 @@ class MessageOrchestrator:
             time.time(),
             mcp_images=mcp_images_media,
             approved_directory=self.settings.approved_directory,
-            intermediate_texts=intermediate_texts_media,
+            telegram_update=update,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
@@ -1621,14 +1727,13 @@ class MessageOrchestrator:
         if ctx_warn and formatted_messages:
             formatted_messages[-1].text += ctx_warn
 
+        # Flush any pending batched intermediate text
+        await self._flush_stream_callback(on_stream)
+
         try:
             await progress_msg.delete()
         except Exception:
             logger.debug("Failed to delete progress message, ignoring")
-
-        # Send intermediate reasoning texts as persistent messages
-        if intermediate_texts_media:
-            await self._send_intermediate_texts(update, intermediate_texts_media)
 
         # Use MCP-collected images (from send_image_to_user tool calls).
         images: List[ImageAttachment] = mcp_images_media
@@ -1670,6 +1775,9 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Delete ephemeral thinking messages now that the final response is sent
+        await self._cleanup_thinking_messages(on_stream)
 
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""
