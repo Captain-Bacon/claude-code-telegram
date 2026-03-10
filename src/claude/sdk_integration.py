@@ -370,18 +370,37 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts)
 
-            # Extract context window info from modelUsage
+            # Extract context window size from modelUsage (static per model)
             context_window = None
-            total_input_tokens = None
             model_usage = result_raw_data.get("modelUsage", {})
             if model_usage:
                 first_model = next(iter(model_usage.values()), {})
                 context_window = first_model.get("contextWindow")
-                total_input_tokens = (
-                    first_model.get("inputTokens", 0)
-                    + first_model.get("cacheReadInputTokens", 0)
-                    + first_model.get("cacheCreationInputTokens", 0)
-                )
+
+            # Extract actual context usage from the LAST API call's
+            # stream events.  modelUsage token counts are cumulative
+            # across all API calls in the session, so dividing them by
+            # contextWindow grossly overestimates usage — especially in
+            # multi-turn tool-use conversations where the full history
+            # is re-sent every turn.
+            #
+            # The message_start stream event carries per-request usage
+            # with input_tokens, cache_read_input_tokens, and
+            # cache_creation_input_tokens.  The sum of all three is the
+            # actual number of tokens occupying the context window for
+            # that single request.
+            total_input_tokens = None
+            for msg in reversed(messages):
+                if isinstance(msg, StreamEvent):
+                    event = getattr(msg, "event", None) or {}
+                    if event.get("type") == "message_start":
+                        usage = (event.get("message") or {}).get("usage", {})
+                        total_input_tokens = (
+                            usage.get("input_tokens", 0)
+                            + usage.get("cache_read_input_tokens", 0)
+                            + usage.get("cache_creation_input_tokens", 0)
+                        )
+                        break
 
             return ClaudeResponse(
                 content=content,
