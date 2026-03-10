@@ -20,6 +20,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ProcessError,
     ResultMessage,
+    ThinkingBlock,
     ToolPermissionContext,
     ToolUseBlock,
     UserMessage,
@@ -61,7 +62,7 @@ class ClaudeResponse:
 class StreamUpdate:
     """Streaming update from Claude SDK."""
 
-    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta'
+    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta', 'thinking'
     content: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
     metadata: Optional[Dict] = None
@@ -213,7 +214,7 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
-                setting_sources=["project"],
+                setting_sources=["project", "user"],
                 stderr=_stderr_callback,
             )
 
@@ -506,6 +507,8 @@ class ClaudeSDKManager:
                 text_parts = []
                 tool_calls = []
 
+                thinking_parts = []
+
                 if content and isinstance(content, list):
                     for block in content:
                         if isinstance(block, ToolUseBlock):
@@ -516,8 +519,20 @@ class ClaudeSDKManager:
                                     "id": getattr(block, "id", None),
                                 }
                             )
+                        elif isinstance(block, ThinkingBlock):
+                            thinking_text = getattr(block, "thinking", "")
+                            if thinking_text and thinking_text.strip():
+                                thinking_parts.append(thinking_text)
                         elif hasattr(block, "text"):
                             text_parts.append(block.text)
+
+                # Emit thinking blocks first (if any)
+                if thinking_parts:
+                    thinking_update = StreamUpdate(
+                        type="thinking",
+                        content="\n".join(thinking_parts),
+                    )
+                    await stream_callback(thinking_update)
 
                 if text_parts or tool_calls:
                     update = StreamUpdate(
