@@ -60,6 +60,12 @@ class ClaudeCodeBot:
         builder.write_timeout(30)
         builder.pool_timeout(30)
 
+        # Enable concurrent handler processing so different Telegram threads
+        # can run handlers in parallel. PTB's default concurrent_updates=1
+        # looks truthy but means "1 at a time" — the internal check is
+        # max_concurrent_updates > 1. Must be True (bool) not a number.
+        builder.concurrent_updates(True)
+
         self.app = builder.build()
 
         # Initialize feature registry

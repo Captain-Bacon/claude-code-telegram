@@ -238,6 +238,13 @@ class PersistentClientManager:
                 error=str(e),
             )
 
+        # Start interrupt timeout — if CLI doesn't send ResultMessage
+        # within _INTERRUPT_TIMEOUT_S, resolve the turn as interrupted
+        asyncio.create_task(
+            self._interrupt_timeout(entry),
+            name=f"interrupt-timeout:{state_key}",
+        )
+
         logger.info(
             "Stopped client",
             state_key=state_key,
@@ -245,6 +252,35 @@ class PersistentClientManager:
         )
 
         return StopResult(was_busy=True, discarded_messages=discarded)
+
+    async def _interrupt_timeout(self, entry: PersistentClientEntry) -> None:
+        """Safety net: resolve current turn if no ResultMessage after interrupt.
+
+        interrupt() does NOT produce a ResultMessage, so the response collector
+        would wait forever. This fires after _INTERRUPT_TIMEOUT_S and resolves
+        the turn as interrupted if it's still pending.
+        """
+        await asyncio.sleep(_INTERRUPT_TIMEOUT_S)
+        turn = entry.current_turn
+        if turn and not turn.response_future.done() and entry._interrupted:
+            logger.warning(
+                "Interrupt timeout — resolving turn without ResultMessage",
+                state_key=entry.state_key,
+                timeout_s=_INTERRUPT_TIMEOUT_S,
+            )
+            response = PersistentResponse(
+                content="[Interrupted]",
+                session_id=entry.session_id or "",
+                cost=0.0,
+                duration_ms=int((time.time() - turn.started_at) * 1000),
+                num_turns=0,
+                is_interrupted=True,
+            )
+            turn.response_future.set_result(response)
+            entry.state = "idle"
+            entry.current_turn = None
+            entry.pending_turns = 0
+            entry._interrupted = False
 
     async def disconnect_client(self, state_key: str) -> None:
         """Fully disconnect and remove client. Next message creates fresh."""
