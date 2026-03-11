@@ -890,12 +890,10 @@ class MessageOrchestrator:
         _thinking_message_ids: List[int] = []
         _text_batch_task: List[Optional[asyncio.Task]] = [None]
 
-        # Track whether tool calls have occurred this turn.  When True,
-        # assistant commentary is sent as persistent standalone messages
-        # (mid-work updates like "Let me check that file").  When False,
-        # assistant text IS the final response and sending it here would
-        # duplicate the final reply.
-        _has_tool_calls = [False]
+        # Track whether assistant text was sent as standalone messages
+        # during this turn.  If True, the final response is suppressed
+        # (the standalone messages already delivered the content).
+        _text_was_sent = [False]
 
         # Lock protecting the mutable closure state above.  Without this,
         # concurrent async operations (_schedule_flush, _enqueue_text,
@@ -952,6 +950,7 @@ class MessageOrchestrator:
                                 parse_mode=msg.parse_mode,
                                 reply_markup=None,
                             )
+                            _text_was_sent[0] = True
                             await asyncio.sleep(0.3)
                         except Exception as send_err:
                             logger.warning(
@@ -1007,7 +1006,6 @@ class MessageOrchestrator:
 
             # Capture tool calls
             if update_obj.tool_calls:
-                _has_tool_calls[0] = True
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
                     detail = self._summarize_tool_input(name, tc.get("input", {}))
@@ -1038,13 +1036,12 @@ class MessageOrchestrator:
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text:
-                    # Only send as a standalone persistent message when
-                    # tool calls have occurred — that means Claude is
-                    # mid-work and the commentary is genuinely different
-                    # from the final response.  Without tool calls, the
-                    # assistant text IS the final response and sending
-                    # it here would duplicate.
-                    if telegram_update and _has_tool_calls[0]:
+                    # Send every assistant text as a persistent standalone
+                    # message.  The _text_was_sent flag is set when the
+                    # flush actually delivers to Telegram — the final
+                    # response path checks this and skips the main text
+                    # to avoid duplication.
+                    if telegram_update:
                         await _enqueue_text(text)
 
                     first_line = text.split("\n", 1)[0].strip()
@@ -1093,9 +1090,10 @@ class MessageOrchestrator:
                     )
             _thinking_message_ids.clear()
 
-        # Attach flush function so callers can drain pending text
+        # Attach helpers so callers can drain pending text and check state
         _on_stream.flush_pending = _flush_pending_text  # type: ignore[attr-defined]
         _on_stream.delete_thinking = _delete_thinking_messages  # type: ignore[attr-defined]
+        _on_stream.text_was_sent = _text_was_sent  # type: ignore[attr-defined]
 
         return _on_stream
 
@@ -1343,18 +1341,27 @@ class MessageOrchestrator:
                 except Exception as e:
                     logger.warning("Failed to log interaction", error=str(e))
 
-            # Format response (no reply_markup — strip keyboards)
-            from .utils.formatting import ResponseFormatter
-
-            formatter = ResponseFormatter(self.settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
+            # Check if assistant text was already delivered mid-stream.
+            # If so, skip the main text (it would duplicate) but still
+            # send supplementary notices (interrupted, stop reason, context).
+            text_already_sent = (
+                on_stream
+                and hasattr(on_stream, "text_was_sent")
+                and on_stream.text_was_sent[0]
             )
+
+            from .utils.formatting import FormattedMessage, ResponseFormatter
+
+            if text_already_sent:
+                formatted_messages: List[FormattedMessage] = []
+            else:
+                formatter = ResponseFormatter(self.settings)
+                formatted_messages = formatter.format_claude_response(
+                    claude_response.content
+                )
 
             # Show [Interrupted] if the response was stopped
             if claude_response.is_interrupted:
-                from .utils.formatting import FormattedMessage
-
                 formatted_messages.append(
                     FormattedMessage("[Interrupted]", parse_mode=None)
                 )
@@ -1372,8 +1379,14 @@ class MessageOrchestrator:
 
             # Append context window warning if threshold crossed
             ctx_warn = self._context_warning(claude_response, context.user_data)
-            if ctx_warn and formatted_messages:
-                formatted_messages[-1].text += ctx_warn
+            if ctx_warn:
+                if formatted_messages:
+                    formatted_messages[-1].text += ctx_warn
+                else:
+                    # No messages to append to — send as standalone
+                    formatted_messages.append(
+                        FormattedMessage(ctx_warn, parse_mode="HTML")
+                    )
 
         except asyncio.CancelledError:
             success = False
@@ -1736,10 +1749,20 @@ class MessageOrchestrator:
             claude_response, context, self.settings, user_id
         )
 
-        from .utils.formatting import ResponseFormatter
+        from .utils.formatting import FormattedMessage, ResponseFormatter
 
-        formatter = ResponseFormatter(self.settings)
-        formatted_messages = formatter.format_claude_response(claude_response.content)
+        # Check if assistant text was already delivered mid-stream
+        text_already_sent = (
+            on_stream
+            and hasattr(on_stream, "text_was_sent")
+            and on_stream.text_was_sent[0]
+        )
+
+        if text_already_sent:
+            formatted_messages: List[FormattedMessage] = []
+        else:
+            formatter = ResponseFormatter(self.settings)
+            formatted_messages = formatter.format_claude_response(claude_response.content)
 
         # Warn if the turn ended for a non-normal reason
         stop_notice = self._abnormal_stop_notice(claude_response)
@@ -1748,8 +1771,13 @@ class MessageOrchestrator:
 
         # Append context window warning if threshold crossed
         ctx_warn = self._context_warning(claude_response, context.user_data)
-        if ctx_warn and formatted_messages:
-            formatted_messages[-1].text += ctx_warn
+        if ctx_warn:
+            if formatted_messages:
+                formatted_messages[-1].text += ctx_warn
+            else:
+                formatted_messages.append(
+                    FormattedMessage(ctx_warn, parse_mode="HTML")
+                )
 
         # Flush any pending batched intermediate text
         await self._flush_stream_callback(on_stream)
