@@ -149,6 +149,88 @@ class ClaudeSDKManager:
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
 
+    def build_options(
+        self,
+        working_directory: Path,
+        model: Optional[str] = None,
+        session_id: Optional[str] = None,
+        continue_session: bool = False,
+        include_partial_messages: bool = False,
+        stderr_callback: Optional[Callable[[str], None]] = None,
+    ) -> ClaudeAgentOptions:
+        """Build ClaudeAgentOptions for either fire-and-forget or persistent use.
+
+        Shared options builder used by both execute_command() and
+        PersistentClientManager. Handles system prompt loading, MCP config,
+        tool validation, sandbox settings, and session resumption.
+        """
+        # Build system prompt, loading CLAUDE.md from working directory if present
+        base_prompt = (
+            f"All file operations must stay within {working_directory}. "
+            "Use relative paths."
+        )
+        claude_md_path = Path(working_directory) / "CLAUDE.md"
+        if claude_md_path.exists():
+            base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+            logger.info(
+                "Loaded CLAUDE.md into system prompt",
+                path=str(claude_md_path),
+            )
+
+        # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
+        # tools so the SDK does not restrict tool usage (e.g. MCP tools).
+        if self.config.disable_tool_validation:
+            sdk_allowed_tools = None
+            sdk_disallowed_tools = None
+        else:
+            sdk_allowed_tools = self.config.claude_allowed_tools
+            sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+        options = ClaudeAgentOptions(
+            max_turns=self.config.claude_max_turns,
+            model=model or self.config.claude_model or None,
+            max_budget_usd=self.config.claude_max_cost_per_request,
+            cwd=str(working_directory),
+            allowed_tools=sdk_allowed_tools,
+            disallowed_tools=sdk_disallowed_tools,
+            cli_path=self.config.claude_cli_path or None,
+            include_partial_messages=include_partial_messages,
+            sandbox={
+                "enabled": self.config.sandbox_enabled,
+                "autoAllowBashIfSandboxed": True,
+                "excludedCommands": self.config.sandbox_excluded_commands or [],
+            },
+            system_prompt=base_prompt,
+            setting_sources=["project", "user"],
+            stderr=stderr_callback,
+        )
+
+        # Pass MCP server configuration if enabled
+        if self.config.enable_mcp and self.config.mcp_config_path:
+            options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
+            logger.info(
+                "MCP servers configured",
+                mcp_config_path=str(self.config.mcp_config_path),
+            )
+
+        # Wire can_use_tool callback for preventive tool validation
+        if self.security_validator:
+            options.can_use_tool = _make_can_use_tool_callback(
+                security_validator=self.security_validator,
+                working_directory=working_directory,
+                approved_directory=self.config.approved_directory,
+            )
+
+        # Resume previous session if we have a session_id
+        if session_id and continue_session:
+            options.resume = session_id
+            logger.info(
+                "Resuming previous session",
+                session_id=session_id,
+            )
+
+        return options
+
     async def execute_command(
         self,
         prompt: str,
@@ -176,71 +258,14 @@ class ClaudeSDKManager:
                 stderr_lines.append(line)
                 logger.debug("Claude CLI stderr", line=line)
 
-            # Build system prompt, loading CLAUDE.md from working directory if present
-            base_prompt = (
-                f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
-            )
-            claude_md_path = Path(working_directory) / "CLAUDE.md"
-            if claude_md_path.exists():
-                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
-                logger.info(
-                    "Loaded CLAUDE.md into system prompt",
-                    path=str(claude_md_path),
-                )
-
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
-            if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
-            else:
-                sdk_allowed_tools = self.config.claude_allowed_tools
-                sdk_disallowed_tools = self.config.claude_disallowed_tools
-
-            # Build Claude Agent options
-            options = ClaudeAgentOptions(
-                max_turns=self.config.claude_max_turns,
-                model=model or self.config.claude_model or None,
-                max_budget_usd=self.config.claude_max_cost_per_request,
-                cwd=str(working_directory),
-                allowed_tools=sdk_allowed_tools,
-                disallowed_tools=sdk_disallowed_tools,
-                cli_path=self.config.claude_cli_path or None,
+            options = self.build_options(
+                working_directory=working_directory,
+                model=model,
+                session_id=session_id,
+                continue_session=continue_session,
                 include_partial_messages=stream_callback is not None,
-                sandbox={
-                    "enabled": self.config.sandbox_enabled,
-                    "autoAllowBashIfSandboxed": True,
-                    "excludedCommands": self.config.sandbox_excluded_commands or [],
-                },
-                system_prompt=base_prompt,
-                setting_sources=["project", "user"],
-                stderr=_stderr_callback,
+                stderr_callback=_stderr_callback,
             )
-
-            # Pass MCP server configuration if enabled
-            if self.config.enable_mcp and self.config.mcp_config_path:
-                options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
-                logger.info(
-                    "MCP servers configured",
-                    mcp_config_path=str(self.config.mcp_config_path),
-                )
-
-            # Wire can_use_tool callback for preventive tool validation
-            if self.security_validator:
-                options.can_use_tool = _make_can_use_tool_callback(
-                    security_validator=self.security_validator,
-                    working_directory=working_directory,
-                    approved_directory=self.config.approved_directory,
-                )
-
-            # Resume previous session if we have a session_id
-            if session_id and continue_session:
-                options.resume = session_id
-                logger.info(
-                    "Resuming previous session",
-                    session_id=session_id,
-                )
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
