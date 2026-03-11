@@ -57,6 +57,14 @@ class TurnContext:
     started_at: float
     messages: List[Message] = field(default_factory=list)
     result_raw_data: Dict[str, Any] = field(default_factory=dict)
+    # Diagnostic tracking — per-turn token accounting
+    api_call_count: int = 0
+    total_input_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
+    total_output_tokens: int = 0
+    last_message_at: float = 0.0
+    last_message_type: str = ""
 
 
 @dataclass
@@ -101,6 +109,7 @@ class PersistentClientEntry:
     current_turn: Optional[TurnContext] = None
     turn_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     _interrupted: bool = False
+    _watchdog_task: Optional[asyncio.Task] = None
 
 
 def derive_state_key(chat_id: int, thread_id: Optional[int], user_id: int) -> str:
@@ -175,6 +184,13 @@ class PersistentClientManager:
         if entry.state == "idle":
             entry.state = "busy"
             entry.current_turn = turn
+            # Start stall watchdog for this turn
+            if entry._watchdog_task and not entry._watchdog_task.done():
+                entry._watchdog_task.cancel()
+            entry._watchdog_task = asyncio.create_task(
+                self._turn_watchdog(entry),
+                name=f"watchdog:{state_key}",
+            )
         else:
             # Client is busy — queue for the collector to pick up
             # after the current turn's ResultMessage
@@ -287,6 +303,59 @@ class PersistentClientManager:
             entry.pending_turns = 0
             entry._interrupted = False
 
+    async def _turn_watchdog(self, entry: PersistentClientEntry) -> None:
+        """Monitor active turns for silence — logs when the CLI goes quiet.
+
+        Fires at 30s, then every 60s. Checks whether the CLI subprocess is
+        still alive. This is diagnostic only — it does not intervene.
+        """
+        thresholds = [30, 60]  # first two alerts
+        idx = 0
+        try:
+            while True:
+                wait = thresholds[idx] if idx < len(thresholds) else 60
+                # After the first two thresholds, check every 60s
+                if idx >= len(thresholds):
+                    wait = 60
+                await asyncio.sleep(wait)
+
+                turn = entry.current_turn
+                if not turn:
+                    return  # Turn completed, watchdog done
+
+                now = time.time()
+                last_msg = turn.last_message_at or turn.started_at
+                silence_s = now - last_msg
+                total_elapsed_s = now - turn.started_at
+
+                # Check if CLI subprocess is alive
+                cli_alive = True
+                try:
+                    proc = getattr(entry.client, "_query", None)
+                    if proc:
+                        transport = getattr(proc, "_transport", None)
+                        if transport:
+                            subprocess_proc = getattr(transport, "_process", None)
+                            if subprocess_proc and subprocess_proc.returncode is not None:
+                                cli_alive = False
+                except Exception:
+                    pass  # Best effort — don't crash the watchdog
+
+                logger.warning(
+                    "turn.quiet",
+                    state_key=entry.state_key,
+                    silence_seconds=round(silence_s, 1),
+                    total_elapsed_seconds=round(total_elapsed_s, 1),
+                    last_message_type=turn.last_message_type or "none",
+                    api_calls_so_far=turn.api_call_count,
+                    cli_alive=cli_alive,
+                    pending_turns=entry.pending_turns,
+                )
+                idx += 1
+
+        except asyncio.CancelledError:
+            pass
+
     async def disconnect_client(self, state_key: str) -> None:
         """Fully disconnect and remove client. Next message creates fresh."""
         entry = self._clients.get(state_key)
@@ -366,11 +435,22 @@ class PersistentClientManager:
         )
 
         self._clients[state_key] = entry
+
+        # Log what we're actually sending to the CLI subprocess
+        sys_prompt = getattr(options, "system_prompt", None)
+        sys_prompt_type = "preset+append" if isinstance(sys_prompt, dict) else "string" if isinstance(sys_prompt, str) else "none"
         logger.info(
             "client.created",
             state_key=state_key,
             working_directory=str(working_directory),
             collector_started=True,
+            model=getattr(options, "model", None),
+            max_turns=getattr(options, "max_turns", None),
+            max_budget_usd=getattr(options, "max_budget_usd", None),
+            system_prompt_type=sys_prompt_type,
+            has_mcp=bool(getattr(options, "mcp_servers", None)),
+            has_can_use_tool=getattr(options, "can_use_tool", None) is not None,
+            resume_session=getattr(options, "resume", None),
         )
         return entry
 
@@ -424,22 +504,66 @@ class PersistentClientManager:
         try:
             async for raw_data in entry.client._query.receive_messages():
                 msg_count += 1
+                now = time.time()
+
                 try:
                     message = parse_message(raw_data)
                 except MessageParseError as e:
-                    logger.debug(
+                    # Promoted to INFO — unparseable messages include
+                    # rate_limit_event and other signals we must not ignore
+                    raw_keys = list(raw_data.keys()) if isinstance(raw_data, dict) else [type(raw_data).__name__]
+                    logger.info(
                         "sdk.unparseable",
                         state_key=entry.state_key,
                         error=str(e),
-                        raw_keys=list(raw_data.keys()) if isinstance(raw_data, dict) else type(raw_data).__name__,
+                        raw_keys=raw_keys,
+                        raw_type=raw_data.get("type") if isinstance(raw_data, dict) else None,
+                        msg_num=msg_count,
                     )
                     continue
 
                 msg_type = type(message).__name__
                 turn = entry.current_turn
 
-                # Log every SDK message at debug level — the trail we need
-                # when diagnosing stalls and mystery signals
+                # Update turn diagnostics
+                if turn:
+                    turn.last_message_at = now
+                    turn.last_message_type = msg_type
+
+                # Extract per-API-call token usage from StreamEvent message_start
+                if isinstance(message, StreamEvent) and turn:
+                    event = getattr(message, "event", None) or {}
+                    if event.get("type") == "message_start":
+                        usage = (event.get("message") or {}).get("usage", {})
+                        input_tok = usage.get("input_tokens", 0)
+                        cache_read = usage.get("cache_read_input_tokens", 0)
+                        cache_create = usage.get("cache_creation_input_tokens", 0)
+                        output_tok = usage.get("output_tokens", 0)
+
+                        turn.api_call_count += 1
+                        turn.total_input_tokens += input_tok
+                        turn.total_cache_read_tokens += cache_read
+                        turn.total_cache_creation_tokens += cache_create
+                        turn.total_output_tokens += output_tok
+
+                        # Cache hit rate for THIS api call
+                        total_in = input_tok + cache_read + cache_create
+                        cache_pct = (cache_read / total_in * 100) if total_in > 0 else 0
+
+                        logger.info(
+                            "api_call.usage",
+                            state_key=entry.state_key,
+                            call_num=turn.api_call_count,
+                            input_tokens=input_tok,
+                            cache_read=cache_read,
+                            cache_creation=cache_create,
+                            output_tokens=output_tok,
+                            cache_hit_pct=round(cache_pct, 1),
+                            total_context=total_in,
+                            elapsed_ms=int((now - turn.started_at) * 1000),
+                        )
+
+                # Log every SDK message at debug level — the full trail
                 logger.debug(
                     "sdk.message",
                     state_key=entry.state_key,
@@ -447,7 +571,7 @@ class PersistentClientManager:
                     msg_num=msg_count,
                     has_turn=turn is not None,
                     state=entry.state,
-                    elapsed_ms=int((time.time() - turn.started_at) * 1000) if turn else None,
+                    elapsed_ms=int((now - turn.started_at) * 1000) if turn else None,
                 )
 
                 if isinstance(message, ResultMessage):
@@ -539,6 +663,10 @@ class PersistentClientManager:
         if not turn.response_future.done():
             turn.response_future.set_result(response)
 
+        # Cancel stall watchdog — turn completed normally
+        if entry._watchdog_task and not entry._watchdog_task.done():
+            entry._watchdog_task.cancel()
+
         # Move to next turn or go idle
         if entry.pending_turns > 0:
             # Another turn is queued — get it from the queue
@@ -559,6 +687,10 @@ class PersistentClientManager:
             entry.state = "idle"
             entry.current_turn = None
 
+        # Per-turn token summary — the key diagnostic for cost analysis
+        total_in = turn.total_input_tokens + turn.total_cache_read_tokens + turn.total_cache_creation_tokens
+        cache_pct = (turn.total_cache_read_tokens / total_in * 100) if total_in > 0 else 0
+
         logger.info(
             "turn.completed",
             state_key=entry.state_key,
@@ -570,6 +702,14 @@ class PersistentClientManager:
             pending_turns=entry.pending_turns,
             transition=f"busy→{entry.state}",
             session_id=entry.session_id,
+            # Token accounting for this turn
+            api_calls=turn.api_call_count,
+            input_tokens=turn.total_input_tokens,
+            cache_read_tokens=turn.total_cache_read_tokens,
+            cache_creation_tokens=turn.total_cache_creation_tokens,
+            output_tokens=turn.total_output_tokens,
+            total_context_tokens=total_in,
+            cache_hit_pct=round(cache_pct, 1),
         )
 
     def _build_persistent_response(
@@ -676,6 +816,22 @@ class PersistentClientManager:
         self, entry: PersistentClientEntry, error: Exception
     ) -> None:
         """Handle unexpected client death — resolve pending futures with errors."""
+        # Cancel watchdog on death
+        if entry._watchdog_task and not entry._watchdog_task.done():
+            entry._watchdog_task.cancel()
+
+        turn = entry.current_turn
+        logger.error(
+            "client.death",
+            state_key=entry.state_key,
+            error=str(error),
+            error_type=type(error).__name__,
+            had_active_turn=turn is not None,
+            last_message_type=turn.last_message_type if turn else None,
+            api_calls_at_death=turn.api_call_count if turn else 0,
+            elapsed_ms=int((time.time() - turn.started_at) * 1000) if turn else 0,
+        )
+
         error_response = PersistentResponse(
             content=f"Client error: {error}",
             session_id=entry.session_id or "",

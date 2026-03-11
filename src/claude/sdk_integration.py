@@ -86,45 +86,70 @@ def _make_can_use_tool_callback(
         tool_input: Dict[str, Any],
         context: ToolPermissionContext,
     ) -> Any:
-        # File path validation
-        if tool_name in _FILE_TOOLS:
-            file_path = tool_input.get("file_path") or tool_input.get("path")
-            if file_path:
-                # Allow Claude Code internal paths (~/.claude/plans/, etc.)
-                if _is_claude_internal_path(file_path):
-                    return PermissionResultAllow()
+        import time as _time
 
-                valid, _resolved, error = security_validator.validate_path(
-                    file_path, working_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied file operation",
-                        tool_name=tool_name,
-                        file_path=file_path,
-                        error=error,
-                    )
-                    return PermissionResultDeny(message=error or "Invalid file path")
+        start = _time.time()
+        decision = "allow"
+        error_msg = None
 
-        # Bash directory boundary validation
-        if tool_name in _BASH_TOOLS:
-            command = tool_input.get("command", "")
-            if command:
-                valid, error = check_bash_directory_boundary(
-                    command, working_directory, approved_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied bash command",
-                        tool_name=tool_name,
-                        command=command,
-                        error=error,
-                    )
-                    return PermissionResultDeny(
-                        message=error or "Bash directory boundary violation"
-                    )
+        try:
+            # File path validation
+            if tool_name in _FILE_TOOLS:
+                file_path = tool_input.get("file_path") or tool_input.get("path")
+                if file_path:
+                    # Allow Claude Code internal paths (~/.claude/plans/, etc.)
+                    if _is_claude_internal_path(file_path):
+                        return PermissionResultAllow()
 
-        return PermissionResultAllow()
+                    valid, _resolved, error = security_validator.validate_path(
+                        file_path, working_directory
+                    )
+                    if not valid:
+                        decision = "deny"
+                        error_msg = error
+                        return PermissionResultDeny(message=error or "Invalid file path")
+
+            # Bash directory boundary validation
+            if tool_name in _BASH_TOOLS:
+                command = tool_input.get("command", "")
+                if command:
+                    valid, error = check_bash_directory_boundary(
+                        command, working_directory, approved_directory
+                    )
+                    if not valid:
+                        decision = "deny"
+                        error_msg = error
+                        return PermissionResultDeny(
+                            message=error or "Bash directory boundary violation"
+                        )
+
+            return PermissionResultAllow()
+
+        except Exception as e:
+            # CRITICAL: Always return a result. An unhandled exception here
+            # means the CLI never gets a permission response and waits forever
+            # — this is a potential stall cause.
+            decision = "error"
+            error_msg = str(e)
+            logger.error(
+                "control.tool_check.error",
+                tool_name=tool_name,
+                error=error_msg,
+                error_type=type(e).__name__,
+            )
+            return PermissionResultDeny(
+                message=f"Internal error checking permission: {e}"
+            )
+
+        finally:
+            elapsed_ms = round((_time.time() - start) * 1000, 1)
+            logger.info(
+                "control.tool_check",
+                tool_name=tool_name,
+                decision=decision,
+                elapsed_ms=elapsed_ms,
+                error=error_msg,
+            )
 
     return can_use_tool
 
@@ -164,14 +189,16 @@ class ClaudeSDKManager:
         PersistentClientManager. Handles system prompt loading, MCP config,
         tool validation, sandbox settings, and session resumption.
         """
-        # Build system prompt, loading CLAUDE.md from working directory if present
-        base_prompt = (
+        # Build system prompt — APPEND to the default Claude Code prompt
+        # (not replace). Using the preset+append pattern preserves all
+        # built-in tool guidance, safety rules, and efficiency instructions.
+        append_prompt = (
             f"All file operations must stay within {working_directory}. "
             "Use relative paths."
         )
         claude_md_path = Path(working_directory) / "CLAUDE.md"
         if claude_md_path.exists():
-            base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+            append_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
             logger.info(
                 "Loaded CLAUDE.md into system prompt",
                 path=str(claude_md_path),
@@ -200,7 +227,11 @@ class ClaudeSDKManager:
                 "autoAllowBashIfSandboxed": True,
                 "excludedCommands": self.config.sandbox_excluded_commands or [],
             },
-            system_prompt=base_prompt,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": append_prompt,
+            },
             setting_sources=["project", "user"],
             stderr=stderr_callback,
         )

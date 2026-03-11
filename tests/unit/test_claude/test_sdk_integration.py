@@ -456,8 +456,12 @@ class TestClaudeSandboxSettings:
 
         assert len(captured_options) == 1
         opts = captured_options[0]
-        assert str(tmp_path) in opts.system_prompt
-        assert "relative paths" in opts.system_prompt.lower()
+        # system_prompt is now a preset+append dict
+        assert isinstance(opts.system_prompt, dict)
+        assert opts.system_prompt["type"] == "preset"
+        assert opts.system_prompt["preset"] == "claude_code"
+        assert str(tmp_path) in opts.system_prompt["append"]
+        assert "relative paths" in opts.system_prompt["append"].lower()
 
     async def test_disallowed_tools_passed_to_options(self, tmp_path):
         """Test that disallowed_tools from config are passed to ClaudeAgentOptions."""
@@ -1061,8 +1065,9 @@ class TestClaudeMdLoading:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
-        assert "# Project Rules" in opts.system_prompt
-        assert "Always use type hints." in opts.system_prompt
+        assert isinstance(opts.system_prompt, dict)
+        assert "# Project Rules" in opts.system_prompt["append"]
+        assert "Always use type hints." in opts.system_prompt["append"]
 
     async def test_system_prompt_unchanged_without_claude_md(
         self, sdk_manager, tmp_path
@@ -1081,8 +1086,9 @@ class TestClaudeMdLoading:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
-        assert "Use relative paths." in opts.system_prompt
-        assert "# Project Rules" not in opts.system_prompt
+        assert isinstance(opts.system_prompt, dict)
+        assert "Use relative paths." in opts.system_prompt["append"]
+        assert "# Project Rules" not in opts.system_prompt["append"]
 
     async def test_setting_sources_includes_project(self, sdk_manager, tmp_path):
         """setting_sources=['project'] is passed to ClaudeAgentOptions."""
