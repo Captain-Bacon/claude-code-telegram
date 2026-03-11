@@ -16,6 +16,7 @@ from src.claude import (
     ClaudeIntegration,
     SessionManager,
 )
+from src.claude.persistent import PersistentClientManager
 from src.claude.sdk_integration import ClaudeSDKManager
 from src.config.features import FeatureFlags
 from src.config.settings import Settings
@@ -150,6 +151,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         session_manager=session_manager,
     )
 
+    # Persistent client manager for per-thread Claude sessions
+    persistent_manager = PersistentClientManager(sdk_manager, config)
+
     # --- Event bus and agentic platform components ---
     event_bus = EventBus()
 
@@ -177,6 +181,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
         "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": storage,
         "event_bus": event_bus,
         "project_registry": None,
@@ -194,6 +199,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     return {
         "bot": bot,
         "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": storage,
         "config": config,
         "features": features,
@@ -209,6 +215,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     logger = structlog.get_logger()
     bot: ClaudeCodeBot = app["bot"]
     claude_integration: ClaudeIntegration = app["claude_integration"]
+    persistent_manager: PersistentClientManager = app["persistent_manager"]
     storage: Storage = app["storage"]
     config: Settings = app["config"]
     features: FeatureFlags = app["features"]
@@ -292,6 +299,20 @@ async def run_application(app: Dict[str, Any]) -> None:
         # Collect concurrent tasks
         tasks = []
 
+        # Persistent client idle cleanup (runs every 5 minutes)
+        async def _idle_cleanup_loop() -> None:
+            while True:
+                await asyncio.sleep(300)
+                try:
+                    cleaned = await persistent_manager.cleanup_idle_clients()
+                    if cleaned > 0:
+                        logger.info("Cleaned up idle clients", count=cleaned)
+                except Exception as e:
+                    logger.warning("Idle cleanup error", error=str(e))
+
+        idle_cleanup_task = asyncio.create_task(_idle_cleanup_loop())
+        tasks.append(idle_cleanup_task)
+
         # Bot task — use start() which handles its own initialization check
         bot_task = asyncio.create_task(bot.start())
         tasks.append(bot_task)
@@ -358,6 +379,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 await notification_service.stop()
             await event_bus.stop()
             await bot.stop()
+            await persistent_manager.shutdown()
             await claude_integration.shutdown()
             await storage.close()
         except Exception as e:

@@ -28,6 +28,7 @@ from telegram.ext import (
     filters,
 )
 
+from ..claude.persistent import PersistentClientManager, derive_state_key
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
@@ -117,8 +118,16 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
-        # Track active Claude tasks per user so /stop can cancel them
+        # Track active Claude tasks per user so /stop can cancel them (legacy)
         self._active_tasks: Dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
+
+    @staticmethod
+    def _state_key(update: Update) -> str:
+        """Derive a persistent client state key from a Telegram update."""
+        chat_id = update.effective_chat.id
+        thread_id = getattr(update.message, "message_thread_id", None)
+        user_id = update.effective_user.id
+        return derive_state_key(chat_id, thread_id, user_id)
 
     @staticmethod
     def _context_warning(
@@ -544,7 +553,14 @@ class MessageOrchestrator:
     async def agentic_new(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Reset session, one-line confirmation."""
+        """Reset session — disconnect persistent client, clear state."""
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if persistent_manager:
+            state_key = self._state_key(update)
+            await persistent_manager.disconnect_client(state_key)
+
         context.user_data["claude_session_id"] = None
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
@@ -664,16 +680,40 @@ class MessageOrchestrator:
     async def agentic_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Cancel the active Claude request for this user."""
-        user_id = update.effective_user.id
-        task = self._active_tasks.get(user_id)
-
-        if task and not task.done():
-            task.cancel()
-            await update.message.reply_text("Stopping current request...")
-            logger.info("User cancelled active task", user_id=user_id)
-        else:
+        """Stop the active Claude work for this thread."""
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if not persistent_manager:
             await update.message.reply_text("Nothing running to stop.")
+            return
+
+        state_key = self._state_key(update)
+        result = await persistent_manager.stop_client(state_key)
+
+        if not result.was_busy:
+            await update.message.reply_text("Nothing running to stop.")
+            return
+
+        # Report what was stopped and any discarded messages
+        if result.discarded_messages:
+            lines = ["Stopped. These queued messages were not sent:"]
+            for msg_text in result.discarded_messages:
+                # Truncate long messages for the summary
+                preview = msg_text[:100] + ("..." if len(msg_text) > 100 else "")
+                lines.append(f"  \u2022 {escape_html(preview)}")
+            await update.message.reply_text(
+                "\n".join(lines), parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text("Stopped.")
+
+        logger.info(
+            "User stopped client",
+            user_id=update.effective_user.id,
+            state_key=state_key,
+            discarded=len(result.discarded_messages),
+        )
 
     def _format_verbose_progress(
         self,
@@ -1148,23 +1188,40 @@ class MessageOrchestrator:
         chat = update.message.chat
         await chat.send_action("typing")
 
-        verbose_level = self._get_verbose_level(context)
-        progress_msg = await update.message.reply_text("Working...")
-
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await progress_msg.edit_text(
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if not persistent_manager:
+            await update.message.reply_text(
                 "Claude integration not available. Check configuration."
             )
             return
 
+        state_key = self._state_key(update)
+        client_state = persistent_manager.get_client_state(state_key)
+
+        # If client is busy, acknowledge the follow-up with a reaction
+        if client_state == "busy":
+            try:
+                await update.message.set_reaction("\U0001f440")  # 👀
+            except Exception:
+                pass  # Reactions may not be supported in all chats
+            logger.info(
+                "Follow-up queued (client busy)",
+                user_id=user_id,
+                state_key=state_key,
+            )
+
+        verbose_level = self._get_verbose_level(context)
+        progress_msg = await update.message.reply_text(
+            "Queued..." if client_state == "busy" else "Working..."
+        )
+
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
-        # Flag is only cleared after a successful run so retries keep the intent.
         force_new = bool(context.user_data.get("force_new_session"))
 
         # --- Verbose progress tracking via stream callback ---
@@ -1198,16 +1255,14 @@ class MessageOrchestrator:
         heartbeat = self._start_typing_heartbeat(chat)
 
         success = True
-        self._active_tasks[user_id] = asyncio.current_task()  # type: ignore[assignment]
         try:
-            claude_response = await claude_integration.run_command(
+            claude_response = await persistent_manager.send_message(
+                state_key=state_key,
                 prompt=message_text,
                 working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
-                force_new=force_new,
+                stream_callback=on_stream,
                 model=context.user_data.get("claude_model"),
+                force_new=force_new,
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1245,6 +1300,14 @@ class MessageOrchestrator:
                 claude_response.content
             )
 
+            # Show [Interrupted] if the response was stopped
+            if claude_response.is_interrupted:
+                from .utils.formatting import FormattedMessage
+
+                formatted_messages.append(
+                    FormattedMessage("[Interrupted]", parse_mode=None)
+                )
+
             # Append context window warning if threshold crossed
             ctx_warn = self._context_warning(claude_response, context.user_data)
             if ctx_warn and formatted_messages:
@@ -1252,7 +1315,7 @@ class MessageOrchestrator:
 
         except asyncio.CancelledError:
             success = False
-            logger.info("Claude request cancelled by user", user_id=user_id)
+            logger.info("Claude request cancelled", user_id=user_id)
             from .utils.formatting import FormattedMessage
 
             formatted_messages = [FormattedMessage("Stopped.", parse_mode=None)]
@@ -1266,7 +1329,6 @@ class MessageOrchestrator:
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
         finally:
-            self._active_tasks.pop(user_id, None)
             heartbeat.cancel()
             if draft_streamer:
                 try:
@@ -1433,7 +1495,18 @@ class MessageOrchestrator:
                 )
                 return
 
-        # Process with Claude
+        # Process with Claude via persistent client
+        await self._handle_agentic_media_message(
+            update=update,
+            context=context,
+            prompt=prompt,
+            progress_msg=progress_msg,
+            user_id=user_id,
+            chat=chat,
+        )
+        return
+
+        # --- Dead code below (kept temporarily for reference) ---
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
             await progress_msg.edit_text(
@@ -1446,8 +1519,6 @@ class MessageOrchestrator:
         )
         session_id = context.user_data.get("claude_session_id")
 
-        # Check if /new was used — skip auto-resume for this first message.
-        # Flag is only cleared after a successful run so retries keep the intent.
         force_new = bool(context.user_data.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
@@ -1656,17 +1727,19 @@ class MessageOrchestrator:
         chat: Any,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if not persistent_manager:
             await progress_msg.edit_text(
                 "Claude integration not available. Check configuration."
             )
             return
 
+        state_key = self._state_key(update)
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
         force_new = bool(context.user_data.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
@@ -1683,27 +1756,32 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
-        self._active_tasks[user_id] = asyncio.current_task()  # type: ignore[assignment]
         try:
-            claude_response = await claude_integration.run_command(
+            claude_response = await persistent_manager.send_message(
+                state_key=state_key,
                 prompt=prompt,
                 working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
-                force_new=force_new,
+                stream_callback=on_stream,
                 model=context.user_data.get("claude_model"),
+                force_new=force_new,
             )
         except asyncio.CancelledError:
-            logger.info("Claude media request cancelled by user", user_id=user_id)
+            logger.info("Claude media request cancelled", user_id=user_id)
             try:
                 await progress_msg.delete()
             except Exception:
                 pass
             await update.message.reply_text("Stopped.")
             return
+        except Exception as e:
+            from .handlers.message import _format_error_message
+
+            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            logger.error(
+                "Claude media processing failed", error=str(e), user_id=user_id
+            )
+            return
         finally:
-            self._active_tasks.pop(user_id, None)
             heartbeat.cancel()
 
         if force_new:

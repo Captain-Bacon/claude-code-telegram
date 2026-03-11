@@ -235,15 +235,20 @@ async def test_agentic_new_resets_session(agentic_settings, deps):
     """Agentic /new clears session and sends brief confirmation."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
+    persistent_manager = AsyncMock()
+    persistent_manager.disconnect_client = AsyncMock()
+
     update = MagicMock()
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
     context.user_data = {"claude_session_id": "old-session-123"}
+    context.bot_data = {"persistent_manager": persistent_manager}
 
     await orchestrator.agentic_new(update, context)
 
     assert context.user_data["claude_session_id"] is None
+    persistent_manager.disconnect_client.assert_awaited_once()
     update.message.reply_text.assert_called_once_with("Session reset. What's next?")
 
 
@@ -267,22 +272,28 @@ async def test_agentic_status_compact(agentic_settings, deps):
 
 
 async def test_agentic_text_calls_claude(agentic_settings, deps):
-    """Agentic text handler calls Claude and returns response without keyboard."""
+    """Agentic text handler calls Claude via persistent manager."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
-    # Mock Claude response
+    # Mock persistent response
     mock_response = MagicMock()
     mock_response.session_id = "session-abc"
     mock_response.content = "Hello, I can help with that!"
     mock_response.tools_used = []
+    mock_response.is_interrupted = False
+    mock_response.context_window = None
+    mock_response.total_input_tokens = None
 
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock(return_value=mock_response)
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock(return_value=mock_response)
+    persistent_manager.get_client_state = MagicMock(return_value=None)
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
     update.message.text = "Help me with this code"
     update.message.message_id = 1
+    update.message.message_thread_id = None
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
 
@@ -295,7 +306,7 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": None,
         "rate_limiter": None,
         "audit_logger": None,
@@ -303,8 +314,8 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
 
     await orchestrator.agentic_text(update, context)
 
-    # Claude was called
-    claude_integration.run_command.assert_called_once()
+    # Claude was called via persistent manager
+    persistent_manager.send_message.assert_awaited_once()
 
     # Session ID updated
     assert context.user_data["claude_session_id"] == "session-abc"
@@ -364,19 +375,24 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
 
 
 async def test_agentic_voice_calls_claude(agentic_settings, deps):
-    """Agentic voice handler transcribes and routes prompt to Claude."""
+    """Agentic voice handler transcribes and routes prompt via persistent manager."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
     mock_response = MagicMock()
     mock_response.session_id = "voice-session-123"
     mock_response.content = "Voice response from Claude"
     mock_response.tools_used = []
+    mock_response.is_interrupted = False
+    mock_response.context_window = None
+    mock_response.total_input_tokens = None
 
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock(return_value=mock_response)
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock(return_value=mock_response)
+    persistent_manager.get_client_state = MagicMock(return_value=None)
 
     processed_voice = MagicMock()
     processed_voice.prompt = "Voice prompt text"
+    processed_voice.transcription = "Voice prompt text"
 
     voice_handler = MagicMock()
     voice_handler.process_voice_message = AsyncMock(return_value=processed_voice)
@@ -386,9 +402,11 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
     update.message.voice = MagicMock()
     update.message.caption = "please summarize"
     update.message.message_id = 1
+    update.message.message_thread_id = None
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
 
@@ -402,7 +420,7 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     context.bot_data = {
         "settings": agentic_settings,
         "features": features,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
     }
 
     await orchestrator.agentic_voice(update, context)
@@ -410,7 +428,7 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     voice_handler.process_voice_message.assert_awaited_once_with(
         update.message.voice, "please summarize"
     )
-    claude_integration.run_command.assert_awaited_once()
+    persistent_manager.send_message.assert_awaited_once()
     assert context.user_data["claude_session_id"] == "voice-session-123"
 
 
@@ -510,16 +528,19 @@ async def test_agentic_text_logs_failure_on_error(agentic_settings, deps):
     """Failed Claude runs are logged with success=False."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock(side_effect=Exception("Claude broke"))
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock(side_effect=Exception("Claude broke"))
+    persistent_manager.get_client_state = MagicMock(return_value=None)
 
     audit_logger = AsyncMock()
     audit_logger.log_command = AsyncMock()
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
     update.message.text = "do something"
     update.message.message_id = 1
+    update.message.message_thread_id = None
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
 
@@ -531,7 +552,7 @@ async def test_agentic_text_logs_failure_on_error(agentic_settings, deps):
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": None,
         "rate_limiter": None,
         "audit_logger": audit_logger,
