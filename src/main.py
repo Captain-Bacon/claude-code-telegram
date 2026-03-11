@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 import structlog
 
-from src import __version__
+from src import __version__, get_build_info
 from src.bot.core import ClaudeCodeBot
 from src.claude import (
     ClaudeIntegration,
@@ -299,16 +299,20 @@ async def run_application(app: Dict[str, Any]) -> None:
         # Collect concurrent tasks
         tasks = []
 
-        # Persistent client idle cleanup (runs every 5 minutes)
+        # Persistent client heartbeat + idle cleanup (runs every 5 minutes)
         async def _idle_cleanup_loop() -> None:
             while True:
                 await asyncio.sleep(300)
                 try:
                     cleaned = await persistent_manager.cleanup_idle_clients()
-                    if cleaned > 0:
-                        logger.info("Cleaned up idle clients", count=cleaned)
+                    logger.info(
+                        "Heartbeat",
+                        build=_build_info,
+                        active_clients=len(persistent_manager._clients),
+                        cleaned=cleaned,
+                    )
                 except Exception as e:
-                    logger.warning("Idle cleanup error", error=str(e))
+                    logger.warning("Idle cleanup error", error=str(e), build=_build_info)
 
         idle_cleanup_task = asyncio.create_task(_idle_cleanup_loop())
         tasks.append(idle_cleanup_task)
@@ -394,7 +398,8 @@ async def main() -> None:
     setup_logging(debug=args.debug)
 
     logger = structlog.get_logger()
-    logger.info("Starting Claude Code Telegram Bot", version=__version__)
+    _build_info = get_build_info()
+    logger.info("Starting Claude Code Telegram Bot", version=__version__, build=_build_info)
 
     try:
         # Load configuration

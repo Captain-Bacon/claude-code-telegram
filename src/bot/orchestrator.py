@@ -606,6 +606,8 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Compact one-line status, no buttons."""
+        from src import get_build_info
+
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
@@ -631,8 +633,12 @@ class MessageOrchestrator:
         if current_model:
             model_str = f" · Model: {current_model}"
 
+        build = get_build_info()
+
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}{model_str}"
+            f"📂 {dir_display} · Session: {session_status}{cost_str}{model_str}\n"
+            f"Build: <code>{escape_html(build)}</code>",
+            parse_mode="HTML",
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
