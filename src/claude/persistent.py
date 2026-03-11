@@ -157,6 +157,7 @@ class PersistentClientManager:
             )
 
         entry.last_activity = time.time()
+        previous_state = entry.state
 
         # Create turn context with a future for the response
         loop = asyncio.get_event_loop()
@@ -185,10 +186,12 @@ class PersistentClientManager:
         entry.pending_turns += 1
 
         logger.info(
-            "Sent message to persistent client",
+            "turn.started",
             state_key=state_key,
-            state=entry.state,
+            transition=f"{previous_state}→busy",
             pending_turns=entry.pending_turns,
+            queued=previous_state == "busy",
+            prompt_len=len(prompt),
         )
 
         # Await the turn's completion
@@ -246,9 +249,10 @@ class PersistentClientManager:
         )
 
         logger.info(
-            "Stopped client",
+            "client.stopped",
             state_key=state_key,
             discarded_count=len(discarded),
+            pending_turns=entry.pending_turns,
         )
 
         return StopResult(was_busy=True, discarded_messages=discarded)
@@ -362,9 +366,10 @@ class PersistentClientManager:
 
         self._clients[state_key] = entry
         logger.info(
-            "Created persistent client",
+            "client.created",
             state_key=state_key,
             working_directory=str(working_directory),
+            collector_started=True,
         )
         return entry
 
@@ -403,7 +408,10 @@ class PersistentClientManager:
 
         # Remove from registry
         self._clients.pop(state_key, None)
-        logger.info("Disconnected persistent client", state_key=state_key)
+        logger.info(
+            "client.disconnected",
+            state_key=state_key,
+        )
 
     async def _response_collector(self, entry: PersistentClientEntry) -> None:
         """Persistent background loop collecting responses from CLI stdout.
@@ -411,15 +419,35 @@ class PersistentClientManager:
         Runs for the lifetime of the client. Each ResultMessage marks a turn end.
         Between ResultMessages, streams updates to the current turn's callback.
         """
+        msg_count = 0
         try:
             async for raw_data in entry.client._query.receive_messages():
+                msg_count += 1
                 try:
                     message = parse_message(raw_data)
                 except MessageParseError as e:
-                    logger.debug("Skipping unparseable message", error=str(e))
+                    logger.debug(
+                        "sdk.unparseable",
+                        state_key=entry.state_key,
+                        error=str(e),
+                        raw_keys=list(raw_data.keys()) if isinstance(raw_data, dict) else type(raw_data).__name__,
+                    )
                     continue
 
+                msg_type = type(message).__name__
                 turn = entry.current_turn
+
+                # Log every SDK message at debug level — the trail we need
+                # when diagnosing stalls and mystery signals
+                logger.debug(
+                    "sdk.message",
+                    state_key=entry.state_key,
+                    msg_type=msg_type,
+                    msg_num=msg_count,
+                    has_turn=turn is not None,
+                    state=entry.state,
+                    elapsed_ms=int((time.time() - turn.started_at) * 1000) if turn else None,
+                )
 
                 if isinstance(message, ResultMessage):
                     await self._handle_result_message(entry, message, raw_data)
@@ -437,6 +465,18 @@ class PersistentClientManager:
                             error=str(e),
                             state_key=entry.state_key,
                         )
+                elif not turn:
+                    # SDK sent us something but we have no active turn —
+                    # this is exactly the "no response requested" scenario
+                    logger.warning(
+                        "sdk.orphan_message",
+                        state_key=entry.state_key,
+                        msg_type=msg_type,
+                        msg_num=msg_count,
+                        state=entry.state,
+                        pending_turns=entry.pending_turns,
+                        raw_keys=list(raw_data.keys()) if isinstance(raw_data, dict) else None,
+                    )
 
                 # Collect message for response building
                 if turn:
@@ -445,16 +485,21 @@ class PersistentClientManager:
                         turn.result_raw_data.update(raw_data)
 
         except asyncio.CancelledError:
-            logger.debug(
-                "Response collector cancelled",
+            logger.info(
+                "collector.stopped",
                 state_key=entry.state_key,
+                messages_processed=msg_count,
             )
         except Exception as e:
             logger.error(
-                "Response collector died",
+                "collector.died",
                 state_key=entry.state_key,
                 error=str(e),
                 error_type=type(e).__name__,
+                messages_processed=msg_count,
+                state=entry.state,
+                pending_turns=entry.pending_turns,
+                has_turn=entry.current_turn is not None,
             )
             # Client is dead — resolve any pending futures with error
             await self._handle_client_death(entry, e)
@@ -514,13 +559,14 @@ class PersistentClientManager:
             entry.current_turn = None
 
         logger.info(
-            "Turn completed",
+            "turn.completed",
             state_key=entry.state_key,
             cost=response.cost,
             duration_ms=response.duration_ms,
             is_interrupted=response.is_interrupted,
             pending_turns=entry.pending_turns,
-            new_state=entry.state,
+            transition=f"busy→{entry.state}",
+            session_id=entry.session_id,
         )
 
     def _build_persistent_response(
