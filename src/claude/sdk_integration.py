@@ -189,16 +189,17 @@ class ClaudeSDKManager:
         PersistentClientManager. Handles system prompt loading, MCP config,
         tool validation, sandbox settings, and session resumption.
         """
-        # Build system prompt — APPEND to the default Claude Code prompt
-        # (not replace). Using the preset+append pattern preserves all
-        # built-in tool guidance, safety rules, and efficiency instructions.
-        append_prompt = (
+        # Build system prompt as a plain string (replaces the default Claude
+        # Code SWE prompt). This is intentional — the SWE prompt's
+        # action-oriented personality conflicts with the bot's use case.
+        # CLAUDE.md in the working directory shapes the bot's behaviour.
+        base_prompt = (
             f"All file operations must stay within {working_directory}. "
             "Use relative paths."
         )
         claude_md_path = Path(working_directory) / "CLAUDE.md"
         if claude_md_path.exists():
-            append_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+            base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
             logger.info(
                 "Loaded CLAUDE.md into system prompt",
                 path=str(claude_md_path),
@@ -227,11 +228,7 @@ class ClaudeSDKManager:
                 "autoAllowBashIfSandboxed": True,
                 "excludedCommands": self.config.sandbox_excluded_commands or [],
             },
-            system_prompt={
-                "type": "preset",
-                "preset": "claude_code",
-                "append": append_prompt,
-            },
+            system_prompt=base_prompt,
             setting_sources=["project", "user"],
             stderr=stderr_callback,
         )
