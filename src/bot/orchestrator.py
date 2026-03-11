@@ -1030,9 +1030,12 @@ class MessageOrchestrator:
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text:
-                    # Send text commentary as persistent message immediately
-                    if telegram_update and text:
-                        await _enqueue_text(text)
+                    # Don't send assistant text as a standalone message here —
+                    # the final response already contains the complete answer.
+                    # Sending here causes duplicates. Progress display and
+                    # tool_log capture below are sufficient for mid-stream
+                    # visibility; thinking blocks (above) are ephemeral and
+                    # deleted after the final response.
 
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
