@@ -70,6 +70,7 @@ class PersistentResponse:
     num_turns: int
     is_error: bool = False
     is_interrupted: bool = False
+    stop_reason: Optional[str] = None  # SDK stop_reason: "end_turn", "max_tokens", etc.
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     context_window: Optional[int] = None
     total_input_tokens: Optional[int] = None
@@ -564,6 +565,8 @@ class PersistentClientManager:
             cost=response.cost,
             duration_ms=response.duration_ms,
             is_interrupted=response.is_interrupted,
+            stop_reason=response.stop_reason,
+            num_turns=response.num_turns,
             pending_turns=entry.pending_turns,
             transition=f"busy→{entry.state}",
             session_id=entry.session_id,
@@ -653,6 +656,9 @@ class PersistentClientManager:
         # Interrupted detection
         is_interrupted = entry._interrupted
 
+        # Stop reason from SDK
+        stop_reason = getattr(result, "stop_reason", None)
+
         return PersistentResponse(
             content=content,
             session_id=session_id,
@@ -660,6 +666,7 @@ class PersistentClientManager:
             duration_ms=duration_ms,
             num_turns=num_turns,
             is_interrupted=is_interrupted,
+            stop_reason=stop_reason,
             tools_used=tools_used,
             context_window=context_window,
             total_input_tokens=total_input_tokens,

@@ -164,6 +164,30 @@ class MessageOrchestrator:
             icon = "ℹ️"
         return f"\n\n{icon} {level}% context remaining"
 
+    _STOP_REASON_LABELS = {
+        "max_tokens": "reached token limit",
+        "max_turns": "reached tool use limit",
+        "budget_exceeded": "reached cost limit",
+        "stop_sequence": "hit a stop condition",
+    }
+
+    @staticmethod
+    def _abnormal_stop_notice(response: Any) -> Optional["FormattedMessage"]:
+        """Return a user-facing notice if the turn ended abnormally."""
+        from .utils.formatting import FormattedMessage
+
+        stop_reason = getattr(response, "stop_reason", None)
+        if not stop_reason or stop_reason == "end_turn":
+            return None
+        label = MessageOrchestrator._STOP_REASON_LABELS.get(
+            stop_reason, stop_reason
+        )
+        return FormattedMessage(
+            f"\n⚠️ Claude was cut short ({label}). "
+            f"Send a follow-up to continue.",
+            parse_mode=None,
+        )
+
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
 
@@ -1314,6 +1338,17 @@ class MessageOrchestrator:
                     FormattedMessage("[Interrupted]", parse_mode=None)
                 )
 
+            # Warn if the turn ended for a non-normal reason
+            stop_notice = self._abnormal_stop_notice(claude_response)
+            if stop_notice:
+                formatted_messages.append(stop_notice)
+                logger.warning(
+                    "turn.abnormal_stop",
+                    state_key=self._state_key(update),
+                    stop_reason=claude_response.stop_reason,
+                    num_turns=claude_response.num_turns,
+                )
+
             # Append context window warning if threshold crossed
             ctx_warn = self._context_warning(claude_response, context.user_data)
             if ctx_warn and formatted_messages:
@@ -1681,6 +1716,11 @@ class MessageOrchestrator:
 
         formatter = ResponseFormatter(self.settings)
         formatted_messages = formatter.format_claude_response(claude_response.content)
+
+        # Warn if the turn ended for a non-normal reason
+        stop_notice = self._abnormal_stop_notice(claude_response)
+        if stop_notice:
+            formatted_messages.append(stop_notice)
 
         # Append context window warning if threshold crossed
         ctx_warn = self._context_warning(claude_response, context.user_data)
