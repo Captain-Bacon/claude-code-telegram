@@ -300,6 +300,8 @@ async def run_application(app: Dict[str, Any]) -> None:
         tasks = []
 
         # Persistent client heartbeat + idle cleanup (runs every 5 minutes)
+        build_info = get_build_info()
+
         async def _idle_cleanup_loop() -> None:
             while True:
                 await asyncio.sleep(300)
@@ -307,12 +309,12 @@ async def run_application(app: Dict[str, Any]) -> None:
                     cleaned = await persistent_manager.cleanup_idle_clients()
                     logger.info(
                         "Heartbeat",
-                        build=_build_info,
+                        build=build_info,
                         active_clients=len(persistent_manager._clients),
                         cleaned=cleaned,
                     )
                 except Exception as e:
-                    logger.warning("Idle cleanup error", error=str(e), build=_build_info)
+                    logger.warning("Idle cleanup error", error=str(e), build=build_info)
 
         idle_cleanup_task = asyncio.create_task(_idle_cleanup_loop())
         tasks.append(idle_cleanup_task)
