@@ -890,68 +890,75 @@ class MessageOrchestrator:
         _thinking_message_ids: List[int] = []
         _text_batch_task: List[Optional[asyncio.Task]] = [None]
 
+        # Lock protecting the mutable closure state above.  Without this,
+        # concurrent async operations (_schedule_flush, _enqueue_text,
+        # the external flush_pending entry-point) race on the shared lists
+        # and the cancel-and-recreate pattern for _text_batch_task.
+        _stream_lock = asyncio.Lock()
+
         async def _flush_pending_text() -> None:
             """Send accumulated text/thinking as persistent messages."""
-            if not telegram_update:
-                return
-
-            # Flush thinking as ephemeral messages (deleted after final response)
-            if _pending_thinking:
-                from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
-
-                thinking_text = "\n\n".join(_pending_thinking)
-                _pending_thinking.clear()
-                escaped = html_mod.escape(thinking_text)
-                # Reserve space for prefix "🧠 " (6 bytes encoded)
-                prefix = "\U0001f9e0 "
-                max_content = TELEGRAM_MAX_MESSAGE_LENGTH - len(prefix)
-                if len(escaped) > max_content:
-                    escaped = escaped[: max_content - 1] + "\u2026"
-                thinking_msg = f"{prefix}{escaped}"
-                try:
-                    sent = await telegram_update.effective_message.reply_text(
-                        thinking_msg,
-                        parse_mode="HTML",
-                    )
-                    _thinking_message_ids.append(sent.message_id)
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    logger.debug("Failed to send thinking message", error=str(e))
-
-            # Flush commentary text
-            if _pending_text:
-                combined = "\n\n".join(_pending_text)
-                _pending_text.clear()
-                if not combined.strip():
+            async with _stream_lock:
+                if not telegram_update:
                     return
 
-                from .utils.formatting import ResponseFormatter
+                # Flush thinking as ephemeral messages (deleted after final response)
+                if _pending_thinking:
+                    from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
 
-                formatter = ResponseFormatter(self.settings)
-                formatted = formatter.format_claude_response(combined)
-                for msg in formatted:
-                    if not msg.text or not msg.text.strip():
-                        continue
+                    thinking_text = "\n\n".join(_pending_thinking)
+                    _pending_thinking.clear()
+                    escaped = html_mod.escape(thinking_text)
+                    # Reserve space for prefix "🧠 " (6 bytes encoded)
+                    prefix = "\U0001f9e0 "
+                    max_content = TELEGRAM_MAX_MESSAGE_LENGTH - len(prefix)
+                    if len(escaped) > max_content:
+                        escaped = escaped[: max_content - 1] + "\u2026"
+                    thinking_msg = f"{prefix}{escaped}"
                     try:
-                        await telegram_update.effective_message.reply_text(
-                            msg.text,
-                            parse_mode=msg.parse_mode,
-                            reply_markup=None,
+                        sent = await telegram_update.effective_message.reply_text(
+                            thinking_msg,
+                            parse_mode="HTML",
                         )
+                        _thinking_message_ids.append(sent.message_id)
                         await asyncio.sleep(0.3)
-                    except Exception as send_err:
-                        logger.warning(
-                            "Failed to send intermediate text",
-                            error=str(send_err),
-                        )
-                        # Fallback: send as plain text
+                    except Exception as e:
+                        logger.debug("Failed to send thinking message", error=str(e))
+
+                # Flush commentary text
+                if _pending_text:
+                    combined = "\n\n".join(_pending_text)
+                    _pending_text.clear()
+                    if not combined.strip():
+                        return
+
+                    from .utils.formatting import ResponseFormatter
+
+                    formatter = ResponseFormatter(self.settings)
+                    formatted = formatter.format_claude_response(combined)
+                    for msg in formatted:
+                        if not msg.text or not msg.text.strip():
+                            continue
                         try:
                             await telegram_update.effective_message.reply_text(
-                                combined,
+                                msg.text,
+                                parse_mode=msg.parse_mode,
                                 reply_markup=None,
                             )
-                        except Exception:
-                            pass
+                            await asyncio.sleep(0.3)
+                        except Exception as send_err:
+                            logger.warning(
+                                "Failed to send intermediate text",
+                                error=str(send_err),
+                            )
+                            # Fallback: send as plain text
+                            try:
+                                await telegram_update.effective_message.reply_text(
+                                    combined,
+                                    reply_markup=None,
+                                )
+                            except Exception:
+                                pass
 
         async def _schedule_flush() -> None:
             """Wait for the batch window then flush."""
@@ -961,15 +968,16 @@ class MessageOrchestrator:
 
         async def _enqueue_text(text: str, is_thinking: bool = False) -> None:
             """Add text to the pending batch and schedule a flush."""
-            if is_thinking:
-                _pending_thinking.append(text)
-            else:
-                _pending_text.append(text)
+            async with _stream_lock:
+                if is_thinking:
+                    _pending_thinking.append(text)
+                else:
+                    _pending_text.append(text)
 
-            # Cancel any existing scheduled flush and restart the timer
-            if _text_batch_task[0] is not None:
-                _text_batch_task[0].cancel()
-            _text_batch_task[0] = asyncio.create_task(_schedule_flush())
+                # Cancel any existing scheduled flush and restart the timer
+                if _text_batch_task[0] is not None:
+                    _text_batch_task[0].cancel()
+                _text_batch_task[0] = asyncio.create_task(_schedule_flush())
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
             # Intercept send_image_to_user MCP tool calls.
@@ -1023,7 +1031,7 @@ class MessageOrchestrator:
                 text = update_obj.content.strip()
                 if text:
                     # Send text commentary as persistent message immediately
-                    if telegram_update and update_obj.tool_calls:
+                    if telegram_update and text:
                         await _enqueue_text(text)
 
                     first_line = text.split("\n", 1)[0].strip()
@@ -1376,10 +1384,13 @@ class MessageOrchestrator:
                     await draft_streamer.flush()
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
-
-        # Flush any pending batched intermediate text before final response
-        if success:
-            await self._flush_stream_callback(on_stream)
+            # Flush any pending batched intermediate text before final response.
+            # This runs in the finally block so buffered text is delivered even
+            # on error paths (previously only flushed on success).
+            try:
+                await self._flush_stream_callback(on_stream)
+            except Exception:
+                logger.debug("Stream callback flush failed in finally block", user_id=user_id)
 
         try:
             await progress_msg.delete()

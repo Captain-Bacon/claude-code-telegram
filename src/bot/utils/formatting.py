@@ -38,19 +38,22 @@ class ResponseFormatter:
         self, text: str, context: Optional[dict] = None
     ) -> List[FormattedMessage]:
         """Enhanced formatting with context awareness and semantic chunking."""
-        # Clean and prepare text
-        text = self._clean_text(text)
+        # Clean whitespace but keep raw markdown (don't convert to HTML yet)
+        text = self._clean_whitespace(text)
 
         # Check if we need semantic chunking (for complex content)
+        # This runs on raw markdown so ``` markers are still present
         if self._should_use_semantic_chunking(text):
-            # Use enhanced semantic chunking for complex content
+            # Chunk raw markdown first, then convert each chunk to HTML
             chunks = self._semantic_chunk(text, context)
             messages = []
             for chunk in chunks:
+                chunk["content"] = markdown_to_telegram_html(chunk["content"])
                 formatted = self._format_chunk(chunk)
                 messages.extend(formatted)
         else:
-            # Use original simple formatting for basic content
+            # Simple path: convert to HTML, then format code blocks
+            text = markdown_to_telegram_html(text)
             text = self._format_code_blocks(text)
             messages = self._split_message(text)
 
@@ -438,14 +441,9 @@ class ResponseFormatter:
 
         return InlineKeyboardMarkup(buttons) if buttons else None
 
-    def _clean_text(self, text: str) -> str:
-        """Clean text for Telegram display."""
-        # Remove excessive whitespace
+    def _clean_whitespace(self, text: str) -> str:
+        """Clean excessive whitespace from text."""
         text = re.sub(r"\n{3,}", "\n\n", text)
-
-        # Convert markdown to Telegram HTML
-        text = markdown_to_telegram_html(text)
-
         return text.strip()
 
     def _format_code_blocks(self, text: str) -> str:
@@ -462,7 +460,7 @@ class ResponseFormatter:
                 inner = m.group(1)
                 truncated = inner[: self.max_code_block_length - 80]
                 return (
-                    f"<pre><code>{escape_html(truncated)}\n... (truncated)</code></pre>"
+                    f"<pre><code>{truncated}\n... (truncated)</code></pre>"
                 )
             return full
 

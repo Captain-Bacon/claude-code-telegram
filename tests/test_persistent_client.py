@@ -11,7 +11,6 @@ from src.claude.persistent import (
     PersistentClientEntry,
     PersistentClientManager,
     PersistentResponse,
-    QueuedMessage,
     StopResult,
     TurnContext,
     derive_state_key,
@@ -289,17 +288,16 @@ class TestStopClient:
         manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
         entry = _make_entry(state="busy", pending_turns=3)
         entry.current_turn = _make_turn_context()
-        entry.queued_messages = [
-            QueuedMessage(text="follow-up 1", queued_at=time.time()),
-            QueuedMessage(text="follow-up 2", queued_at=time.time()),
-        ]
+        # Queue follow-up turns (not the current turn)
+        await entry.turn_queue.put(_make_turn_context(prompt="follow-up 1"))
+        await entry.turn_queue.put(_make_turn_context(prompt="follow-up 2"))
         manager._clients["1:2"] = entry
 
         result = await manager.stop_client("1:2")
 
         assert result.was_busy is True
         assert result.discarded_messages == ["follow-up 1", "follow-up 2"]
-        assert entry.queued_messages == []
+        assert entry.turn_queue.empty()
 
     @pytest.mark.asyncio
     async def test_stop_cancels_queued_turn_futures(self):

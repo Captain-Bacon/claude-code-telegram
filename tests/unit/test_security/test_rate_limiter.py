@@ -117,9 +117,8 @@ class TestRateLimiter:
         assert allowed is True
         assert message is None
 
-        # Should have created bucket and tracked cost
+        # Should have created bucket (cost tracking is disabled)
         assert user_id in rate_limiter.request_buckets
-        assert rate_limiter.cost_tracker[user_id] == 0.5
 
     async def test_request_rate_limit_exceeded(self, rate_limiter):
         """Test request rate limit exceeded."""
@@ -135,30 +134,28 @@ class TestRateLimiter:
         assert "Rate limit exceeded" in message
         assert "wait" in message.lower()
 
-    async def test_cost_limit_exceeded(self, rate_limiter):
-        """Test cost limit exceeded."""
+    async def test_cost_parameter_is_noop(self, rate_limiter):
+        """Test that cost parameter is accepted but ignored (no cost-based limiting)."""
         user_id = 123
 
-        # Set cost near limit and set reset time to prevent auto-reset
+        # Even with high cost values, should pass (cost checking removed)
         rate_limiter.cost_tracker[user_id] = 4.8
-        rate_limiter.cost_reset_time[user_id] = datetime.now(UTC)  # Prevent reset
+        rate_limiter.cost_reset_time[user_id] = datetime.now(UTC)
 
-        # Request that would exceed limit
         allowed, message = await rate_limiter.check_rate_limit(user_id, cost=0.5)
-        assert allowed is False
-        assert "Cost limit exceeded" in message
-        assert "Remaining budget" in message
+        assert allowed is True
+        assert message is None
 
-    async def test_cost_tracking(self, rate_limiter):
-        """Test cost tracking functionality."""
+    async def test_cost_not_tracked(self, rate_limiter):
+        """Test that cost is not tracked (cost-based limiting removed)."""
         user_id = 123
 
-        # Track multiple costs
         await rate_limiter.check_rate_limit(user_id, cost=1.0)
         await rate_limiter.check_rate_limit(user_id, cost=1.5)
         await rate_limiter.check_rate_limit(user_id, cost=0.5)
 
-        assert rate_limiter.cost_tracker[user_id] == 3.0
+        # Cost tracking is disabled — tracker stays at zero
+        assert rate_limiter.cost_tracker[user_id] == 0.0
 
     async def test_user_limit_reset(self, rate_limiter):
         """Test resetting user limits."""
@@ -167,8 +164,7 @@ class TestRateLimiter:
         # Set up some usage
         await rate_limiter.check_rate_limit(user_id, cost=2.0, tokens=5)
 
-        # Verify usage
-        assert rate_limiter.cost_tracker[user_id] == 2.0
+        # Cost not tracked (disabled), but bucket tokens should be consumed
         bucket = rate_limiter.request_buckets[user_id]
         assert bucket.tokens < bucket.capacity
 
@@ -209,8 +205,8 @@ class TestRateLimiter:
 
         assert "request_bucket" in status
         assert "cost_usage" in status
-        assert status["cost_usage"]["current"] == 2.0
-        assert status["cost_usage"]["remaining"] == 3.0  # 5.0 - 2.0
+        # Cost not tracked via check_rate_limit anymore, so current stays 0
+        assert status["cost_usage"]["current"] == 0.0
         assert 0 <= status["cost_usage"]["utilization"] <= 1
 
     async def test_global_status_reporting(self, rate_limiter):
@@ -222,7 +218,8 @@ class TestRateLimiter:
         status = rate_limiter.get_global_status()
 
         assert status["active_users"] == 2
-        assert status["total_cost_tracked"] == 3.0
+        # Cost not tracked via check_rate_limit anymore
+        assert status["total_cost_tracked"] == 0
         assert "config" in status
         assert (
             status["config"]["max_cost_per_user"]
@@ -261,9 +258,8 @@ class TestRateLimiter:
         # All should succeed (bucket has enough capacity)
         assert all(result[0] for result in results)
 
-        # Cost should be properly tracked
-        expected_cost = 10 * 0.1
-        assert abs(rate_limiter.cost_tracker[user_id] - expected_cost) < 0.01
+        # Cost not tracked (disabled)
+        assert rate_limiter.cost_tracker[user_id] == 0.0
 
     async def test_bucket_creation_per_user(self, rate_limiter):
         """Test that buckets are created per user."""
@@ -276,8 +272,9 @@ class TestRateLimiter:
         # Should have separate buckets and cost tracking
         assert user1 in rate_limiter.request_buckets
         assert user2 in rate_limiter.request_buckets
-        assert rate_limiter.cost_tracker[user1] == 1.0
-        assert rate_limiter.cost_tracker[user2] == 2.0
+        # Cost not tracked (disabled), but buckets should be separate
+        assert rate_limiter.cost_tracker[user1] == 0.0
+        assert rate_limiter.cost_tracker[user2] == 0.0
 
     async def test_edge_case_zero_cost(self, rate_limiter):
         """Test handling of zero cost requests."""

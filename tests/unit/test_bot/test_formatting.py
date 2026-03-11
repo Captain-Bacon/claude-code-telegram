@@ -160,28 +160,29 @@ class TestResponseFormatter:
         assert "Loading" in msg.text
         assert "%" not in msg.text
 
-    def test_clean_text(self, formatter):
-        """Test text cleaning."""
+    def test_clean_whitespace(self, formatter):
+        """Test whitespace cleaning."""
         messy_text = "Hello\n\n\n\nWorld"
-        cleaned = formatter._clean_text(messy_text)
+        cleaned = formatter._clean_whitespace(messy_text)
 
         # Should reduce multiple newlines
         assert "\n\n\n" not in cleaned
 
-    def test_clean_text_converts_markdown_to_html(self, formatter):
-        """Test that _clean_text converts markdown bold to HTML."""
+    def test_markdown_to_html_in_response(self, formatter):
+        """Test that format_claude_response converts markdown bold to HTML."""
         text = "This is **bold** text"
-        cleaned = formatter._clean_text(text)
-        assert "<b>bold</b>" in cleaned
+        messages = formatter.format_claude_response(text)
+        assert any("<b>bold</b>" in m.text for m in messages)
 
     def test_code_block_preservation(self, formatter):
         """Test that code blocks preserve special characters."""
         text = "Normal text\n```\ncode_with_underscores\n```"
-        cleaned = formatter._clean_text(text)
+        messages = formatter.format_claude_response(text)
+        full_text = " ".join(m.text for m in messages)
 
         # Code block content should be inside <pre><code> tags
-        assert "<pre><code>" in cleaned
-        assert "code_with_underscores" in cleaned
+        assert "<pre><code>" in full_text
+        assert "code_with_underscores" in full_text
 
     def test_truncate_long_code_block(self, formatter):
         """Test truncation of very long code blocks via _format_code_blocks."""

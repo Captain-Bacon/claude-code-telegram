@@ -40,14 +40,6 @@ _DEFAULT_IDLE_TIMEOUT_S = 1800
 
 
 @dataclass
-class QueuedMessage:
-    """A message queued while the client was busy."""
-
-    text: str
-    queued_at: float
-
-
-@dataclass
 class TurnContext:
     """Context for a single Claude turn within a persistent session."""
 
@@ -104,10 +96,10 @@ class PersistentClientEntry:
     last_activity: float = field(default_factory=time.time)
     previous_cumulative_cost: float = 0.0
     pending_turns: int = 0
-    queued_messages: List[QueuedMessage] = field(default_factory=list)
     collector_task: Optional[asyncio.Task] = None
     current_turn: Optional[TurnContext] = None
     turn_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _interrupted: bool = False
     _watchdog_task: Optional[asyncio.Task] = None
 
@@ -166,52 +158,59 @@ class PersistentClientManager:
                 state_key, working_directory, model=model
             )
 
-        entry.last_activity = time.time()
-        previous_state = entry.state
+        # Lock the state-check → query() section to prevent race
+        # between concurrent send_message calls on the same entry.
+        async with entry.send_lock:
+            entry.last_activity = time.time()
+            previous_state = entry.state
 
-        # Create turn context with a future for the response
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future[PersistentResponse] = loop.create_future()
-        turn = TurnContext(
-            prompt=prompt,
-            stream_callback=stream_callback,
-            response_future=future,
-            started_at=time.time(),
-        )
-
-        # IMPORTANT: Set current_turn BEFORE query() so the collector
-        # has a turn context when messages start flowing from the CLI.
-        if entry.state == "idle":
-            entry.state = "busy"
-            entry.current_turn = turn
-            # Start stall watchdog for this turn
-            if entry._watchdog_task and not entry._watchdog_task.done():
-                entry._watchdog_task.cancel()
-            entry._watchdog_task = asyncio.create_task(
-                self._turn_watchdog(entry),
-                name=f"watchdog:{state_key}",
+            # Create turn context with a future for the response
+            loop = asyncio.get_event_loop()
+            future: asyncio.Future[PersistentResponse] = loop.create_future()
+            turn = TurnContext(
+                prompt=prompt,
+                stream_callback=stream_callback,
+                response_future=future,
+                started_at=time.time(),
             )
-        else:
-            # Client is busy — queue for the collector to pick up
-            # after the current turn's ResultMessage
-            await entry.turn_queue.put(turn)
 
-        # Send query to CLI — it handles queueing internally.
-        # Must happen AFTER current_turn is set (idle case) or
-        # turn is queued (busy case).
-        await entry.client.query(prompt)
-        entry.pending_turns += 1
+            # IMPORTANT: Set current_turn BEFORE query() so the collector
+            # has a turn context when messages start flowing from the CLI.
+            if entry.state == "idle":
+                entry.state = "busy"
+                entry.current_turn = turn
+                # Start stall watchdog for this turn
+                if entry._watchdog_task and not entry._watchdog_task.done():
+                    entry._watchdog_task.cancel()
+                entry._watchdog_task = asyncio.create_task(
+                    self._turn_watchdog(entry),
+                    name=f"watchdog:{state_key}",
+                )
+            else:
+                # Client is busy — queue for the collector to pick up
+                # after the current turn's ResultMessage
+                await entry.turn_queue.put(turn)
 
-        logger.info(
-            "turn.started",
-            state_key=state_key,
-            transition=f"{previous_state}→busy",
-            pending_turns=entry.pending_turns,
-            queued=previous_state == "busy",
-            prompt_len=len(prompt),
-        )
+            # Increment pending_turns BEFORE query() so that if a ResultMessage
+            # for the previous turn arrives during the await, _handle_result_message
+            # sees the correct count and dequeues the next turn instead of going idle.
+            entry.pending_turns += 1
 
-        # Await the turn's completion
+            # Send query to CLI — it handles queueing internally.
+            # Must happen AFTER current_turn is set (idle case) or
+            # turn is queued (busy case).
+            await entry.client.query(prompt)
+
+            logger.info(
+                "turn.started",
+                state_key=state_key,
+                transition=f"{previous_state}→busy",
+                pending_turns=entry.pending_turns,
+                queued=previous_state == "busy",
+                prompt_len=len(prompt),
+            )
+
+        # Await the turn's completion (outside lock — don't block other senders)
         return await future
 
     async def stop_client(self, state_key: str) -> StopResult:
@@ -225,12 +224,9 @@ class PersistentClientManager:
         if entry is None or entry.state != "busy":
             return StopResult(was_busy=False, discarded_messages=[])
 
-        # Collect queued message texts before discarding
-        discarded = [qm.text for qm in entry.queued_messages]
-        entry.queued_messages.clear()
-
         # Cancel any pending turns beyond the current one
         # Drain the turn queue and cancel their futures
+        discarded = []
         cancelled_turns = []
         while not entry.turn_queue.empty():
             try:
@@ -238,6 +234,7 @@ class PersistentClientManager:
                 # Don't cancel the current turn — interrupt handles that
                 if turn is not entry.current_turn:
                     cancelled_turns.append(turn)
+                    discarded.append(turn.prompt)
             except asyncio.QueueEmpty:
                 break
 
@@ -577,13 +574,14 @@ class PersistentClientManager:
                 if isinstance(message, ResultMessage):
                     await self._handle_result_message(entry, message, raw_data)
                 elif turn and turn.stream_callback:
-                    # Stream update to current turn's callback
+                    # Stream update(s) to current turn's callback
                     try:
-                        update = self._message_to_stream_update(message)
-                        if update:
-                            result = turn.stream_callback(update)
-                            if asyncio.iscoroutine(result):
-                                await result
+                        updates = self._message_to_stream_update(message)
+                        if updates:
+                            for update in updates:
+                                result = turn.stream_callback(update)
+                                if asyncio.iscoroutine(result):
+                                    await result
                     except Exception as e:
                         logger.warning(
                             "Stream callback error",
@@ -673,6 +671,11 @@ class PersistentClientManager:
             try:
                 next_turn = entry.turn_queue.get_nowait()
                 entry.current_turn = next_turn
+                # Restart stall watchdog for the follow-up turn
+                entry._watchdog_task = asyncio.create_task(
+                    self._turn_watchdog(entry),
+                    name=f"watchdog:{entry.state_key}",
+                )
             except asyncio.QueueEmpty:
                 # Queue empty but pending_turns > 0 — defensive reset
                 logger.warning(
@@ -862,8 +865,15 @@ class PersistentClientManager:
         self._clients.pop(entry.state_key, None)
 
     @staticmethod
-    def _message_to_stream_update(message: Message) -> Optional[StreamUpdate]:
-        """Convert an SDK message to a StreamUpdate for the stream callback."""
+    def _message_to_stream_update(
+        message: Message,
+    ) -> Optional[List[StreamUpdate]]:
+        """Convert an SDK message to StreamUpdate(s) for the stream callback.
+
+        Returns a list of updates (possibly empty/None).  When an
+        AssistantMessage contains both thinking blocks and tool calls,
+        both are emitted as separate updates so neither shadows the other.
+        """
         if isinstance(message, AssistantMessage):
             content = getattr(message, "content", [])
             text_parts = []
@@ -887,19 +897,27 @@ class PersistentClientManager:
                     elif hasattr(block, "text"):
                         text_parts.append(block.text)
 
+            updates: List[StreamUpdate] = []
+
             # Emit thinking blocks as a separate update
             if thinking_parts:
-                return StreamUpdate(
-                    type="thinking",
-                    content="\n".join(thinking_parts),
+                updates.append(
+                    StreamUpdate(
+                        type="thinking",
+                        content="\n".join(thinking_parts),
+                    )
                 )
 
             if text_parts or tool_calls:
-                return StreamUpdate(
-                    type="assistant",
-                    content=("\n".join(text_parts) if text_parts else None),
-                    tool_calls=tool_calls if tool_calls else None,
+                updates.append(
+                    StreamUpdate(
+                        type="assistant",
+                        content=("\n".join(text_parts) if text_parts else None),
+                        tool_calls=tool_calls if tool_calls else None,
+                    )
                 )
+
+            return updates if updates else None
 
         elif isinstance(message, StreamEvent):
             event = getattr(message, "event", None) or {}
@@ -908,11 +926,11 @@ class PersistentClientManager:
                 if delta.get("type") == "text_delta":
                     text = delta.get("text", "")
                     if text:
-                        return StreamUpdate(type="stream_delta", content=text)
+                        return [StreamUpdate(type="stream_delta", content=text)]
 
         elif isinstance(message, UserMessage):
             content = getattr(message, "content", "")
             if content:
-                return StreamUpdate(type="user", content=content)
+                return [StreamUpdate(type="user", content=content)]
 
         return None

@@ -103,20 +103,8 @@ class RateLimiter:
                 )
                 return False, rate_message
 
-            # Check cost limit
-            cost_allowed, cost_message = self._check_cost_limit(user_id, cost)
-            if not cost_allowed:
-                logger.warning(
-                    "Cost limit exceeded",
-                    user_id=user_id,
-                    cost_requested=cost,
-                    current_usage=self.cost_tracker[user_id],
-                )
-                return False, cost_message
-
-            # If both checks pass, consume resources
+            # If rate check passes, consume request tokens
             self._consume_request_tokens(user_id, tokens)
-            self._track_cost(user_id, cost)
 
             logger.debug(
                 "Rate limit check passed", user_id=user_id, cost=cost, tokens=tokens
@@ -129,7 +117,7 @@ class RateLimiter:
         """Check request rate limit."""
         bucket = self._get_or_create_bucket(user_id)
 
-        if bucket.consume(tokens):
+        if bucket.get_wait_time(tokens) == 0.0:
             return True, None
 
         wait_time = bucket.get_wait_time(tokens)
