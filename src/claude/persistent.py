@@ -728,9 +728,13 @@ class PersistentClientManager:
         # Duration
         duration_ms = int((time.time() - turn.started_at) * 1000)
 
-        # Content extraction — use ResultMessage.result if available
+        # Content extraction — use ResultMessage.result if non-empty,
+        # otherwise fall back to assembling from AssistantMessage blocks.
+        # NOTE: The CLI may send result="" for some turns (e.g. conversational
+        # replies without tool use). An `is not None` check treated "" as valid
+        # content, producing "(No content to display)" in Telegram.
         result_content = getattr(result, "result", None)
-        if result_content is not None:
+        if result_content:
             content = result_content
         else:
             content_parts = []

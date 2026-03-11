@@ -56,11 +56,10 @@ class ProductionConfig:
     development_mode: bool = False
     log_level: str = "INFO"
     enable_telemetry: bool = True
-    # Use stricter defaults for production
-    claude_max_cost_per_user: float = 5.0  # Lower cost limit
-    claude_max_cost_per_request: float = 2.0  # Per-request SDK cap
-    rate_limit_requests: int = 5  # Stricter rate limiting
-    session_timeout_hours: int = 12  # Shorter session timeout
+    # Production defaults — relaxed for single-user subscription use.
+    # Cost tracking and rate limiting serve no purpose when you're the
+    # only user on a flat-rate subscription.  The .env values take over.
+    session_timeout_hours: int = 12
 
     @classmethod
     def as_dict(cls) -> Dict[str, Any]:

@@ -44,11 +44,17 @@ def setup_logging(debug: bool = False) -> None:
     """Configure structured logging."""
     level = logging.DEBUG if debug else logging.INFO
 
+    # Always write to both stdout AND bot-debug.log so diagnostics survive
+    log_file = Path(__file__).resolve().parent.parent / "bot-debug.log"
+    file_handler = logging.FileHandler(str(log_file), mode="a")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+
     # Configure standard logging
     logging.basicConfig(
         level=level,
         format="%(message)s",
-        stream=sys.stdout,
+        handlers=[logging.StreamHandler(sys.stdout), file_handler],
     )
 
     # Configure structlog
