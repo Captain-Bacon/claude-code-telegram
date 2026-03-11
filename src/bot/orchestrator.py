@@ -890,6 +890,13 @@ class MessageOrchestrator:
         _thinking_message_ids: List[int] = []
         _text_batch_task: List[Optional[asyncio.Task]] = [None]
 
+        # Track whether tool calls have occurred this turn.  When True,
+        # assistant commentary is sent as persistent standalone messages
+        # (mid-work updates like "Let me check that file").  When False,
+        # assistant text IS the final response and sending it here would
+        # duplicate the final reply.
+        _has_tool_calls = [False]
+
         # Lock protecting the mutable closure state above.  Without this,
         # concurrent async operations (_schedule_flush, _enqueue_text,
         # the external flush_pending entry-point) race on the shared lists
@@ -1000,6 +1007,7 @@ class MessageOrchestrator:
 
             # Capture tool calls
             if update_obj.tool_calls:
+                _has_tool_calls[0] = True
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
                     detail = self._summarize_tool_input(name, tc.get("input", {}))
@@ -1030,12 +1038,14 @@ class MessageOrchestrator:
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text:
-                    # Don't send assistant text as a standalone message here —
-                    # the final response already contains the complete answer.
-                    # Sending here causes duplicates. Progress display and
-                    # tool_log capture below are sufficient for mid-stream
-                    # visibility; thinking blocks (above) are ephemeral and
-                    # deleted after the final response.
+                    # Only send as a standalone persistent message when
+                    # tool calls have occurred — that means Claude is
+                    # mid-work and the commentary is genuinely different
+                    # from the final response.  Without tool calls, the
+                    # assistant text IS the final response and sending
+                    # it here would duplicate.
+                    if telegram_update and _has_tool_calls[0]:
+                        await _enqueue_text(text)
 
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
