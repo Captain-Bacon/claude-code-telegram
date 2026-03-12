@@ -263,6 +263,22 @@ class ClaudeCodeBot:
     ) -> None:
         """Handle errors globally."""
         error = context.error
+
+        # Silently ignore errors from update types we don't handle
+        # (e.g. message reactions from double-tapping in Telegram).
+        # These produce AttributeErrors when handlers assume .message exists.
+        if update and not update.message and not update.callback_query:
+            logger.debug(
+                "Ignoring error from non-message update",
+                error=str(error),
+                user_id=(
+                    update.effective_user.id
+                    if update.effective_user
+                    else None
+                ),
+            )
+            return
+
         logger.error(
             "Global error handler triggered",
             error=str(error),
