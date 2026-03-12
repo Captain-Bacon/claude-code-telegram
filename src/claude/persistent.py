@@ -125,6 +125,7 @@ class PersistentClientManager:
 
     def __init__(self, sdk_manager: ClaudeSDKManager, config: Any):
         self._clients: Dict[str, PersistentClientEntry] = {}
+        self._saved_sessions: Dict[str, str] = {}  # state_key → session_id
         self._sdk_manager = sdk_manager
         self._config = config
 
@@ -376,6 +377,14 @@ class PersistentClientManager:
         for key in to_remove:
             entry = self._clients.get(key)
             if entry:
+                # Preserve session_id so we can resume on reconnect
+                if entry.session_id:
+                    self._saved_sessions[key] = entry.session_id
+                    logger.info(
+                        "Saved session for future resume",
+                        state_key=key,
+                        session_id=entry.session_id,
+                    )
                 await self._disconnect_entry(entry)
                 logger.info(
                     "Cleaned up idle client",
@@ -410,10 +419,18 @@ class PersistentClientManager:
         working_directory: Path,
         model: Optional[str] = None,
     ) -> PersistentClientEntry:
-        """Create and connect a new persistent client."""
+        """Create and connect a new persistent client.
+
+        If a previous session_id was saved for this state_key (e.g. after
+        idle cleanup), resumes that session so conversation context is
+        preserved.
+        """
+        saved_session_id = self._saved_sessions.pop(state_key, None)
         options = self._sdk_manager.build_options(
             working_directory=working_directory,
             model=model,
+            session_id=saved_session_id,
+            continue_session=bool(saved_session_id),
             include_partial_messages=True,
         )
 
