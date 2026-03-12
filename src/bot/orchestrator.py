@@ -1334,6 +1334,10 @@ class MessageOrchestrator:
             if claude_response is None:
                 heartbeat.cancel()
                 try:
+                    await update.message.set_reaction("\U0001f440")  # 👀
+                except Exception:
+                    pass
+                try:
                     await progress_msg.delete()
                 except Exception:
                     pass
