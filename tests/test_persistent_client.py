@@ -159,24 +159,27 @@ class TestHandleResultMessage:
         assert entry.pending_turns == 0
 
     @pytest.mark.asyncio
-    async def test_picks_up_next_turn_from_queue(self):
-        """If more turns are pending, collector should pick up next from queue."""
+    async def test_always_returns_to_idle_after_result(self):
+        """ResultMessage always returns entry to idle.
+
+        Injected messages (sent while busy) are absorbed into the current
+        turn by the CLI — they don't produce their own ResultMessage.
+        So when a ResultMessage arrives, the turn is done and we go idle.
+        """
         manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
-        entry = _make_entry(state="busy", pending_turns=2)
-        turn1 = _make_turn_context(prompt="first")
-        turn2 = _make_turn_context(prompt="second")
-        entry.current_turn = turn1
-        await entry.turn_queue.put(turn2)
+        entry = _make_entry(state="busy", pending_turns=1)
+        turn = _make_turn_context(prompt="first")
+        entry.current_turn = turn
         manager._clients["1:2"] = entry
 
         await manager._handle_result_message(
             entry, _make_mock_result_message(), {}
         )
 
-        assert turn1.response_future.done()
-        assert entry.current_turn is turn2
-        assert entry.state == "busy"
-        assert entry.pending_turns == 1
+        assert turn.response_future.done()
+        assert entry.current_turn is None
+        assert entry.state == "idle"
+        assert entry.pending_turns == 0
 
     @pytest.mark.asyncio
     async def test_no_active_turn_logs_warning(self):

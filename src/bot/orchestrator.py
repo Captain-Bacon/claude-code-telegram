@@ -1254,22 +1254,30 @@ class MessageOrchestrator:
         state_key = self._state_key(update)
         client_state = persistent_manager.get_client_state(state_key)
 
-        # If client is busy, acknowledge the follow-up with a reaction
+        # If client is busy, inject the message into the current turn
+        # and return immediately.  The CLI absorbs it as a system reminder
+        # between tool calls — no separate response is produced.
         if client_state == "busy":
             try:
                 await update.message.set_reaction("\U0001f440")  # 👀
             except Exception:
-                pass  # Reactions may not be supported in all chats
+                pass
+            await persistent_manager.send_message(
+                state_key=state_key,
+                prompt=message_text,
+                working_directory=context.user_data.get(
+                    "current_directory", self.settings.approved_directory
+                ),
+            )
             logger.info(
-                "Follow-up queued (client busy)",
+                "Follow-up injected (client busy)",
                 user_id=user_id,
                 state_key=state_key,
             )
+            return
 
         verbose_level = self._get_verbose_level(context)
-        progress_msg = await update.message.reply_text(
-            "Queued..." if client_state == "busy" else "Working..."
-        )
+        progress_msg = await update.message.reply_text("Working...")
 
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
@@ -1718,6 +1726,14 @@ class MessageOrchestrator:
                 model=context.user_data.get("claude_model"),
                 force_new=force_new,
             )
+            # None means the message was injected into a busy turn
+            if claude_response is None:
+                heartbeat.cancel()
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                return
         except asyncio.CancelledError:
             logger.info("Claude media request cancelled", user_id=user_id)
             try:

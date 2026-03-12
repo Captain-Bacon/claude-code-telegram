@@ -136,14 +136,17 @@ class PersistentClientManager:
         stream_callback: Optional[Callable[[StreamUpdate], Any]] = None,
         model: Optional[str] = None,
         force_new: bool = False,
-    ) -> PersistentResponse:
+    ) -> Optional[PersistentResponse]:
         """Send a message to Claude via persistent client.
 
         If no client exists for state_key, creates one.
-        If client is idle, sends query immediately.
-        If client is busy, sends query() to CLI (queued as next turn).
+        If client is idle, sends query and awaits the turn's result.
+        If client is busy, injects via query() and returns None immediately.
+            The CLI absorbs injected messages into the current turn —
+            no separate ResultMessage is produced, so there is nothing
+            to await.
 
-        Returns PersistentResponse when the turn completes.
+        Returns PersistentResponse for normal turns, None for injections.
         """
         entry = self._clients.get(state_key)
 
@@ -164,7 +167,23 @@ class PersistentClientManager:
             entry.last_activity = time.time()
             previous_state = entry.state
 
-            # Create turn context with a future for the response
+            if entry.state == "busy":
+                # Client is mid-turn.  query() injects this message into
+                # the current turn (appears as a system reminder between
+                # tool calls).  The CLI does NOT produce a separate
+                # ResultMessage for injected queries, so we must NOT
+                # create a TurnContext or increment pending_turns —
+                # doing so would leave the state permanently stuck on
+                # "busy" waiting for a ResultMessage that never comes.
+                await entry.client.query(prompt)
+                logger.info(
+                    "turn.injected",
+                    state_key=state_key,
+                    prompt_len=len(prompt),
+                )
+                return None
+
+            # Normal idle → busy transition
             loop = asyncio.get_event_loop()
             future: asyncio.Future[PersistentResponse] = loop.create_future()
             turn = TurnContext(
@@ -174,39 +193,22 @@ class PersistentClientManager:
                 started_at=time.time(),
             )
 
-            # IMPORTANT: Set current_turn BEFORE query() so the collector
-            # has a turn context when messages start flowing from the CLI.
-            if entry.state == "idle":
-                entry.state = "busy"
-                entry.current_turn = turn
-                # Start stall watchdog for this turn
-                if entry._watchdog_task and not entry._watchdog_task.done():
-                    entry._watchdog_task.cancel()
-                entry._watchdog_task = asyncio.create_task(
-                    self._turn_watchdog(entry),
-                    name=f"watchdog:{state_key}",
-                )
-            else:
-                # Client is busy — queue for the collector to pick up
-                # after the current turn's ResultMessage
-                await entry.turn_queue.put(turn)
-
-            # Increment pending_turns BEFORE query() so that if a ResultMessage
-            # for the previous turn arrives during the await, _handle_result_message
-            # sees the correct count and dequeues the next turn instead of going idle.
+            entry.state = "busy"
+            entry.current_turn = turn
+            # Start stall watchdog for this turn
+            if entry._watchdog_task and not entry._watchdog_task.done():
+                entry._watchdog_task.cancel()
+            entry._watchdog_task = asyncio.create_task(
+                self._turn_watchdog(entry),
+                name=f"watchdog:{state_key}",
+            )
             entry.pending_turns += 1
 
-            # Send query to CLI — it handles queueing internally.
-            # Must happen AFTER current_turn is set (idle case) or
-            # turn is queued (busy case).
             await entry.client.query(prompt)
 
             logger.info(
                 "turn.started",
                 state_key=state_key,
-                transition=f"{previous_state}→busy",
-                pending_turns=entry.pending_turns,
-                queued=previous_state == "busy",
                 prompt_len=len(prompt),
             )
 
@@ -665,30 +667,12 @@ class PersistentClientManager:
         if entry._watchdog_task and not entry._watchdog_task.done():
             entry._watchdog_task.cancel()
 
-        # Move to next turn or go idle
-        if entry.pending_turns > 0:
-            # Another turn is queued — get it from the queue
-            try:
-                next_turn = entry.turn_queue.get_nowait()
-                entry.current_turn = next_turn
-                # Restart stall watchdog for the follow-up turn
-                entry._watchdog_task = asyncio.create_task(
-                    self._turn_watchdog(entry),
-                    name=f"watchdog:{entry.state_key}",
-                )
-            except asyncio.QueueEmpty:
-                # Queue empty but pending_turns > 0 — defensive reset
-                logger.warning(
-                    "pending_turns > 0 but turn_queue empty, resetting",
-                    state_key=entry.state_key,
-                    pending_turns=entry.pending_turns,
-                )
-                entry.pending_turns = 0
-                entry.state = "idle"
-                entry.current_turn = None
-        else:
-            entry.state = "idle"
-            entry.current_turn = None
+        # Go idle.  Injected messages (sent while busy) are absorbed
+        # into the current turn by the CLI — they don't produce their
+        # own ResultMessage, so there is never a queued turn to dequeue.
+        entry.state = "idle"
+        entry.current_turn = None
+        entry.pending_turns = 0  # defensive reset
 
         # Per-turn token summary — the key diagnostic for cost analysis
         total_in = turn.total_input_tokens + turn.total_cache_read_tokens + turn.total_cache_creation_tokens
