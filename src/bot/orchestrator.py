@@ -924,6 +924,7 @@ class MessageOrchestrator:
                         sent = await telegram_update.effective_message.reply_text(
                             thinking_msg,
                             parse_mode="HTML",
+                            disable_notification=True,
                         )
                         _thinking_message_ids.append(sent.message_id)
                         await asyncio.sleep(0.3)
@@ -949,6 +950,7 @@ class MessageOrchestrator:
                                 msg.text,
                                 parse_mode=msg.parse_mode,
                                 reply_markup=None,
+                                disable_notification=True,
                             )
                             _text_was_sent[0] = True
                             await asyncio.sleep(0.3)
@@ -962,6 +964,7 @@ class MessageOrchestrator:
                                 await telegram_update.effective_message.reply_text(
                                     combined,
                                     reply_markup=None,
+                                    disable_notification=True,
                                 )
                             except Exception:
                                 pass
