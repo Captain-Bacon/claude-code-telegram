@@ -264,28 +264,37 @@ class ClaudeCodeBot:
         """Handle errors globally."""
         error = context.error
 
-        # Silently ignore errors from update types we don't handle
-        # (e.g. message reactions from double-tapping in Telegram).
-        # These produce AttributeErrors when handlers assume .message exists.
-        if update and not update.message and not update.callback_query:
-            logger.debug(
-                "Ignoring error from non-message update",
+        # Suppress errors from message-reaction updates (e.g. double-tap
+        # heart on iOS).  These don't carry a .message, so middleware that
+        # assumes one will crash.  Log at info with the traceback so we
+        # can identify the actual crash site if it recurs.
+        is_reaction = update and (
+            getattr(update, "message_reaction", None) is not None
+            or getattr(update, "message_reaction_count", None) is not None
+        )
+        if is_reaction:
+            logger.info(
+                "Suppressed error from reaction update",
                 error=str(error),
+                error_type=type(error).__name__,
                 user_id=(
                     update.effective_user.id
                     if update.effective_user
                     else None
                 ),
+                exc_info=error,
             )
             return
 
         logger.error(
             "Global error handler triggered",
             error=str(error),
+            error_type=type(error).__name__,
             update_type=type(update).__name__ if update else None,
             user_id=(
                 update.effective_user.id if update and update.effective_user else None
             ),
+            exc_info=error,
         )
 
         # Determine error message for user

@@ -98,7 +98,6 @@ class PersistentClientEntry:
     pending_turns: int = 0
     collector_task: Optional[asyncio.Task] = None
     current_turn: Optional[TurnContext] = None
-    turn_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _interrupted: bool = False
     _watchdog_task: Optional[asyncio.Task] = None
@@ -217,33 +216,15 @@ class PersistentClientManager:
         return await future
 
     async def stop_client(self, state_key: str) -> StopResult:
-        """Stop current work and discard queued messages.
+        """Stop current work.
 
         Calls client.interrupt() to stop the current turn.
-        Discards any messages queued for subsequent turns.
-        Returns the texts of discarded messages so the user can resend.
+        Follow-up messages are injected into the current turn (not queued),
+        so there is nothing to discard.
         """
         entry = self._clients.get(state_key)
         if entry is None or entry.state != "busy":
             return StopResult(was_busy=False, discarded_messages=[])
-
-        # Cancel any pending turns beyond the current one
-        # Drain the turn queue and cancel their futures
-        discarded = []
-        cancelled_turns = []
-        while not entry.turn_queue.empty():
-            try:
-                turn = entry.turn_queue.get_nowait()
-                # Don't cancel the current turn — interrupt handles that
-                if turn is not entry.current_turn:
-                    cancelled_turns.append(turn)
-                    discarded.append(turn.prompt)
-            except asyncio.QueueEmpty:
-                break
-
-        for turn in cancelled_turns:
-            if not turn.response_future.done():
-                turn.response_future.cancel()
 
         # Signal interrupt
         entry._interrupted = True
@@ -268,11 +249,10 @@ class PersistentClientManager:
         logger.info(
             "client.stopped",
             state_key=state_key,
-            discarded_count=len(discarded),
             pending_turns=entry.pending_turns,
         )
 
-        return StopResult(was_busy=True, discarded_messages=discarded)
+        return StopResult(was_busy=True, discarded_messages=[])
 
     async def _interrupt_timeout(self, entry: PersistentClientEntry) -> None:
         """Safety net: resolve current turn if no ResultMessage after interrupt.
@@ -482,16 +462,9 @@ class PersistentClientManager:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Cancel any pending turn futures
+        # Cancel any pending turn future
         if entry.current_turn and not entry.current_turn.response_future.done():
             entry.current_turn.response_future.cancel()
-        while not entry.turn_queue.empty():
-            try:
-                turn = entry.turn_queue.get_nowait()
-                if not turn.response_future.done():
-                    turn.response_future.cancel()
-            except asyncio.QueueEmpty:
-                break
 
         # Disconnect the SDK client
         try:
@@ -852,15 +825,6 @@ class PersistentClientManager:
         # Resolve current turn
         if entry.current_turn and not entry.current_turn.response_future.done():
             entry.current_turn.response_future.set_result(error_response)
-
-        # Resolve any queued turns
-        while not entry.turn_queue.empty():
-            try:
-                turn = entry.turn_queue.get_nowait()
-                if not turn.response_future.done():
-                    turn.response_future.set_result(error_response)
-            except asyncio.QueueEmpty:
-                break
 
         # Remove from registry
         self._clients.pop(entry.state_key, None)

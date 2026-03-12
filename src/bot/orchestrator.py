@@ -1327,6 +1327,18 @@ class MessageOrchestrator:
                 force_new=force_new,
             )
 
+            # None means the message was injected into a busy turn
+            # (race: state was idle at the orchestrator check but another
+            # concurrent handler claimed the turn before we acquired the
+            # send_lock inside send_message).
+            if claude_response is None:
+                heartbeat.cancel()
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                return
+
             # New session created successfully — clear the one-shot flag
             if force_new:
                 context.user_data["force_new_session"] = False
