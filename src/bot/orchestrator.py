@@ -951,6 +951,7 @@ class MessageOrchestrator:
                                 parse_mode=msg.parse_mode,
                                 reply_markup=None,
                                 disable_notification=True,
+                                do_quote=False,
                             )
                             _text_was_sent[0] = True
                             await asyncio.sleep(0.3)
@@ -965,6 +966,7 @@ class MessageOrchestrator:
                                     combined,
                                     reply_markup=None,
                                     disable_notification=True,
+                                    do_quote=False,
                                 )
                             except Exception:
                                 pass
@@ -1344,9 +1346,12 @@ class MessageOrchestrator:
                 except Exception as e:
                     logger.warning("Failed to log interaction", error=str(e))
 
-            # Check if assistant text was already delivered mid-stream.
-            # If so, skip the main text (it would duplicate) but still
-            # send supplementary notices (interrupted, stop reason, context).
+            # Drain any pending batched text BEFORE checking the flag.
+            # The 1.5s batch window means text can be enqueued but not yet
+            # flushed when the turn completes — checking the flag first
+            # would miss it and cause the final response to duplicate.
+            await self._flush_stream_callback(on_stream)
+
             text_already_sent = (
                 on_stream
                 and hasattr(on_stream, "text_was_sent")
@@ -1455,9 +1460,6 @@ class MessageOrchestrator:
                         message.text,
                         parse_mode=message.parse_mode,
                         reply_markup=None,  # No keyboards in agentic mode
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
                     )
                     if i < len(formatted_messages) - 1:
                         await asyncio.sleep(0.5)
@@ -1471,18 +1473,12 @@ class MessageOrchestrator:
                         await update.message.reply_text(
                             message.text,
                             reply_markup=None,
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
                         )
                     except Exception as plain_err:
                         await update.message.reply_text(
                             f"Failed to deliver response "
                             f"(Telegram error: {str(plain_err)[:150]}). "
                             f"Please try again.",
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
                         )
 
             # Send images separately if caption wasn't used
@@ -1754,7 +1750,9 @@ class MessageOrchestrator:
 
         from .utils.formatting import FormattedMessage, ResponseFormatter
 
-        # Check if assistant text was already delivered mid-stream
+        # Drain any pending batched text BEFORE checking the flag.
+        await self._flush_stream_callback(on_stream)
+
         text_already_sent = (
             on_stream
             and hasattr(on_stream, "text_was_sent")
@@ -1781,9 +1779,6 @@ class MessageOrchestrator:
                 formatted_messages.append(
                     FormattedMessage(ctx_warn, parse_mode="HTML")
                 )
-
-        # Flush any pending batched intermediate text
-        await self._flush_stream_callback(on_stream)
 
         try:
             await progress_msg.delete()
@@ -1816,7 +1811,6 @@ class MessageOrchestrator:
                     message.text,
                     parse_mode=message.parse_mode,
                     reply_markup=None,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
                 )
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
