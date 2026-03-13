@@ -217,7 +217,6 @@ class ClaudeSDKManager:
         options = ClaudeAgentOptions(
             max_turns=self.config.claude_max_turns,
             model=model or self.config.claude_model or None,
-            max_budget_usd=self.config.claude_max_cost_per_request,
             cwd=str(working_directory),
             allowed_tools=sdk_allowed_tools,
             disallowed_tools=sdk_disallowed_tools,

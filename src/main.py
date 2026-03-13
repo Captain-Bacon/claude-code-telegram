@@ -12,10 +12,6 @@ import structlog
 
 from src import __version__, get_build_info
 from src.bot.core import ClaudeCodeBot
-from src.claude import (
-    ClaudeIntegration,
-    SessionManager,
-)
 from src.claude.persistent import PersistentClientManager
 from src.claude.sdk_integration import ClaudeSDKManager
 from src.config.features import FeatureFlags
@@ -37,7 +33,6 @@ from src.security.auth import (
 from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
-from src.storage.session_storage import SQLiteSessionStorage
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -143,21 +138,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     audit_storage = InMemoryAuditStorage()  # TODO: Use database storage in production
     audit_logger = AuditLogger(audit_storage)
 
-    # Create Claude integration components with persistent storage
-    session_storage = SQLiteSessionStorage(storage.db_manager)
-    session_manager = SessionManager(config, session_storage)
-
-    # Create Claude SDK manager and integration facade
+    # Create Claude SDK manager and persistent client manager
     logger.info("Using Claude Python SDK integration")
     sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
-
-    claude_integration = ClaudeIntegration(
-        config=config,
-        sdk_manager=sdk_manager,
-        session_manager=session_manager,
-    )
-
-    # Persistent client manager for per-thread Claude sessions
     persistent_manager = PersistentClientManager(sdk_manager, config)
 
     # --- Event bus and agentic platform components ---
@@ -174,7 +157,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # Agent handler — translates events into Claude executions
     agent_handler = AgentHandler(
         event_bus=event_bus,
-        claude_integration=claude_integration,
+        persistent_manager=persistent_manager,
         default_working_directory=config.approved_directory,
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
     )
@@ -186,7 +169,6 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "security_validator": security_validator,
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
-        "claude_integration": claude_integration,
         "persistent_manager": persistent_manager,
         "storage": storage,
         "event_bus": event_bus,
@@ -204,7 +186,6 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     return {
         "bot": bot,
-        "claude_integration": claude_integration,
         "persistent_manager": persistent_manager,
         "storage": storage,
         "config": config,
@@ -220,7 +201,6 @@ async def run_application(app: Dict[str, Any]) -> None:
     """Run the application with graceful shutdown handling."""
     logger = structlog.get_logger()
     bot: ClaudeCodeBot = app["bot"]
-    claude_integration: ClaudeIntegration = app["claude_integration"]
     persistent_manager: PersistentClientManager = app["persistent_manager"]
     storage: Storage = app["storage"]
     config: Settings = app["config"]
@@ -392,7 +372,6 @@ async def run_application(app: Dict[str, Any]) -> None:
             await event_bus.stop()
             await bot.stop()
             await persistent_manager.shutdown()
-            await claude_integration.shutdown()
             await storage.close()
         except Exception as e:
             logger.error("Error during shutdown", error=str(e))

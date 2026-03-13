@@ -16,8 +16,6 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
-    DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
-    DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_TURNS,
     DEFAULT_CLAUDE_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
@@ -82,13 +80,6 @@ class Settings(BaseSettings):
     )
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
-    )
-    claude_max_cost_per_user: float = Field(
-        DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
-    )
-    claude_max_cost_per_request: float = Field(
-        DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
-        description="Max cost per individual request (SDK budget cap)",
     )
     # NOTE: When changing this list, also update docs/tools.md,
     # docs/configuration.md, .env.example,

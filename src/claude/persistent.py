@@ -473,7 +473,6 @@ class PersistentClientManager:
             collector_started=True,
             model=getattr(options, "model", None),
             max_turns=getattr(options, "max_turns", None),
-            max_budget_usd=getattr(options, "max_budget_usd", None),
             system_prompt_type=sys_prompt_type,
             has_mcp=bool(getattr(options, "mcp_servers", None)),
             has_can_use_tool=getattr(options, "can_use_tool", None) is not None,

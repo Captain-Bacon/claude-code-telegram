@@ -84,7 +84,6 @@ class RateLimiter:
             requests_per_window=self.config.rate_limit_requests,
             window_seconds=self.config.rate_limit_window,
             burst_capacity=self.config.rate_limit_burst,
-            max_cost_per_user=self.config.claude_max_cost_per_user,
             refill_rate=self.refill_rate,
         )
 
@@ -129,25 +128,6 @@ class RateLimiter:
             f"Bucket: {status['tokens']:.1f}/{status['capacity']} tokens available."
         )
         return False, message
-
-    def _check_cost_limit(
-        self, user_id: int, cost: float
-    ) -> Tuple[bool, Optional[str]]:
-        """Check cost-based limit."""
-        # Reset cost tracker if enough time has passed
-        self._maybe_reset_cost_tracker(user_id)
-
-        current_cost = self.cost_tracker[user_id]
-        if current_cost + cost > self.config.claude_max_cost_per_user:
-            remaining = max(0, self.config.claude_max_cost_per_user - current_cost)
-            message = (
-                f"Cost limit exceeded. Remaining budget: ${remaining:.2f}. "
-                f"Current usage: ${current_cost:.2f}/"
-                f"${self.config.claude_max_cost_per_user:.2f}"
-            )
-            return False, message
-
-        return True, None
 
     def _consume_request_tokens(self, user_id: int, tokens: int) -> None:
         """Consume tokens from request bucket."""
@@ -221,22 +201,8 @@ class RateLimiter:
         bucket = self._get_or_create_bucket(user_id)
         bucket_status = bucket.get_status()
 
-        # Get cost status
-        self._maybe_reset_cost_tracker(user_id)
-        current_cost = self.cost_tracker[user_id]
-        cost_remaining = max(0, self.config.claude_max_cost_per_user - current_cost)
-
         return {
             "request_bucket": bucket_status,
-            "cost_usage": {
-                "current": current_cost,
-                "limit": self.config.claude_max_cost_per_user,
-                "remaining": cost_remaining,
-                "utilization": current_cost / self.config.claude_max_cost_per_user,
-            },
-            "last_reset": self.cost_reset_time.get(
-                user_id, datetime.now(UTC)
-            ).isoformat(),
         }
 
     def get_global_status(self) -> Dict[str, Any]:
@@ -248,7 +214,6 @@ class RateLimiter:
                 "requests_per_window": self.config.rate_limit_requests,
                 "window_seconds": self.config.rate_limit_window,
                 "burst_capacity": self.config.rate_limit_burst,
-                "max_cost_per_user": self.config.claude_max_cost_per_user,
                 "refill_rate": self.refill_rate,
             },
         }

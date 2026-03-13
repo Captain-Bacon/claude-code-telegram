@@ -1,13 +1,12 @@
 """Handle inline keyboard callbacks."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
@@ -111,7 +110,7 @@ async def handle_cd_callback(
     settings: Settings = context.bot_data["settings"]
     security_validator: SecurityValidator = context.bot_data.get("security_validator")
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
-    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    claude_integration: Any = context.bot_data.get("claude_integration")
 
     try:
         current_dir = context.user_data.get(
@@ -532,7 +531,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
     """Handle continue session action."""
     user_id = query.from_user.id
     settings: Settings = context.bot_data["settings"]
-    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    claude_integration: Any = context.bot_data.get("claude_integration")
 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
@@ -885,7 +884,7 @@ async def handle_quick_action_callback(
         return
 
     # Get Claude integration
-    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    claude_integration: Any = context.bot_data.get("claude_integration")
     if not claude_integration:
         await query.edit_message_text(
             "❌ <b>Claude Integration Not Available</b>\n\n"

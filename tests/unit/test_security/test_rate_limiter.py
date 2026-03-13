@@ -89,7 +89,6 @@ class TestRateLimiter:
             rate_limit_requests=10,
             rate_limit_window=60,
             rate_limit_burst=20,
-            claude_max_cost_per_user=5.0,
         )
 
     @pytest.fixture
@@ -204,10 +203,6 @@ class TestRateLimiter:
         status = rate_limiter.get_user_status(user_id)
 
         assert "request_bucket" in status
-        assert "cost_usage" in status
-        # Cost not tracked via check_rate_limit anymore, so current stays 0
-        assert status["cost_usage"]["current"] == 0.0
-        assert 0 <= status["cost_usage"]["utilization"] <= 1
 
     async def test_global_status_reporting(self, rate_limiter):
         """Test global status reporting."""
@@ -221,10 +216,6 @@ class TestRateLimiter:
         # Cost not tracked via check_rate_limit anymore
         assert status["total_cost_tracked"] == 0
         assert "config" in status
-        assert (
-            status["config"]["max_cost_per_user"]
-            == rate_limiter.config.claude_max_cost_per_user
-        )
 
     async def test_cleanup_inactive_users(self, rate_limiter):
         """Test cleanup of inactive users."""

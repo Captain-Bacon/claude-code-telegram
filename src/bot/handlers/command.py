@@ -4,13 +4,12 @@ import os
 import signal
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
@@ -361,7 +360,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Handle /continue command with optional prompt."""
     user_id = update.effective_user.id
     settings: Settings = context.bot_data["settings"]
-    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    claude_integration: Any = context.bot_data.get("claude_integration")
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
 
     # Parse optional prompt from command arguments
