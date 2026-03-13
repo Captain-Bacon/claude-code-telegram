@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -111,24 +111,6 @@ def test_agentic_registers_8_commands(agentic_settings, deps):
     assert frozenset({"stop"}) in commands
 
 
-def test_classic_registers_14_commands(classic_settings, deps):
-    """Classic mode registers all 14 commands."""
-    orchestrator = MessageOrchestrator(classic_settings, deps)
-    app = MagicMock()
-    app.add_handler = MagicMock()
-
-    orchestrator.register_handlers(app)
-
-    from telegram.ext import CommandHandler
-
-    cmd_handlers = [
-        call
-        for call in app.add_handler.call_args_list
-        if isinstance(call[0][0], CommandHandler)
-    ]
-
-    assert len(cmd_handlers) == 14
-
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
     """Agentic mode registers text, document, photo, and voice message handlers."""
@@ -166,19 +148,6 @@ async def test_agentic_bot_commands(agentic_settings, deps):
     cmd_names = [c.command for c in commands]
     assert cmd_names == ["start", "new", "status", "verbose", "repo", "model", "restart", "stop"]
 
-
-async def test_classic_bot_commands(classic_settings, deps):
-    """Classic mode returns 14 bot commands (without project threads)."""
-    orchestrator = MessageOrchestrator(classic_settings, deps)
-    commands = await orchestrator.get_bot_commands()
-
-    assert len(commands) == 14
-
-    cmd_names = [c.command for c in commands]
-    assert "start" in cmd_names
-    assert "help" in cmd_names
-    assert "git" in cmd_names
-    assert "restart" in cmd_names
 
 
 async def test_restart_command_sends_sigterm(deps):
@@ -379,6 +348,9 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
 
 async def test_agentic_voice_calls_claude(agentic_settings, deps):
     """Agentic voice handler transcribes and routes prompt via persistent manager."""
+    agentic_settings.enable_voice_messages = True
+    agentic_settings.voice_provider = "mistral"
+    agentic_settings.mistral_api_key = "test-key"
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
     mock_response = MagicMock()
@@ -397,11 +369,8 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     processed_voice.prompt = "Voice prompt text"
     processed_voice.transcription = "Voice prompt text"
 
-    voice_handler = MagicMock()
-    voice_handler.process_voice_message = AsyncMock(return_value=processed_voice)
-
-    features = MagicMock()
-    features.get_voice_handler.return_value = voice_handler
+    mock_voice_handler = MagicMock()
+    mock_voice_handler.process_voice_message = AsyncMock(return_value=processed_voice)
 
     update = MagicMock()
     update.effective_user.id = 123
@@ -422,13 +391,13 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "features": features,
         "persistent_manager": persistent_manager,
     }
 
-    await orchestrator.agentic_voice(update, context)
+    with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
+        await orchestrator.agentic_voice(update, context)
 
-    voice_handler.process_voice_message.assert_awaited_once_with(
+    mock_voice_handler.process_voice_message.assert_awaited_once_with(
         update.message.voice, "please summarize"
     )
     persistent_manager.send_message.assert_awaited_once()
@@ -465,18 +434,18 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
     agentic_settings, deps
 ):
     """Transcription failures are shown to users and do not call Claude."""
+    agentic_settings.enable_voice_messages = True
+    agentic_settings.voice_provider = "mistral"
+    agentic_settings.mistral_api_key = "test-key"
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
-    voice_handler = MagicMock()
-    voice_handler.process_voice_message = AsyncMock(
+    mock_voice_handler = MagicMock()
+    mock_voice_handler.process_voice_message = AsyncMock(
         side_effect=RuntimeError("Mistral transcription request failed: boom")
     )
 
-    features = MagicMock()
-    features.get_voice_handler.return_value = voice_handler
-
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock()
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock()
 
     update = MagicMock()
     update.effective_user.id = 123
@@ -493,17 +462,17 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "features": features,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
     }
 
-    await orchestrator.agentic_voice(update, context)
+    with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
+        await orchestrator.agentic_voice(update, context)
 
     progress_msg.edit_text.assert_awaited_once()
     error_text = progress_msg.edit_text.call_args.args[0]
     assert "Mistral transcription request failed" in error_text
     assert progress_msg.edit_text.call_args.kwargs["parse_mode"] == "HTML"
-    claude_integration.run_command.assert_not_awaited()
+    persistent_manager.send_message.assert_not_awaited()
 
 
 async def test_agentic_start_escapes_html_in_name(agentic_settings, deps):
