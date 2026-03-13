@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.bot.features.voice_handler import ProcessedVoice, VoiceHandler
+from src.bot.media.voice_handler import ProcessedVoice, VoiceHandler
 
 
 @pytest.fixture

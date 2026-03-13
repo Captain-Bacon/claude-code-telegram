@@ -1725,12 +1725,9 @@ class MessageOrchestrator:
         """Process photo -> Claude, minimal chrome."""
         user_id = update.effective_user.id
 
-        features = context.bot_data.get("features")
-        image_handler = features.get_image_handler() if features else None
+        from .media.image_handler import ImageHandler
 
-        if not image_handler:
-            await update.message.reply_text("Photo processing is not available.")
-            return
+        image_handler = ImageHandler(config=self.settings)
 
         chat = update.message.chat
         await chat.send_action("typing")
@@ -1764,12 +1761,20 @@ class MessageOrchestrator:
         """Transcribe voice message -> Claude, minimal chrome."""
         user_id = update.effective_user.id
 
-        features = context.bot_data.get("features")
-        voice_handler = features.get_voice_handler() if features else None
+        from .media.voice_handler import VoiceHandler
 
-        if not voice_handler:
+        voice_key_available = (
+            self.settings.voice_provider == "openai"
+            and self.settings.openai_api_key
+        ) or (
+            self.settings.voice_provider == "mistral"
+            and self.settings.mistral_api_key
+        )
+        if not (self.settings.enable_voice_messages and voice_key_available):
             await update.message.reply_text(self._voice_unavailable_message())
             return
+
+        voice_handler = VoiceHandler(config=self.settings)
 
         chat = update.message.chat
         await chat.send_action("typing")
