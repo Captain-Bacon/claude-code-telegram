@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Capture real sleep before any patching
+_real_sleep = asyncio.sleep
+
 from src.claude.persistent import (
     PersistentClientEntry,
     PersistentClientManager,
@@ -107,10 +110,16 @@ class TestStallCallbackInvocation:
         config = MagicMock()
         persistent_mgr = PersistentClientManager(manager, config)
 
-        stall_callback = AsyncMock()
-        turn = _make_turn(stall_callback=stall_callback)
-        turn.started_at = time.time() - 35  # 35 seconds ago
-        turn.last_message_at = time.time() - 35  # No messages
+        callback_event = asyncio.Event()
+        captured_kwargs: Dict[str, Any] = {}
+
+        async def tracking_callback(**kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+            callback_event.set()
+
+        turn = _make_turn(stall_callback=tracking_callback)
+        turn.started_at = time.time() - 35
+        turn.last_message_at = time.time() - 35
 
         mock_client = MagicMock()
         entry = PersistentClientEntry(
@@ -121,27 +130,28 @@ class TestStallCallbackInvocation:
             current_turn=turn,
         )
 
-        # Patch asyncio.sleep so the watchdog doesn't wait 30s
-        with patch("src.claude.persistent.asyncio.sleep", new_callable=AsyncMock):
+        async def yielding_sleep(_: float) -> None:
+            await _real_sleep(0)
+
+        with patch("src.claude.persistent.asyncio.sleep", side_effect=yielding_sleep):
             watchdog_task = asyncio.create_task(
                 persistent_mgr._turn_watchdog(entry)
             )
-            # Let it run through the first iteration
-            await asyncio.sleep(0.05)
-
-            # Cancel the watchdog
-            watchdog_task.cancel()
             try:
-                await watchdog_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(callback_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pytest.fail("Stall callback was not invoked")
+            finally:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
 
-        # Verify callback was invoked
-        stall_callback.assert_called()
-        call_kwargs = stall_callback.call_args[1]
-        assert "silence_seconds" in call_kwargs
-        assert "total_elapsed_seconds" in call_kwargs
-        assert "cli_alive" in call_kwargs
+        assert "silence_seconds" in captured_kwargs
+        assert "total_elapsed_seconds" in captured_kwargs
+        assert "cli_alive" in captured_kwargs
+        assert "is_dead" in captured_kwargs
 
     @pytest.mark.asyncio
     async def test_stall_callback_receives_correct_kwargs(self) -> None:
@@ -150,8 +160,14 @@ class TestStallCallbackInvocation:
         config = MagicMock()
         persistent_mgr = PersistentClientManager(manager, config)
 
-        stall_callback = AsyncMock()
-        turn = _make_turn(stall_callback=stall_callback)
+        callback_event = asyncio.Event()
+        captured_kwargs: Dict[str, Any] = {}
+
+        async def tracking_callback(**kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+            callback_event.set()
+
+        turn = _make_turn(stall_callback=tracking_callback)
         now = time.time()
         turn.started_at = now - 40
         turn.last_message_at = now - 35
@@ -165,25 +181,30 @@ class TestStallCallbackInvocation:
             current_turn=turn,
         )
 
-        with patch("src.claude.persistent.asyncio.sleep", new_callable=AsyncMock):
+        async def yielding_sleep(_: float) -> None:
+            await _real_sleep(0)
+
+        with patch("src.claude.persistent.asyncio.sleep", side_effect=yielding_sleep):
             watchdog_task = asyncio.create_task(
                 persistent_mgr._turn_watchdog(entry)
             )
-            await asyncio.sleep(0.05)
-            watchdog_task.cancel()
             try:
-                await watchdog_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(callback_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pytest.fail("Stall callback was not invoked")
+            finally:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
 
-        # Verify callback was invoked with correct values
-        stall_callback.assert_called()
-        call_kwargs = stall_callback.call_args[1]
-        assert isinstance(call_kwargs["silence_seconds"], float)
-        assert isinstance(call_kwargs["total_elapsed_seconds"], float)
-        assert isinstance(call_kwargs["cli_alive"], bool)
-        assert call_kwargs["silence_seconds"] >= 5.0
-        assert call_kwargs["total_elapsed_seconds"] >= 40.0
+        assert isinstance(captured_kwargs["silence_seconds"], float)
+        assert isinstance(captured_kwargs["total_elapsed_seconds"], float)
+        assert isinstance(captured_kwargs["cli_alive"], bool)
+        assert captured_kwargs["is_dead"] is False
+        assert captured_kwargs["silence_seconds"] >= 5.0
+        assert captured_kwargs["total_elapsed_seconds"] >= 40.0
 
     @pytest.mark.asyncio
     async def test_async_stall_callback_is_awaited(self) -> None:
@@ -192,11 +213,10 @@ class TestStallCallbackInvocation:
         config = MagicMock()
         persistent_mgr = PersistentClientManager(manager, config)
 
-        invoked = False
+        callback_event = asyncio.Event()
 
         async def async_callback(**kwargs: Any) -> None:
-            nonlocal invoked
-            invoked = True
+            callback_event.set()
 
         turn = _make_turn(stall_callback=async_callback)
         turn.started_at = time.time() - 35
@@ -211,18 +231,23 @@ class TestStallCallbackInvocation:
             current_turn=turn,
         )
 
-        with patch("src.claude.persistent.asyncio.sleep", new_callable=AsyncMock):
+        async def yielding_sleep(_: float) -> None:
+            await _real_sleep(0)
+
+        with patch("src.claude.persistent.asyncio.sleep", side_effect=yielding_sleep):
             watchdog_task = asyncio.create_task(
                 persistent_mgr._turn_watchdog(entry)
             )
-            await asyncio.sleep(0.05)
-            watchdog_task.cancel()
             try:
-                await watchdog_task
-            except asyncio.CancelledError:
-                pass
-
-        assert invoked
+                await asyncio.wait_for(callback_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pytest.fail("Async stall callback was not awaited")
+            finally:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
 
     @pytest.mark.asyncio
     async def test_stall_callback_error_does_not_crash_watchdog(self) -> None:
@@ -231,7 +256,11 @@ class TestStallCallbackInvocation:
         config = MagicMock()
         persistent_mgr = PersistentClientManager(manager, config)
 
+        call_count = 0
+
         def broken_callback(**kwargs: Any) -> None:
+            nonlocal call_count
+            call_count += 1
             raise RuntimeError("Callback broken")
 
         turn = _make_turn(stall_callback=broken_callback)
@@ -247,18 +276,23 @@ class TestStallCallbackInvocation:
             current_turn=turn,
         )
 
-        with patch("src.claude.persistent.asyncio.sleep", new_callable=AsyncMock):
+        async def yielding_sleep(_: float) -> None:
+            await _real_sleep(0)
+
+        with patch("src.claude.persistent.asyncio.sleep", side_effect=yielding_sleep):
             watchdog_task = asyncio.create_task(
                 persistent_mgr._turn_watchdog(entry)
             )
-            await asyncio.sleep(0.05)
+            # Let it run a couple of iterations
+            await _real_sleep(0.05)
             watchdog_task.cancel()
             try:
                 await watchdog_task
             except asyncio.CancelledError:
                 pass
 
-        # Watchdog should still complete without raising
+        # Callback was invoked (and raised), but watchdog survived
+        assert call_count >= 1
 
 
 class TestStallCallbackOnClientDeath:

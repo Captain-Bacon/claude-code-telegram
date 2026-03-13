@@ -375,6 +375,7 @@ class PersistentClientManager:
                             silence_seconds=round(silence_s, 1),
                             total_elapsed_seconds=round(total_elapsed_s, 1),
                             cli_alive=cli_alive,
+                            is_dead=False,
                         )
                         if asyncio.iscoroutine(result):
                             await result

@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.bot.orchestrator import MessageOrchestrator, _redact_secrets
+from src.bot.orchestrator import MessageOrchestrator
+from src.bot.stream_handler import _redact_secrets, _summarize_tool_input
 from src.config import create_test_config
 
 
@@ -599,8 +600,7 @@ class TestRedactSecrets:
 
     def test_summarize_tool_input_bash_redacts(self, agentic_settings, deps):
         """_summarize_tool_input applies redaction to Bash commands."""
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
-        result = orchestrator._summarize_tool_input(
+        result = _summarize_tool_input(
             "Bash",
             {"command": "curl --token=mysupersecrettoken123 https://api.example.com"},
         )
@@ -609,8 +609,7 @@ class TestRedactSecrets:
 
     def test_summarize_tool_input_non_bash_unchanged(self, agentic_settings, deps):
         """Non-Bash tools don't go through redaction."""
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
-        result = orchestrator._summarize_tool_input(
+        result = _summarize_tool_input(
             "Read", {"file_path": "/home/user/.env"}
         )
         assert result == ".env"
@@ -684,11 +683,12 @@ class TestTypingHeartbeat:
 
     async def test_stream_callback_independent_of_typing(self, agentic_settings, deps):
         """Stream callback no longer sends typing — that's the heartbeat's job."""
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        from src.bot.stream_handler import make_stream_callback
 
         progress_msg = AsyncMock()
         tool_log: list = []  # type: ignore[type-arg]
-        callback = orchestrator._make_stream_callback(
+        callback = make_stream_callback(
+            agentic_settings,
             verbose_level=1,
             progress_msg=progress_msg,
             tool_log=tool_log,
@@ -700,7 +700,7 @@ class TestTypingHeartbeat:
         # (typing is no longer handled by the stream callback)
         import inspect
 
-        sig = inspect.signature(orchestrator._make_stream_callback)
+        sig = inspect.signature(make_stream_callback)
         assert "chat" not in sig.parameters
 
 
