@@ -8,6 +8,8 @@ import os
 import re
 import signal
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -33,6 +35,11 @@ from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError, load_project_registry
 from ..security.audit import AuditLogger
+from .stream_handler import (
+    cleanup_thinking_messages,
+    flush_stream_callback,
+    make_stream_callback,
+)
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.error_format import _format_error_message, _update_working_directory_from_claude_response
 from .utils.html_format import escape_html
@@ -43,6 +50,16 @@ from .utils.image_extractor import (
 )
 
 logger = structlog.get_logger()
+
+
+@dataclass
+class QueuedMessage:
+    """A message queued while Claude was busy."""
+
+    text: str
+    sent_at: float  # time.time() when user sent it
+    placeholder_message_id: Optional[int] = None  # Telegram msg id of the placeholder
+
 
 # Patterns that look like secrets/credentials in CLI arguments
 _SECRET_PATTERNS: List[re.Pattern[str]] = [
@@ -260,6 +277,8 @@ class MessageOrchestrator:
         self.deps = deps
         # Track active Claude tasks per user so /stop can cancel them (legacy)
         self._active_tasks: Dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
+        # Message queue per state_key — messages received while Claude is busy
+        self._message_queues: Dict[str, List[QueuedMessage]] = {}
 
     @staticmethod
     def _state_key(update: Update) -> str:
@@ -782,95 +801,45 @@ class MessageOrchestrator:
         state_key = self._state_key(update)
         result = await persistent_manager.stop_client(state_key)
 
-        if not result.was_busy:
+        # Clear queued messages
+        queued = self._message_queues.pop(state_key, [])
+
+        if not result.was_busy and not queued:
             await update.message.reply_text("Nothing running to stop.")
             return
 
-        # Report what was stopped and any discarded messages
-        if result.discarded_messages:
-            lines = ["Stopped. These queued messages were not sent:"]
-            for msg_text in result.discarded_messages:
-                # Truncate long messages for the summary
-                preview = msg_text[:100] + ("..." if len(msg_text) > 100 else "")
-                lines.append(f"  \u2022 {escape_html(preview)}")
-            await update.message.reply_text(
-                "\n".join(lines), parse_mode="HTML"
-            )
-        else:
-            await update.message.reply_text("Stopped.")
+        # Delete queue placeholder messages from Telegram
+        chat = update.effective_chat
+        for qm in queued:
+            if qm.placeholder_message_id and chat:
+                try:
+                    await chat.delete_message(qm.placeholder_message_id)
+                except Exception:
+                    pass
+
+        # Report what happened
+        parts: List[str] = []
+        if result.was_busy:
+            parts.append("Stopped.")
+        if queued:
+            parts.append(f"{len(queued)} queued message(s) discarded:")
+            for qm in queued:
+                preview = qm.text[:100] + ("..." if len(qm.text) > 100 else "")
+                parts.append(f"  \u2022 {escape_html(preview)}")
+        await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
         logger.info(
             "User stopped client",
             user_id=update.effective_user.id,
             state_key=state_key,
-            discarded=len(result.discarded_messages),
+            discarded_queued=len(queued),
         )
-
-    def _format_verbose_progress(
-        self,
-        activity_log: List[Dict[str, Any]],
-        verbose_level: int,
-        start_time: float,
-    ) -> str:
-        """Build the progress message text based on activity so far."""
-        if not activity_log:
-            return "Working..."
-
-        elapsed = time.time() - start_time
-        lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
-
-        for entry in activity_log[-15:]:  # Show last 15 entries max
-            kind = entry.get("kind", "tool")
-            if kind == "text":
-                # Claude's intermediate reasoning/commentary
-                snippet = entry.get("detail", "")
-                if verbose_level >= 2:
-                    lines.append(f"\U0001f4ac {snippet}")
-                else:
-                    # Level 1: one short line
-                    lines.append(f"\U0001f4ac {snippet[:80]}")
-            else:
-                # Tool call
-                icon = _tool_icon(entry["name"])
-                if verbose_level >= 2 and entry.get("detail"):
-                    lines.append(f"{icon} {entry['name']}: {entry['detail']}")
-                else:
-                    lines.append(f"{icon} {entry['name']}")
-
-        if len(activity_log) > 15:
-            lines.insert(1, f"... ({len(activity_log) - 15} earlier entries)\n")
-
-        return "\n".join(lines)
 
     @staticmethod
     def _summarize_tool_input(tool_name: str, tool_input: Dict[str, Any]) -> str:
-        """Return a short summary of tool input for verbose level 2."""
-        if not tool_input:
-            return ""
-        if tool_name in ("Read", "Write", "Edit", "MultiEdit"):
-            path = tool_input.get("file_path") or tool_input.get("path", "")
-            if path:
-                # Show just the filename, not the full path
-                return path.rsplit("/", 1)[-1]
-        if tool_name in ("Glob", "Grep"):
-            pattern = tool_input.get("pattern", "")
-            if pattern:
-                return pattern[:60]
-        if tool_name == "Bash":
-            cmd = tool_input.get("command", "")
-            if cmd:
-                return _redact_secrets(cmd[:100])[:80]
-        if tool_name in ("WebFetch", "WebSearch"):
-            return (tool_input.get("url", "") or tool_input.get("query", ""))[:60]
-        if tool_name == "Task":
-            desc = tool_input.get("description", "")
-            if desc:
-                return desc[:60]
-        # Generic: show first key's value
-        for v in tool_input.values():
-            if isinstance(v, str) and v:
-                return v[:60]
-        return ""
+        """Wrapper for stream handler's _summarize_tool_input - delegates to stream_handler module."""
+        from .stream_handler import _summarize_tool_input as stream_summarize
+        return stream_summarize(tool_name, tool_input)
 
     @staticmethod
     def _start_typing_heartbeat(
@@ -1125,12 +1094,14 @@ class MessageOrchestrator:
             if update_obj.tool_calls:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
-                    detail = self._summarize_tool_input(name, tc.get("input", {}))
+                    from .stream_handler import _summarize_tool_input
+                    detail = _summarize_tool_input(name, tc.get("input", {}))
                     if verbose_level >= 1:
                         tool_log.append(
                             {"kind": "tool", "name": name, "detail": detail}
                         )
                     if draft_streamer:
+                        from .stream_handler import _tool_icon
                         icon = _tool_icon(name)
                         line = (
                             f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
@@ -1183,7 +1154,8 @@ class MessageOrchestrator:
                 now = time.time()
                 if (now - last_edit_time[0]) >= 2.0 and tool_log:
                     last_edit_time[0] = now
-                    new_text = self._format_verbose_progress(
+                    from .stream_handler import _format_verbose_progress
+                    new_text = _format_verbose_progress(
                         tool_log, verbose_level, start_time
                     )
                     try:
@@ -1366,26 +1338,14 @@ class MessageOrchestrator:
         state_key = self._state_key(update)
         client_state = persistent_manager.get_client_state(state_key)
 
-        # If client is busy, inject the message into the current turn
-        # and return immediately.  The CLI absorbs it as a system reminder
-        # between tool calls — no separate response is produced.
+        # If client is busy, queue the message for delivery after the
+        # current turn finishes.  No injection — queued messages are
+        # sent as a normal turn once Claude is idle.
         if client_state in ("busy", "draining"):
-            try:
-                await update.message.set_reaction("\U0001f440")  # 👀
-            except Exception:
-                pass
-            await persistent_manager.send_message(
+            await self._enqueue_message(
                 state_key=state_key,
-                prompt=message_text,
-                working_directory=context.user_data.get(
-                    "current_directory", self.settings.approved_directory
-                ),
-            )
-            logger.info(
-                "Follow-up injected (client busy)",
-                user_id=user_id,
-                state_key=state_key,
-                client_state=client_state,
+                message_text=message_text,
+                update=update,
             )
             return
 

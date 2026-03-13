@@ -76,6 +76,7 @@ def _make_turn_context(prompt="test", **kwargs):
     return TurnContext(
         prompt=prompt,
         stream_callback=kwargs.get("stream_callback"),
+        stall_callback=kwargs.get("stall_callback"),
         response_future=loop.create_future(),
         started_at=kwargs.get("started_at", time.time()),
     )

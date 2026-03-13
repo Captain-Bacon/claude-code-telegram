@@ -49,6 +49,7 @@ class TurnContext:
 
     prompt: str
     stream_callback: Optional[Callable]
+    stall_callback: Optional[Callable]
     response_future: "asyncio.Future[PersistentResponse]"
     started_at: float
     messages: List[Message] = field(default_factory=list)
@@ -143,6 +144,7 @@ class PersistentClientManager:
         prompt: str,
         working_directory: Path,
         stream_callback: Optional[Callable[[StreamUpdate], Any]] = None,
+        stall_callback: Optional[Callable[..., Any]] = None,
         model: Optional[str] = None,
         force_new: bool = False,
     ) -> Optional[PersistentResponse]:
@@ -199,6 +201,7 @@ class PersistentClientManager:
             turn = TurnContext(
                 prompt=prompt,
                 stream_callback=stream_callback,
+                stall_callback=stall_callback,
                 response_future=future,
                 started_at=time.time(),
             )
@@ -364,6 +367,20 @@ class PersistentClientManager:
                     cli_alive=cli_alive,
                     pending_turns=entry.pending_turns,
                 )
+
+                # Notify caller about stall
+                if turn.stall_callback:
+                    try:
+                        result = turn.stall_callback(
+                            silence_seconds=round(silence_s, 1),
+                            total_elapsed_seconds=round(total_elapsed_s, 1),
+                            cli_alive=cli_alive,
+                        )
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        logger.debug("stall_callback error", error=str(e))
+
                 idx += 1
 
         except asyncio.CancelledError:
@@ -966,6 +983,20 @@ class PersistentClientManager:
             num_turns=0,
             is_error=True,
         )
+
+        # Notify caller about death
+        if turn and turn.stall_callback:
+            try:
+                result = turn.stall_callback(
+                    silence_seconds=0,
+                    total_elapsed_seconds=round(time.time() - turn.started_at, 1),
+                    cli_alive=False,
+                    is_dead=True,
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
 
         # Resolve current turn
         if entry.current_turn and not entry.current_turn.response_future.done():

@@ -17,6 +17,7 @@ def _make_turn(event_loop: Any = None, **kwargs: Any) -> TurnContext:
     defaults = dict(
         prompt="test",
         stream_callback=None,
+        stall_callback=None,
         response_future=future,
         started_at=1000.0,
         messages=[],
