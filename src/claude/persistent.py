@@ -61,6 +61,7 @@ class TurnContext:
     total_output_tokens: int = 0
     last_message_at: float = 0.0
     last_message_type: str = ""
+    last_stream_event_type: str = ""  # Inner event type from most recent StreamEvent
 
 
 @dataclass
@@ -356,6 +357,7 @@ class PersistentClientManager:
                     silence_seconds=round(silence_s, 1),
                     total_elapsed_seconds=round(total_elapsed_s, 1),
                     last_message_type=turn.last_message_type or "none",
+                    last_stream_event_type=turn.last_stream_event_type or "none",
                     api_calls_so_far=turn.api_call_count,
                     cli_alive=cli_alive,
                     pending_turns=entry.pending_turns,
@@ -552,9 +554,11 @@ class PersistentClientManager:
                     turn.last_message_at = now
                     turn.last_message_type = msg_type
 
-                # Extract per-API-call token usage from StreamEvent message_start
+                # StreamEvent diagnostics: track inner type + extract token usage
                 if isinstance(message, StreamEvent) and turn:
                     event = getattr(message, "event", None) or {}
+                    turn.last_stream_event_type = event.get("type", "unknown")
+
                     if event.get("type") == "message_start":
                         usage = (event.get("message") or {}).get("usage", {})
                         input_tok = usage.get("input_tokens", 0)

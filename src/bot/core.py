@@ -305,12 +305,15 @@ class ClaudeCodeBot:
             SecurityError,
         )
 
+        from telegram.error import NetworkError
+
         error_messages = {
             AuthenticationError: "🔒 Authentication required. Please contact the administrator.",
             SecurityError: "🛡️ Security violation detected. This incident has been logged.",
             RateLimitExceeded: "⏱️ Rate limit exceeded. Please wait before sending more messages.",
             ConfigurationError: "⚙️ Configuration error. Please contact the administrator.",
             asyncio.TimeoutError: "⏰ Operation timed out. Please try again with a simpler request.",
+            NetworkError: "📡 Network error talking to Telegram. Your message may not have been processed — try sending it again.",
         }
 
         error_type = type(error)
