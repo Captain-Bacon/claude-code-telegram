@@ -41,11 +41,6 @@ def bot_with_builder(monkeypatch):
         "builder",
         MagicMock(return_value=builder),
     )
-    monkeypatch.setattr(
-        core_module,
-        "FeatureRegistry",
-        MagicMock(return_value=MagicMock()),
-    )
     monkeypatch.setattr(bot, "_set_bot_commands", AsyncMock())
     monkeypatch.setattr(bot, "_register_handlers", MagicMock())
     monkeypatch.setattr(bot, "_add_middleware", MagicMock())
