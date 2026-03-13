@@ -28,15 +28,21 @@ def test_testing_config():
 
 
 def test_production_config():
-    """Test production configuration values."""
+    """Test production configuration values.
+
+    ProductionConfig intentionally has minimal overrides — settings like
+    debug, log_level, and enable_telemetry are controlled via .env so
+    they are NOT set here (prevents _apply_environment_overrides from
+    silently clobbering .env values).
+    """
     config_dict = ProductionConfig.as_dict()
 
-    assert config_dict["debug"] is False
-    assert config_dict["development_mode"] is False
-    assert config_dict["log_level"] == "INFO"
-    assert config_dict["enable_telemetry"] is True
-    assert config_dict["claude_max_cost_per_user"] == 5.0
-    assert config_dict["rate_limit_requests"] == 5
+    assert config_dict["session_timeout_hours"] == 12
+    # These must NOT be present — .env controls them
+    assert "debug" not in config_dict
+    assert "development_mode" not in config_dict
+    assert "log_level" not in config_dict
+    assert "enable_telemetry" not in config_dict
 
 
 def test_config_as_dict_excludes_internals():

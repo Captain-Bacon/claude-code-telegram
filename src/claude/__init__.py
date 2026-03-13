@@ -7,7 +7,6 @@ from .exceptions import (
     ClaudeSessionError,
     ClaudeTimeoutError,
 )
-from .facade import ClaudeIntegration
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import (
     ClaudeSession,
@@ -22,8 +21,6 @@ __all__ = [
     "ClaudeProcessError",
     "ClaudeSessionError",
     "ClaudeTimeoutError",
-    # Main integration
-    "ClaudeIntegration",
     # Core components
     "ClaudeSDKManager",
     "ClaudeResponse",

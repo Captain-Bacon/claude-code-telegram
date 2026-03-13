@@ -27,8 +27,25 @@ from src.config.settings import Settings
 
 @pytest.fixture(autouse=True)
 def _patch_parse_message():
-    """Patch parse_message as identity so mocks can yield typed Message objects."""
-    with patch("src.claude.sdk_integration.parse_message", side_effect=lambda x: x):
+    """Patch parse_message so mocks can yield typed Message objects.
+
+    The production code iterates ``receive_messages()`` which yields *raw
+    dicts*.  It then calls ``parse_message(raw_data)`` to get a typed
+    object **and** may call ``result_raw_data.update(raw_data)`` on the
+    same raw dict.
+
+    Our mock ``receive_messages()`` yields ``{"_mock_msg": <typed_obj>}``
+    dicts.  This patch extracts the typed object so ``isinstance`` checks
+    work, while the surrounding code can still ``.update()`` the dict
+    without error.
+    """
+
+    def _parse(raw):
+        if isinstance(raw, dict) and "_mock_msg" in raw:
+            return raw["_mock_msg"]
+        return raw
+
+    with patch("src.claude.sdk_integration.parse_message", side_effect=_parse):
         yield
 
 
@@ -61,6 +78,11 @@ def _mock_client(*messages):
 
     Returns a factory function suitable for patching ClaudeSDKClient.
     Uses connect()/disconnect() pattern (not async context manager).
+
+    ``receive_messages()`` yields ``{"_mock_msg": <typed_obj>}`` dicts so
+    the production code's ``result_raw_data.update(raw_data)`` works (it
+    expects a dict), while the patched ``parse_message`` extracts the
+    typed object for ``isinstance`` checks.
     """
     client = AsyncMock()
     client.connect = AsyncMock()
@@ -69,7 +91,7 @@ def _mock_client(*messages):
 
     async def receive_raw_messages():
         for msg in messages:
-            yield msg
+            yield {"_mock_msg": msg}
 
     query_mock = AsyncMock()
     query_mock.receive_messages = receive_raw_messages
@@ -346,26 +368,6 @@ class TestClaudeSDKManager:
         assert len(captured_options) == 1
         assert captured_options[0].resume == "existing-session-id"
 
-    async def test_execute_command_passes_max_budget_usd(self, sdk_manager, config):
-        """Test that max_budget_usd is passed from config to ClaudeAgentOptions."""
-        captured_options = []
-        mock_factory = _mock_client_factory(
-            _make_assistant_message("Test response"),
-            _make_result_message(total_cost_usd=0.01),
-            capture_options=captured_options,
-        )
-
-        with patch(
-            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
-        ):
-            await sdk_manager.execute_command(
-                prompt="Test prompt",
-                working_directory=Path("/test"),
-            )
-
-        assert len(captured_options) == 1
-        assert captured_options[0].max_budget_usd == config.claude_max_cost_per_request
-
     async def test_execute_command_no_resume_for_new_session(self, sdk_manager):
         """Test that resume is not set for new sessions."""
         captured_options = []
@@ -456,6 +458,8 @@ class TestClaudeSandboxSettings:
 
         assert len(captured_options) == 1
         opts = captured_options[0]
+        # system_prompt is a plain string (replaces default SWE prompt)
+        assert isinstance(opts.system_prompt, str)
         assert str(tmp_path) in opts.system_prompt
         assert "relative paths" in opts.system_prompt.lower()
 
@@ -467,6 +471,7 @@ class TestClaudeSandboxSettings:
             approved_directory=tmp_path,
             claude_timeout_seconds=2,
             claude_disallowed_tools=["WebFetch", "WebSearch"],
+            disable_tool_validation=False,
         )
         manager = ClaudeSDKManager(config)
 
@@ -496,6 +501,7 @@ class TestClaudeSandboxSettings:
             approved_directory=tmp_path,
             claude_timeout_seconds=2,
             claude_allowed_tools=["Read", "Write", "Bash"],
+            disable_tool_validation=False,
         )
         manager = ClaudeSDKManager(config)
 
@@ -1061,6 +1067,7 @@ class TestClaudeMdLoading:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
+        assert isinstance(opts.system_prompt, str)
         assert "# Project Rules" in opts.system_prompt
         assert "Always use type hints." in opts.system_prompt
 
@@ -1081,6 +1088,7 @@ class TestClaudeMdLoading:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
+        assert isinstance(opts.system_prompt, str)
         assert "Use relative paths." in opts.system_prompt
         assert "# Project Rules" not in opts.system_prompt
 
@@ -1099,4 +1107,4 @@ class TestClaudeMdLoading:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
-        assert opts.setting_sources == ["project"]
+        assert opts.setting_sources == ["project", "user"]

@@ -1,12 +1,12 @@
 """Message orchestrator — single entry point for all Telegram updates.
 
-Routes messages based on agentic vs classic mode. In agentic mode, provides
-a minimal conversational interface (3 commands, no inline keyboards). In
-classic mode, delegates to existing full-featured handlers.
+Provides a minimal agentic conversational interface (commands + text/file/photo).
 """
 
 import asyncio
+import os
 import re
+import signal
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -28,10 +28,13 @@ from telegram.ext import (
     filters,
 )
 
+from ..claude.persistent import PersistentClientManager, derive_state_key
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
-from ..projects import PrivateTopicsUnavailableError
+from ..projects import PrivateTopicsUnavailableError, load_project_registry
+from ..security.audit import AuditLogger
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
+from .utils.error_format import _format_error_message, _update_working_directory_from_claude_response
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
     ImageAttachment,
@@ -109,12 +112,221 @@ def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, "\U0001f527")
 
 
+def _is_private_chat(update: Update) -> bool:
+    """Return True when update is from a private chat."""
+    chat = update.effective_chat
+    return bool(chat and getattr(chat, "type", "") == "private")
+
+
+async def restart_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /restart command - gracefully restart the bot process.
+
+    Sends a confirmation message then triggers SIGTERM so systemd
+    (or any process manager with restart-on-exit) brings the bot back up.
+
+    Auth: protected by the auth middleware (group -2) which raises
+    ``ApplicationHandlerStop`` for unauthenticated users before any
+    handler in group 10 runs.  No per-handler check is needed.
+    """
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    await update.message.reply_text(
+        "🔄 <b>Restarting bot…</b>\n\nBack shortly.",
+        parse_mode="HTML",
+    )
+
+    if audit_logger:
+        await audit_logger.log_command(user_id, "restart", [], True)
+
+    logger.info("Restart requested via /restart command", user_id=user_id)
+
+    # SIGTERM triggers the existing graceful-shutdown handler in main.py;
+    # systemd Restart=always will bring the process back up.
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+async def sync_threads(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Synchronize project topics in the configured forum chat."""
+    settings: Settings = context.bot_data["settings"]
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    if not settings.enable_project_threads:
+        await update.message.reply_text(
+            "ℹ️ <b>Project thread mode is disabled.</b>", parse_mode="HTML"
+        )
+        return
+
+    manager = context.bot_data.get("project_threads_manager")
+    if not manager:
+        await update.message.reply_text(
+            "❌ <b>Project thread manager not initialized.</b>", parse_mode="HTML"
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        "🔄 <b>Syncing project topics...</b>", parse_mode="HTML"
+    )
+
+    if settings.project_threads_mode == "private":
+        if not _is_private_chat(update):
+            await status_msg.edit_text(
+                "❌ <b>Private Thread Mode</b>\n\n"
+                "Run <code>/sync_threads</code> in your private chat with the bot.",
+                parse_mode="HTML",
+            )
+            return
+        target_chat_id = update.effective_chat.id
+    else:
+        if settings.project_threads_chat_id is None:
+            await status_msg.edit_text(
+                "❌ <b>Group Thread Mode Misconfigured</b>\n\n"
+                "Set <code>PROJECT_THREADS_CHAT_ID</code> first.",
+                parse_mode="HTML",
+            )
+            return
+        if (
+            not update.effective_chat
+            or update.effective_chat.id != settings.project_threads_chat_id
+        ):
+            await status_msg.edit_text(
+                "❌ <b>Group Thread Mode</b>\n\n"
+                "Run <code>/sync_threads</code> in the configured project threads group.",
+                parse_mode="HTML",
+            )
+            return
+        target_chat_id = settings.project_threads_chat_id
+
+    try:
+        if not settings.projects_config_path:
+            await status_msg.edit_text(
+                "❌ <b>Project thread mode is misconfigured</b>\n\n"
+                "Set <code>PROJECTS_CONFIG_PATH</code> to a valid YAML file.",
+                parse_mode="HTML",
+            )
+            if audit_logger:
+                await audit_logger.log_command(user_id, "sync_threads", [], False)
+            return
+
+        registry = load_project_registry(
+            config_path=settings.projects_config_path,
+            approved_directory=settings.approved_directory,
+        )
+        manager.registry = registry
+        context.bot_data["project_registry"] = registry
+
+        result = await manager.sync_topics(context.bot, chat_id=target_chat_id)
+        await status_msg.edit_text(
+            "✅ <b>Project topic sync complete</b>\n\n"
+            f"• Created: <b>{result.created}</b>\n"
+            f"• Reused: <b>{result.reused}</b>\n"
+            f"• Renamed: <b>{result.renamed}</b>\n"
+            f"• Reopened: <b>{result.reopened}</b>\n"
+            f"• Closed: <b>{result.closed}</b>\n"
+            f"• Deactivated: <b>{result.deactivated}</b>\n"
+            f"• Failed: <b>{result.failed}</b>",
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(user_id, "sync_threads", [], True)
+    except PrivateTopicsUnavailableError:
+        await status_msg.edit_text(
+            manager.private_topics_unavailable_message(),
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(user_id, "sync_threads", [], False)
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ <b>Project topic sync failed</b>\n\n{escape_html(str(e))}",
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(user_id, "sync_threads", [], False)
+
+
 class MessageOrchestrator:
     """Routes messages based on mode. Single entry point for all Telegram updates."""
+
+    _CONTEXT_THRESHOLDS = [70, 60, 50, 40, 35, 30, 25, 20, 15, 10, 5]
 
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        # Track active Claude tasks per user so /stop can cancel them (legacy)
+        self._active_tasks: Dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
+
+    @staticmethod
+    def _state_key(update: Update) -> str:
+        """Derive a persistent client state key from a Telegram update."""
+        chat_id = update.effective_chat.id
+        thread_id = getattr(update.message, "message_thread_id", None)
+        user_id = update.effective_user.id
+        return derive_state_key(chat_id, thread_id, user_id)
+
+    @staticmethod
+    def _context_warning(
+        response: Any,
+        user_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Return a context-window warning if a NEW threshold is crossed."""
+        if not getattr(response, "context_window", None) or not getattr(
+            response, "total_input_tokens", None
+        ):
+            return None
+        used_pct = (response.total_input_tokens / response.context_window) * 100
+        remaining_pct = 100 - used_pct
+        if remaining_pct > MessageOrchestrator._CONTEXT_THRESHOLDS[0]:
+            return None
+        level = None
+        for threshold in MessageOrchestrator._CONTEXT_THRESHOLDS:
+            if remaining_pct <= threshold:
+                level = threshold
+            else:
+                break
+        if level is None:
+            return None
+        if user_data is not None:
+            last_warned = user_data.get("_context_last_warned")
+            if last_warned is not None and last_warned <= level:
+                return None
+            user_data["_context_last_warned"] = level
+        if level <= 15:
+            icon = "❗"
+        elif level <= 35:
+            icon = "⚠️"
+        else:
+            icon = "ℹ️"
+        return f"\n\n{icon} {level}% context remaining"
+
+    _STOP_REASON_LABELS = {
+        "max_tokens": "reached token limit",
+        "max_turns": "reached tool use limit",
+        "budget_exceeded": "reached cost limit",
+        "stop_sequence": "hit a stop condition",
+    }
+
+    @staticmethod
+    def _abnormal_stop_notice(response: Any) -> Optional["FormattedMessage"]:
+        """Return a user-facing notice if the turn ended abnormally."""
+        from .utils.formatting import FormattedMessage
+
+        stop_reason = getattr(response, "stop_reason", None)
+        if not stop_reason or stop_reason == "end_turn":
+            return None
+        label = MessageOrchestrator._STOP_REASON_LABELS.get(
+            stop_reason, stop_reason
+        )
+        return FormattedMessage(
+            f"\n⚠️ Claude was cut short ({label}). "
+            f"Send a follow-up to continue.",
+            parse_mode=None,
+        )
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -290,27 +502,24 @@ class MessageOrchestrator:
             await update.effective_message.reply_text(message, parse_mode="HTML")
 
     def register_handlers(self, app: Application) -> None:
-        """Register handlers based on mode."""
-        if self.settings.agentic_mode:
-            self._register_agentic_handlers(app)
-        else:
-            self._register_classic_handlers(app)
+        """Register agentic handlers."""
+        self._register_agentic_handlers(app)
 
     def _register_agentic_handlers(self, app: Application) -> None:
         """Register agentic handlers: commands + text/file/photo."""
-        from .handlers import command
-
         # Commands
-        handlers = [
+        handlers: list[tuple[str, Callable]] = [
             ("start", self.agentic_start),
             ("new", self.agentic_new),
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
-            ("restart", command.restart_command),
+            ("model", self.agentic_model),
+            ("restart", restart_command),
+            ("stop", self.agentic_stop),
         ]
         if self.settings.enable_project_threads:
-            handlers.append(("sync_threads", command.sync_threads))
+            handlers.append(("sync_threads", sync_threads))
 
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
@@ -354,93 +563,21 @@ class MessageOrchestrator:
 
         logger.info("Agentic handlers registered")
 
-    def _register_classic_handlers(self, app: Application) -> None:
-        """Register full classic handler set (moved from core.py)."""
-        from .handlers import callback, command, message
-
-        handlers = [
-            ("start", command.start_command),
-            ("help", command.help_command),
-            ("new", command.new_session),
-            ("continue", command.continue_session),
-            ("end", command.end_session),
-            ("ls", command.list_files),
-            ("cd", command.change_directory),
-            ("pwd", command.print_working_directory),
-            ("projects", command.show_projects),
-            ("status", command.session_status),
-            ("export", command.export_session),
-            ("actions", command.quick_actions),
-            ("git", command.git_command),
-            ("restart", command.restart_command),
+    async def get_bot_commands(self) -> list:  # type: ignore[type-arg]
+        """Return bot commands for the Telegram command menu."""
+        commands = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("new", "Start a fresh session"),
+            BotCommand("status", "Show session status"),
+            BotCommand("verbose", "Set output verbosity (0/1/2)"),
+            BotCommand("repo", "List repos / switch workspace"),
+            BotCommand("model", "Switch Claude model"),
+            BotCommand("restart", "Restart the bot"),
+            BotCommand("stop", "Cancel the current Claude request"),
         ]
         if self.settings.enable_project_threads:
-            handlers.append(("sync_threads", command.sync_threads))
-
-        for cmd, handler in handlers:
-            app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
-
-        app.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._inject_deps(message.handle_text_message),
-            ),
-            group=10,
-        )
-        app.add_handler(
-            MessageHandler(
-                filters.Document.ALL, self._inject_deps(message.handle_document)
-            ),
-            group=10,
-        )
-        app.add_handler(
-            MessageHandler(filters.PHOTO, self._inject_deps(message.handle_photo)),
-            group=10,
-        )
-        app.add_handler(
-            MessageHandler(filters.VOICE, self._inject_deps(message.handle_voice)),
-            group=10,
-        )
-        app.add_handler(
-            CallbackQueryHandler(self._inject_deps(callback.handle_callback_query))
-        )
-
-        logger.info("Classic handlers registered (13 commands + full handler set)")
-
-    async def get_bot_commands(self) -> list:  # type: ignore[type-arg]
-        """Return bot commands appropriate for current mode."""
-        if self.settings.agentic_mode:
-            commands = [
-                BotCommand("start", "Start the bot"),
-                BotCommand("new", "Start a fresh session"),
-                BotCommand("status", "Show session status"),
-                BotCommand("verbose", "Set output verbosity (0/1/2)"),
-                BotCommand("repo", "List repos / switch workspace"),
-                BotCommand("restart", "Restart the bot"),
-            ]
-            if self.settings.enable_project_threads:
-                commands.append(BotCommand("sync_threads", "Sync project topics"))
-            return commands
-        else:
-            commands = [
-                BotCommand("start", "Start bot and show help"),
-                BotCommand("help", "Show available commands"),
-                BotCommand("new", "Clear context and start fresh session"),
-                BotCommand("continue", "Explicitly continue last session"),
-                BotCommand("end", "End current session and clear context"),
-                BotCommand("ls", "List files in current directory"),
-                BotCommand("cd", "Change directory (resumes project session)"),
-                BotCommand("pwd", "Show current directory"),
-                BotCommand("projects", "Show all projects"),
-                BotCommand("status", "Show session status"),
-                BotCommand("export", "Export current session"),
-                BotCommand("actions", "Show quick actions"),
-                BotCommand("git", "Git repository commands"),
-                BotCommand("restart", "Restart the bot"),
-            ]
-            if self.settings.enable_project_threads:
-                commands.append(BotCommand("sync_threads", "Sync project topics"))
-            return commands
+            commands.append(BotCommand("sync_threads", "Sync project topics"))
+        return commands
 
     # --- Agentic handlers ---
 
@@ -501,17 +638,61 @@ class MessageOrchestrator:
     async def agentic_new(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Reset session, one-line confirmation."""
+        """Reset session — disconnect persistent client, clear state."""
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if persistent_manager:
+            state_key = self._state_key(update)
+            await persistent_manager.disconnect_client(state_key)
+
         context.user_data["claude_session_id"] = None
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
+        context.user_data.pop("_context_last_warned", None)
 
         await update.message.reply_text("Session reset. What's next?")
+
+    async def agentic_model(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Switch Claude model at runtime."""
+        aliases = {
+            "opus": "claude-opus-4-6",
+            "sonnet": "claude-sonnet-4-6",
+            "haiku": "claude-haiku-4-5-20251001",
+        }
+        args = update.message.text.split()[1:] if update.message.text else []
+        if not args:
+            current = context.user_data.get("claude_model")
+            display = current or "default (CLI decides)"
+            await update.message.reply_text(
+                f"Model: <b>{escape_html(display)}</b>\n\n"
+                "Usage: <code>/model opus|sonnet|haiku|default</code>",
+                parse_mode="HTML",
+            )
+            return
+        choice = args[0].lower()
+        if choice == "default":
+            context.user_data.pop("claude_model", None)
+            await update.message.reply_text(
+                "Model reset to <b>default</b> (CLI decides)",
+                parse_mode="HTML",
+            )
+            return
+        model_id = aliases.get(choice, choice)
+        context.user_data["claude_model"] = model_id
+        await update.message.reply_text(
+            f"Model set to <b>{escape_html(model_id)}</b>",
+            parse_mode="HTML",
+        )
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Compact one-line status, no buttons."""
+        from src import get_build_info
+
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
@@ -532,8 +713,17 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
+        model_str = ""
+        current_model = context.user_data.get("claude_model")
+        if current_model:
+            model_str = f" · Model: {current_model}"
+
+        build = get_build_info()
+
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
+            f"📂 {dir_display} · Session: {session_status}{cost_str}{model_str}\n"
+            f"Build: <code>{escape_html(build)}</code>",
+            parse_mode="HTML",
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -576,6 +766,44 @@ class MessageOrchestrator:
         await update.message.reply_text(
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
             parse_mode="HTML",
+        )
+
+    async def agentic_stop(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Stop the active Claude work for this thread."""
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if not persistent_manager:
+            await update.message.reply_text("Nothing running to stop.")
+            return
+
+        state_key = self._state_key(update)
+        result = await persistent_manager.stop_client(state_key)
+
+        if not result.was_busy:
+            await update.message.reply_text("Nothing running to stop.")
+            return
+
+        # Report what was stopped and any discarded messages
+        if result.discarded_messages:
+            lines = ["Stopped. These queued messages were not sent:"]
+            for msg_text in result.discarded_messages:
+                # Truncate long messages for the summary
+                preview = msg_text[:100] + ("..." if len(msg_text) > 100 else "")
+                lines.append(f"  \u2022 {escape_html(preview)}")
+            await update.message.reply_text(
+                "\n".join(lines), parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text("Stopped.")
+
+        logger.info(
+            "User stopped client",
+            user_id=update.effective_user.id,
+            state_key=state_key,
+            discarded=len(result.discarded_messages),
         )
 
     def _format_verbose_progress(
@@ -678,6 +906,7 @@ class MessageOrchestrator:
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
+        telegram_update: Optional[Any] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
@@ -689,16 +918,189 @@ class MessageOrchestrator:
         text are streamed to the user in real time via
         ``sendMessageDraft``.
 
+        When *telegram_update* is provided, Claude's text commentary
+        between tool calls is sent as persistent Telegram messages
+        immediately (not batched until the end).  Thinking blocks are
+        sent as ephemeral messages visible during streaming and deleted
+        once the final response is delivered.
+
         Returns None when verbose_level is 0 **and** no MCP image
         collection or draft streaming is requested.
         Typing indicators are handled by a separate heartbeat task.
         """
+        import html as html_mod
+
         need_mcp_intercept = mcp_images is not None and approved_directory is not None
 
-        if verbose_level == 0 and not need_mcp_intercept and draft_streamer is None:
+        if (
+            verbose_level == 0
+            and not need_mcp_intercept
+            and draft_streamer is None
+            and telegram_update is None
+        ):
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
+
+        # Batching state for rapid-fire text blocks (rate-limit safety).
+        # We accumulate text for up to _TEXT_BATCH_WINDOW seconds before
+        # sending a single persistent message.
+        _TEXT_BATCH_WINDOW = 1.5  # seconds
+        _pending_text: List[str] = []
+        _pending_thinking: List[str] = []
+        _thinking_message_ids: List[int] = []
+        _text_batch_task: List[Optional[asyncio.Task]] = [None]
+
+        # Track whether assistant text was sent as standalone messages
+        # during this turn.  If True, the final response is suppressed
+        # (the standalone messages already delivered the content).
+        _text_was_sent = [False]
+
+        # Lock protecting the mutable closure state above.  Without this,
+        # concurrent async operations (_schedule_flush, _enqueue_text,
+        # the external flush_pending entry-point) race on the shared lists
+        # and the cancel-and-recreate pattern for _text_batch_task.
+        _stream_lock = asyncio.Lock()
+
+        # Serialises Telegram sends so two concurrent flushes don't
+        # interleave messages.  Separate from _stream_lock so that
+        # network I/O never blocks _enqueue_text / _on_stream.
+        _send_lock = asyncio.Lock()
+
+        async def _flush_pending_text() -> None:
+            """Send accumulated text/thinking as persistent messages.
+
+            Collects pending data under _stream_lock (microseconds),
+            then sends to Telegram under _send_lock (network I/O).
+            This prevents slow/failing Telegram sends from blocking
+            the SDK message pipeline.
+            """
+            # --- Phase 1: collect under _stream_lock ---
+            t0 = time.time()
+            async with _stream_lock:
+                lock_wait_ms = (time.time() - t0) * 1000
+                if lock_wait_ms > 100:
+                    logger.warning(
+                        "stream_lock.slow_acquire",
+                        wait_ms=round(lock_wait_ms, 1),
+                        phase="flush_collect",
+                    )
+
+                if not telegram_update:
+                    return
+
+                # Snapshot and clear — releases lock quickly
+                thinking_snapshot = list(_pending_thinking)
+                _pending_thinking.clear()
+                text_snapshot = list(_pending_text)
+                _pending_text.clear()
+
+            # Nothing to send
+            if not thinking_snapshot and not text_snapshot:
+                return
+
+            # --- Phase 2: send under _send_lock (network I/O) ---
+            async with _send_lock:
+                # Send thinking as ephemeral messages
+                if thinking_snapshot:
+                    from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+
+                    thinking_text = "\n\n".join(thinking_snapshot)
+                    escaped = html_mod.escape(thinking_text)
+                    prefix = "\U0001f9e0 "
+                    max_content = TELEGRAM_MAX_MESSAGE_LENGTH - len(prefix)
+                    if len(escaped) > max_content:
+                        escaped = escaped[: max_content - 1] + "\u2026"
+                    thinking_msg = f"{prefix}{escaped}"
+                    try:
+                        send_t0 = time.time()
+                        sent = await telegram_update.effective_message.reply_text(
+                            thinking_msg,
+                            parse_mode="HTML",
+                            disable_notification=True,
+                        )
+                        _thinking_message_ids.append(sent.message_id)
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        send_duration_ms = (time.time() - send_t0) * 1000
+                        logger.warning(
+                            "Failed to send thinking message",
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            send_duration_ms=round(send_duration_ms, 1),
+                        )
+
+                # Send commentary text
+                if text_snapshot:
+                    combined = "\n\n".join(text_snapshot)
+                    if not combined.strip():
+                        return
+
+                    from .utils.formatting import ResponseFormatter
+
+                    formatter = ResponseFormatter(self.settings)
+                    formatted = formatter.format_claude_response(combined)
+                    for msg in formatted:
+                        if not msg.text or not msg.text.strip():
+                            continue
+                        try:
+                            send_t0 = time.time()
+                            await telegram_update.effective_message.reply_text(
+                                msg.text,
+                                parse_mode=msg.parse_mode,
+                                reply_markup=None,
+                                disable_notification=True,
+                                do_quote=False,
+                            )
+                            _text_was_sent[0] = True
+                            await asyncio.sleep(0.3)
+                        except Exception as send_err:
+                            send_duration_ms = (time.time() - send_t0) * 1000
+                            logger.warning(
+                                "Failed to send intermediate text",
+                                error=str(send_err),
+                                error_type=type(send_err).__name__,
+                                send_duration_ms=round(send_duration_ms, 1),
+                                text_length=len(msg.text),
+                            )
+                            # Fallback: send as plain text
+                            try:
+                                await telegram_update.effective_message.reply_text(
+                                    combined,
+                                    reply_markup=None,
+                                    disable_notification=True,
+                                    do_quote=False,
+                                )
+                            except Exception:
+                                pass
+
+        async def _schedule_flush() -> None:
+            """Wait for the batch window then flush."""
+            await asyncio.sleep(_TEXT_BATCH_WINDOW)
+            await _flush_pending_text()
+            _text_batch_task[0] = None
+
+        async def _enqueue_text(text: str, is_thinking: bool = False) -> None:
+            """Add text to the pending batch and schedule a flush."""
+            t0 = time.time()
+            async with _stream_lock:
+                lock_wait_ms = (time.time() - t0) * 1000
+                if lock_wait_ms > 100:
+                    logger.warning(
+                        "stream_lock.slow_acquire",
+                        wait_ms=round(lock_wait_ms, 1),
+                        phase="enqueue",
+                    )
+
+                if is_thinking:
+                    _pending_thinking.append(text)
+                else:
+                    _pending_text.append(text)
+
+                # Cancel any existing scheduled flush and restart the timer
+                if _text_batch_task[0] is not None:
+                    _text_batch_task[0].cancel()
+                _text_batch_task[0] = asyncio.create_task(_schedule_flush())
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
             # Intercept send_image_to_user MCP tool calls.
@@ -735,10 +1137,30 @@ class MessageOrchestrator:
                         )
                         await draft_streamer.append_tool(line)
 
+            # Send thinking blocks as ephemeral messages (deleted after response)
+            if update_obj.type == "thinking" and update_obj.content:
+                text = update_obj.content.strip()
+                if text and telegram_update:
+                    await _enqueue_text(text, is_thinking=True)
+                if draft_streamer:
+                    first_line = text.split("\n", 1)[0].strip() if text else ""
+                    if first_line:
+                        await draft_streamer.append_tool(
+                            f"\U0001f914 {first_line[:80]}"
+                        )
+
             # Capture assistant text (reasoning / commentary)
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text:
+                    # Send every assistant text as a persistent standalone
+                    # message.  The _text_was_sent flag is set when the
+                    # flush actually delivers to Telegram — the final
+                    # response path checks this and skips the main text
+                    # to avoid duplication.
+                    if telegram_update:
+                        await _enqueue_text(text)
+
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
                         if verbose_level >= 1:
@@ -769,7 +1191,55 @@ class MessageOrchestrator:
                     except Exception:
                         pass
 
+        async def _delete_thinking_messages() -> None:
+            """Delete all ephemeral thinking messages sent during streaming."""
+            if not telegram_update or not _thinking_message_ids:
+                return
+            chat = telegram_update.effective_message.chat
+            for msg_id in _thinking_message_ids:
+                try:
+                    await chat.delete_message(msg_id)
+                except Exception as e:
+                    logger.debug(
+                        "Failed to delete thinking message",
+                        message_id=msg_id,
+                        error=str(e),
+                    )
+            _thinking_message_ids.clear()
+
+        # Attach helpers so callers can drain pending text and check state
+        _on_stream.flush_pending = _flush_pending_text  # type: ignore[attr-defined]
+        _on_stream.delete_thinking = _delete_thinking_messages  # type: ignore[attr-defined]
+        _on_stream.text_was_sent = _text_was_sent  # type: ignore[attr-defined]
+
         return _on_stream
+
+    async def _flush_stream_callback(
+        self,
+        on_stream: Optional[Callable],
+    ) -> None:
+        """Flush any pending batched text from the stream callback.
+
+        Call this after streaming completes to ensure any buffered
+        intermediate text or thinking blocks are sent before the
+        final response.
+        """
+        if on_stream and hasattr(on_stream, "flush_pending"):
+            try:
+                await on_stream.flush_pending()
+            except Exception as e:
+                logger.debug("Failed to flush pending stream text", error=str(e))
+
+    async def _cleanup_thinking_messages(
+        self,
+        on_stream: Optional[Callable],
+    ) -> None:
+        """Delete ephemeral thinking messages after the final response is sent."""
+        if on_stream and hasattr(on_stream, "delete_thinking"):
+            try:
+                await on_stream.delete_thinking()
+            except Exception as e:
+                logger.debug("Failed to delete thinking messages", error=str(e))
 
     async def _send_images(
         self,
@@ -884,23 +1354,49 @@ class MessageOrchestrator:
         chat = update.message.chat
         await chat.send_action("typing")
 
-        verbose_level = self._get_verbose_level(context)
-        progress_msg = await update.message.reply_text("Working...")
-
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await progress_msg.edit_text(
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if not persistent_manager:
+            await update.message.reply_text(
                 "Claude integration not available. Check configuration."
             )
             return
 
+        state_key = self._state_key(update)
+        client_state = persistent_manager.get_client_state(state_key)
+
+        # If client is busy, inject the message into the current turn
+        # and return immediately.  The CLI absorbs it as a system reminder
+        # between tool calls — no separate response is produced.
+        if client_state in ("busy", "draining"):
+            try:
+                await update.message.set_reaction("\U0001f440")  # 👀
+            except Exception:
+                pass
+            await persistent_manager.send_message(
+                state_key=state_key,
+                prompt=message_text,
+                working_directory=context.user_data.get(
+                    "current_directory", self.settings.approved_directory
+                ),
+            )
+            logger.info(
+                "Follow-up injected (client busy)",
+                user_id=user_id,
+                state_key=state_key,
+                client_state=client_state,
+            )
+            return
+
+        verbose_level = self._get_verbose_level(context)
+        progress_msg = await update.message.reply_text("Working...")
+
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
-        # Flag is only cleared after a successful run so retries keep the intent.
         force_new = bool(context.user_data.get("force_new_session"))
 
         # --- Verbose progress tracking via stream callback ---
@@ -927,6 +1423,7 @@ class MessageOrchestrator:
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
+            telegram_update=update,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -934,14 +1431,30 @@ class MessageOrchestrator:
 
         success = True
         try:
-            claude_response = await claude_integration.run_command(
+            claude_response = await persistent_manager.send_message(
+                state_key=state_key,
                 prompt=message_text,
                 working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
+                stream_callback=on_stream,
+                model=context.user_data.get("claude_model"),
                 force_new=force_new,
             )
+
+            # None means the message was injected into a busy turn
+            # (race: state was idle at the orchestrator check but another
+            # concurrent handler claimed the turn before we acquired the
+            # send_lock inside send_message).
+            if claude_response is None:
+                heartbeat.cancel()
+                try:
+                    await update.message.set_reaction("\U0001f440")  # 👀
+                except Exception:
+                    pass
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                return
 
             # New session created successfully — clear the one-shot flag
             if force_new:
@@ -950,7 +1463,7 @@ class MessageOrchestrator:
             context.user_data["claude_session_id"] = claude_response.session_id
 
             # Track directory changes
-            from .handlers.message import _update_working_directory_from_claude_response
+
 
             _update_working_directory_from_claude_response(
                 claude_response, context, self.settings, user_id
@@ -970,18 +1483,66 @@ class MessageOrchestrator:
                 except Exception as e:
                     logger.warning("Failed to log interaction", error=str(e))
 
-            # Format response (no reply_markup — strip keyboards)
-            from .utils.formatting import ResponseFormatter
+            # Drain any pending batched text BEFORE checking the flag.
+            # The 1.5s batch window means text can be enqueued but not yet
+            # flushed when the turn completes — checking the flag first
+            # would miss it and cause the final response to duplicate.
+            await self._flush_stream_callback(on_stream)
 
-            formatter = ResponseFormatter(self.settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
+            text_already_sent = (
+                on_stream
+                and hasattr(on_stream, "text_was_sent")
+                and on_stream.text_was_sent[0]
             )
 
+            from .utils.formatting import FormattedMessage, ResponseFormatter
+
+            if text_already_sent:
+                formatted_messages: List[FormattedMessage] = []
+            else:
+                formatter = ResponseFormatter(self.settings)
+                formatted_messages = formatter.format_claude_response(
+                    claude_response.content
+                )
+
+            # Show [Interrupted] if the response was stopped
+            if claude_response.is_interrupted:
+                formatted_messages.append(
+                    FormattedMessage("[Interrupted]", parse_mode=None)
+                )
+
+            # Warn if the turn ended for a non-normal reason
+            stop_notice = self._abnormal_stop_notice(claude_response)
+            if stop_notice:
+                formatted_messages.append(stop_notice)
+                logger.warning(
+                    "turn.abnormal_stop",
+                    state_key=self._state_key(update),
+                    stop_reason=claude_response.stop_reason,
+                    num_turns=claude_response.num_turns,
+                )
+
+            # Append context window warning if threshold crossed
+            ctx_warn = self._context_warning(claude_response, context.user_data)
+            if ctx_warn:
+                if formatted_messages:
+                    formatted_messages[-1].text += ctx_warn
+                else:
+                    # No messages to append to — send as standalone
+                    formatted_messages.append(
+                        FormattedMessage(ctx_warn, parse_mode="HTML")
+                    )
+
+        except asyncio.CancelledError:
+            success = False
+            logger.info("Claude request cancelled", user_id=user_id)
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [FormattedMessage("Stopped.", parse_mode=None)]
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
-            from .handlers.message import _format_error_message
+
             from .utils.formatting import FormattedMessage
 
             formatted_messages = [
@@ -994,6 +1555,13 @@ class MessageOrchestrator:
                     await draft_streamer.flush()
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
+            # Flush any pending batched intermediate text before final response.
+            # This runs in the finally block so buffered text is delivered even
+            # on error paths (previously only flushed on success).
+            try:
+                await self._flush_stream_callback(on_stream)
+            except Exception:
+                logger.debug("Stream callback flush failed in finally block", user_id=user_id)
 
         try:
             await progress_msg.delete()
@@ -1029,9 +1597,6 @@ class MessageOrchestrator:
                         message.text,
                         parse_mode=message.parse_mode,
                         reply_markup=None,  # No keyboards in agentic mode
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
                     )
                     if i < len(formatted_messages) - 1:
                         await asyncio.sleep(0.5)
@@ -1045,18 +1610,12 @@ class MessageOrchestrator:
                         await update.message.reply_text(
                             message.text,
                             reply_markup=None,
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
                         )
                     except Exception as plain_err:
                         await update.message.reply_text(
                             f"Failed to deliver response "
                             f"(Telegram error: {str(plain_err)[:150]}). "
                             f"Please try again.",
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
                         )
 
             # Send images separately if caption wasn't used
@@ -1069,6 +1628,9 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Delete ephemeral thinking messages now that the final response is sent
+        await self._cleanup_thinking_messages(on_stream)
 
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
@@ -1147,117 +1709,15 @@ class MessageOrchestrator:
                 )
                 return
 
-        # Process with Claude
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await progress_msg.edit_text(
-                "Claude integration not available. Check configuration."
-            )
-            return
-
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
+        # Process with Claude via persistent client
+        await self._handle_agentic_media_message(
+            update=update,
+            context=context,
+            prompt=prompt,
+            progress_msg=progress_msg,
+            user_id=user_id,
+            chat=chat,
         )
-        session_id = context.user_data.get("claude_session_id")
-
-        # Check if /new was used — skip auto-resume for this first message.
-        # Flag is only cleared after a successful run so retries keep the intent.
-        force_new = bool(context.user_data.get("force_new_session"))
-
-        verbose_level = self._get_verbose_level(context)
-        tool_log: List[Dict[str, Any]] = []
-        mcp_images_doc: List[ImageAttachment] = []
-        on_stream = self._make_stream_callback(
-            verbose_level,
-            progress_msg,
-            tool_log,
-            time.time(),
-            mcp_images=mcp_images_doc,
-            approved_directory=self.settings.approved_directory,
-        )
-
-        heartbeat = self._start_typing_heartbeat(chat)
-        try:
-            claude_response = await claude_integration.run_command(
-                prompt=prompt,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
-                force_new=force_new,
-            )
-
-            if force_new:
-                context.user_data["force_new_session"] = False
-
-            context.user_data["claude_session_id"] = claude_response.session_id
-
-            from .handlers.message import _update_working_directory_from_claude_response
-
-            _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
-            )
-
-            from .utils.formatting import ResponseFormatter
-
-            formatter = ResponseFormatter(self.settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
-
-            try:
-                await progress_msg.delete()
-            except Exception:
-                logger.debug("Failed to delete progress message, ignoring")
-
-            # Use MCP-collected images (from send_image_to_user tool calls)
-            images: List[ImageAttachment] = mcp_images_doc
-
-            caption_sent = False
-            if images and len(formatted_messages) == 1:
-                msg = formatted_messages[0]
-                if msg.text and len(msg.text) <= 1024:
-                    try:
-                        caption_sent = await self._send_images(
-                            update,
-                            images,
-                            reply_to_message_id=update.message.message_id,
-                            caption=msg.text,
-                            caption_parse_mode=msg.parse_mode,
-                        )
-                    except Exception as img_err:
-                        logger.warning("Image+caption send failed", error=str(img_err))
-
-            if not caption_sent:
-                for i, message in enumerate(formatted_messages):
-                    await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=None,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
-
-                if images:
-                    try:
-                        await self._send_images(
-                            update,
-                            images,
-                            reply_to_message_id=update.message.message_id,
-                        )
-                    except Exception as img_err:
-                        logger.warning("Image send failed", error=str(img_err))
-
-        except Exception as e:
-            from .handlers.message import _format_error_message
-
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
-            logger.error("Claude file processing failed", error=str(e), user_id=user_id)
-        finally:
-            heartbeat.cancel()
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1265,12 +1725,9 @@ class MessageOrchestrator:
         """Process photo -> Claude, minimal chrome."""
         user_id = update.effective_user.id
 
-        features = context.bot_data.get("features")
-        image_handler = features.get_image_handler() if features else None
+        from .media.image_handler import ImageHandler
 
-        if not image_handler:
-            await update.message.reply_text("Photo processing is not available.")
-            return
+        image_handler = ImageHandler(config=self.settings)
 
         chat = update.message.chat
         await chat.send_action("typing")
@@ -1291,7 +1748,7 @@ class MessageOrchestrator:
             )
 
         except Exception as e:
-            from .handlers.message import _format_error_message
+
 
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
             logger.error(
@@ -1304,12 +1761,20 @@ class MessageOrchestrator:
         """Transcribe voice message -> Claude, minimal chrome."""
         user_id = update.effective_user.id
 
-        features = context.bot_data.get("features")
-        voice_handler = features.get_voice_handler() if features else None
+        from .media.voice_handler import VoiceHandler
 
-        if not voice_handler:
+        voice_key_available = (
+            self.settings.voice_provider == "openai"
+            and self.settings.openai_api_key
+        ) or (
+            self.settings.voice_provider == "mistral"
+            and self.settings.mistral_api_key
+        )
+        if not (self.settings.enable_voice_messages and voice_key_available):
             await update.message.reply_text(self._voice_unavailable_message())
             return
+
+        voice_handler = VoiceHandler(config=self.settings)
 
         chat = update.message.chat
         await chat.send_action("typing")
@@ -1319,6 +1784,13 @@ class MessageOrchestrator:
             voice = update.message.voice
             processed_voice = await voice_handler.process_voice_message(
                 voice, update.message.caption
+            )
+
+            # Show transcription so the user can see what was heard
+            transcription_text = escape_html(processed_voice.transcription)
+            await update.message.reply_text(
+                f"\U0001f3a4 <b>Transcription:</b>\n{transcription_text}",
+                parse_mode="HTML",
             )
 
             await progress_msg.edit_text("Working...")
@@ -1332,7 +1804,7 @@ class MessageOrchestrator:
             )
 
         except Exception as e:
-            from .handlers.message import _format_error_message
+
 
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
             logger.error(
@@ -1350,17 +1822,19 @@ class MessageOrchestrator:
         chat: Any,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+            "persistent_manager"
+        )
+        if not persistent_manager:
             await progress_msg.edit_text(
                 "Claude integration not available. Check configuration."
             )
             return
 
+        state_key = self._state_key(update)
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
         force_new = bool(context.user_data.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
@@ -1373,18 +1847,43 @@ class MessageOrchestrator:
             time.time(),
             mcp_images=mcp_images_media,
             approved_directory=self.settings.approved_directory,
+            telegram_update=update,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
         try:
-            claude_response = await claude_integration.run_command(
+            claude_response = await persistent_manager.send_message(
+                state_key=state_key,
                 prompt=prompt,
                 working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=on_stream,
+                stream_callback=on_stream,
+                model=context.user_data.get("claude_model"),
                 force_new=force_new,
             )
+            # None means the message was injected into a busy turn
+            if claude_response is None:
+                heartbeat.cancel()
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                return
+        except asyncio.CancelledError:
+            logger.info("Claude media request cancelled", user_id=user_id)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            await update.message.reply_text("Stopped.")
+            return
+        except Exception as e:
+            from .handlers.message import _format_error_message
+
+            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            logger.error(
+                "Claude media processing failed", error=str(e), user_id=user_id
+            )
+            return
         finally:
             heartbeat.cancel()
 
@@ -1393,16 +1892,41 @@ class MessageOrchestrator:
 
         context.user_data["claude_session_id"] = claude_response.session_id
 
-        from .handlers.message import _update_working_directory_from_claude_response
-
         _update_working_directory_from_claude_response(
             claude_response, context, self.settings, user_id
         )
 
-        from .utils.formatting import ResponseFormatter
+        from .utils.formatting import FormattedMessage, ResponseFormatter
 
-        formatter = ResponseFormatter(self.settings)
-        formatted_messages = formatter.format_claude_response(claude_response.content)
+        # Drain any pending batched text BEFORE checking the flag.
+        await self._flush_stream_callback(on_stream)
+
+        text_already_sent = (
+            on_stream
+            and hasattr(on_stream, "text_was_sent")
+            and on_stream.text_was_sent[0]
+        )
+
+        if text_already_sent:
+            formatted_messages: List[FormattedMessage] = []
+        else:
+            formatter = ResponseFormatter(self.settings)
+            formatted_messages = formatter.format_claude_response(claude_response.content)
+
+        # Warn if the turn ended for a non-normal reason
+        stop_notice = self._abnormal_stop_notice(claude_response)
+        if stop_notice:
+            formatted_messages.append(stop_notice)
+
+        # Append context window warning if threshold crossed
+        ctx_warn = self._context_warning(claude_response, context.user_data)
+        if ctx_warn:
+            if formatted_messages:
+                formatted_messages[-1].text += ctx_warn
+            else:
+                formatted_messages.append(
+                    FormattedMessage(ctx_warn, parse_mode="HTML")
+                )
 
         try:
             await progress_msg.delete()
@@ -1435,7 +1959,6 @@ class MessageOrchestrator:
                     message.text,
                     parse_mode=message.parse_mode,
                     reply_markup=None,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
                 )
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
@@ -1450,13 +1973,25 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
+        # Delete ephemeral thinking messages now that the final response is sent
+        await self._cleanup_thinking_messages(on_stream)
+
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""
+        api_key_env = self.settings.voice_provider_api_key_env
+        if api_key_env:
+            return (
+                "Voice processing is not available. "
+                f"Set {api_key_env} "
+                f"for {self.settings.voice_provider_display_name} and install "
+                'voice extras with: pip install "claude-code-telegram[voice]"'
+            )
+        # Local provider (Parakeet) -- no API key, different install instructions
         return (
             "Voice processing is not available. "
-            f"Set {self.settings.voice_provider_api_key_env} "
-            f"for {self.settings.voice_provider_display_name} and install "
-            'voice extras with: pip install "claude-code-telegram[voice]"'
+            f"Install {self.settings.voice_provider_display_name} with: "
+            'pip install "claude-code-telegram[voice-local]" '
+            "and ensure ffmpeg is installed."
         )
 
     async def agentic_repo(

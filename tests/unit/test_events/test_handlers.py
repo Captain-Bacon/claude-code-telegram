@@ -16,17 +16,19 @@ def event_bus() -> EventBus:
 
 
 @pytest.fixture
-def mock_claude() -> AsyncMock:
+def mock_persistent_manager() -> AsyncMock:
     mock = AsyncMock()
-    mock.run_command = AsyncMock()
+    mock.send_message = AsyncMock()
     return mock
 
 
 @pytest.fixture
-def agent_handler(event_bus: EventBus, mock_claude: AsyncMock) -> AgentHandler:
+def agent_handler(
+    event_bus: EventBus, mock_persistent_manager: AsyncMock
+) -> AgentHandler:
     handler = AgentHandler(
         event_bus=event_bus,
-        claude_integration=mock_claude,
+        persistent_manager=mock_persistent_manager,
         default_working_directory=Path("/tmp/test"),
         default_user_id=42,
     )
@@ -38,12 +40,15 @@ class TestAgentHandler:
     """Tests for AgentHandler."""
 
     async def test_webhook_event_triggers_claude(
-        self, event_bus: EventBus, mock_claude: AsyncMock, agent_handler: AgentHandler
+        self,
+        event_bus: EventBus,
+        mock_persistent_manager: AsyncMock,
+        agent_handler: AgentHandler,
     ) -> None:
         """Webhook events are processed through Claude."""
         mock_response = MagicMock()
         mock_response.content = "Analysis complete"
-        mock_claude.run_command.return_value = mock_response
+        mock_persistent_manager.send_message.return_value = mock_response
 
         published: list = []
         original_publish = event_bus.publish
@@ -63,8 +68,8 @@ class TestAgentHandler:
 
         await agent_handler.handle_webhook(event)
 
-        mock_claude.run_command.assert_called_once()
-        call_kwargs = mock_claude.run_command.call_args
+        mock_persistent_manager.send_message.assert_called_once()
+        call_kwargs = mock_persistent_manager.send_message.call_args
         assert "github" in call_kwargs.kwargs["prompt"].lower()
 
         # Should publish an AgentResponseEvent
@@ -73,12 +78,15 @@ class TestAgentHandler:
         assert response_events[0].text == "Analysis complete"
 
     async def test_scheduled_event_triggers_claude(
-        self, event_bus: EventBus, mock_claude: AsyncMock, agent_handler: AgentHandler
+        self,
+        event_bus: EventBus,
+        mock_persistent_manager: AsyncMock,
+        agent_handler: AgentHandler,
     ) -> None:
         """Scheduled events invoke Claude with the job's prompt."""
         mock_response = MagicMock()
         mock_response.content = "Standup summary"
-        mock_claude.run_command.return_value = mock_response
+        mock_persistent_manager.send_message.return_value = mock_response
 
         published: list = []
         original_publish = event_bus.publish
@@ -97,20 +105,26 @@ class TestAgentHandler:
 
         await agent_handler.handle_scheduled(event)
 
-        mock_claude.run_command.assert_called_once()
-        assert "standup" in mock_claude.run_command.call_args.kwargs["prompt"].lower()
+        mock_persistent_manager.send_message.assert_called_once()
+        assert (
+            "standup"
+            in mock_persistent_manager.send_message.call_args.kwargs["prompt"].lower()
+        )
 
         response_events = [e for e in published if isinstance(e, AgentResponseEvent)]
         assert len(response_events) == 1
         assert response_events[0].chat_id == 100
 
     async def test_scheduled_event_with_skill(
-        self, event_bus: EventBus, mock_claude: AsyncMock, agent_handler: AgentHandler
+        self,
+        event_bus: EventBus,
+        mock_persistent_manager: AsyncMock,
+        agent_handler: AgentHandler,
     ) -> None:
         """Scheduled events with skill_name prepend the skill invocation."""
         mock_response = MagicMock()
         mock_response.content = "Done"
-        mock_claude.run_command.return_value = mock_response
+        mock_persistent_manager.send_message.return_value = mock_response
 
         event = ScheduledEvent(
             job_name="standup",
@@ -121,15 +135,18 @@ class TestAgentHandler:
 
         await agent_handler.handle_scheduled(event)
 
-        prompt = mock_claude.run_command.call_args.kwargs["prompt"]
+        prompt = mock_persistent_manager.send_message.call_args.kwargs["prompt"]
         assert prompt.startswith("/daily-standup")
         assert "morning report" in prompt
 
     async def test_claude_error_does_not_propagate(
-        self, event_bus: EventBus, mock_claude: AsyncMock, agent_handler: AgentHandler
+        self,
+        event_bus: EventBus,
+        mock_persistent_manager: AsyncMock,
+        agent_handler: AgentHandler,
     ) -> None:
         """Agent errors are logged but don't crash the handler."""
-        mock_claude.run_command.side_effect = RuntimeError("SDK error")
+        mock_persistent_manager.send_message.side_effect = RuntimeError("SDK error")
 
         event = WebhookEvent(
             provider="github",

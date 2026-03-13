@@ -20,6 +20,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ProcessError,
     ResultMessage,
+    ThinkingBlock,
     ToolPermissionContext,
     ToolUseBlock,
     UserMessage,
@@ -53,13 +54,15 @@ class ClaudeResponse:
     is_error: bool = False
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    context_window: Optional[int] = None
+    total_input_tokens: Optional[int] = None
 
 
 @dataclass
 class StreamUpdate:
     """Streaming update from Claude SDK."""
 
-    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta'
+    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta', 'thinking'
     content: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
     metadata: Optional[Dict] = None
@@ -83,45 +86,70 @@ def _make_can_use_tool_callback(
         tool_input: Dict[str, Any],
         context: ToolPermissionContext,
     ) -> Any:
-        # File path validation
-        if tool_name in _FILE_TOOLS:
-            file_path = tool_input.get("file_path") or tool_input.get("path")
-            if file_path:
-                # Allow Claude Code internal paths (~/.claude/plans/, etc.)
-                if _is_claude_internal_path(file_path):
-                    return PermissionResultAllow()
+        import time as _time
 
-                valid, _resolved, error = security_validator.validate_path(
-                    file_path, working_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied file operation",
-                        tool_name=tool_name,
-                        file_path=file_path,
-                        error=error,
-                    )
-                    return PermissionResultDeny(message=error or "Invalid file path")
+        start = _time.time()
+        decision = "allow"
+        error_msg = None
 
-        # Bash directory boundary validation
-        if tool_name in _BASH_TOOLS:
-            command = tool_input.get("command", "")
-            if command:
-                valid, error = check_bash_directory_boundary(
-                    command, working_directory, approved_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied bash command",
-                        tool_name=tool_name,
-                        command=command,
-                        error=error,
-                    )
-                    return PermissionResultDeny(
-                        message=error or "Bash directory boundary violation"
-                    )
+        try:
+            # File path validation
+            if tool_name in _FILE_TOOLS:
+                file_path = tool_input.get("file_path") or tool_input.get("path")
+                if file_path:
+                    # Allow Claude Code internal paths (~/.claude/plans/, etc.)
+                    if _is_claude_internal_path(file_path):
+                        return PermissionResultAllow()
 
-        return PermissionResultAllow()
+                    valid, _resolved, error = security_validator.validate_path(
+                        file_path, working_directory
+                    )
+                    if not valid:
+                        decision = "deny"
+                        error_msg = error
+                        return PermissionResultDeny(message=error or "Invalid file path")
+
+            # Bash directory boundary validation
+            if tool_name in _BASH_TOOLS:
+                command = tool_input.get("command", "")
+                if command:
+                    valid, error = check_bash_directory_boundary(
+                        command, working_directory, approved_directory
+                    )
+                    if not valid:
+                        decision = "deny"
+                        error_msg = error
+                        return PermissionResultDeny(
+                            message=error or "Bash directory boundary violation"
+                        )
+
+            return PermissionResultAllow()
+
+        except Exception as e:
+            # CRITICAL: Always return a result. An unhandled exception here
+            # means the CLI never gets a permission response and waits forever
+            # — this is a potential stall cause.
+            decision = "error"
+            error_msg = str(e)
+            logger.error(
+                "control.tool_check.error",
+                tool_name=tool_name,
+                error=error_msg,
+                error_type=type(e).__name__,
+            )
+            return PermissionResultDeny(
+                message=f"Internal error checking permission: {e}"
+            )
+
+        finally:
+            elapsed_ms = round((_time.time() - start) * 1000, 1)
+            logger.info(
+                "control.tool_check",
+                tool_name=tool_name,
+                decision=decision,
+                elapsed_ms=elapsed_ms,
+                error=error_msg,
+            )
 
     return can_use_tool
 
@@ -146,6 +174,90 @@ class ClaudeSDKManager:
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
 
+    def build_options(
+        self,
+        working_directory: Path,
+        model: Optional[str] = None,
+        session_id: Optional[str] = None,
+        continue_session: bool = False,
+        include_partial_messages: bool = False,
+        stderr_callback: Optional[Callable[[str], None]] = None,
+    ) -> ClaudeAgentOptions:
+        """Build ClaudeAgentOptions for either fire-and-forget or persistent use.
+
+        Shared options builder used by both execute_command() and
+        PersistentClientManager. Handles system prompt loading, MCP config,
+        tool validation, sandbox settings, and session resumption.
+        """
+        # Build system prompt as a plain string (replaces the default Claude
+        # Code SWE prompt). This is intentional — the SWE prompt's
+        # action-oriented personality conflicts with the bot's use case.
+        # CLAUDE.md in the working directory shapes the bot's behaviour.
+        base_prompt = (
+            f"All file operations must stay within {working_directory}. "
+            "Use relative paths."
+        )
+        claude_md_path = Path(working_directory) / "CLAUDE.md"
+        if claude_md_path.exists():
+            base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+            logger.info(
+                "Loaded CLAUDE.md into system prompt",
+                path=str(claude_md_path),
+            )
+
+        # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
+        # tools so the SDK does not restrict tool usage (e.g. MCP tools).
+        if self.config.disable_tool_validation:
+            sdk_allowed_tools = None
+            sdk_disallowed_tools = None
+        else:
+            sdk_allowed_tools = self.config.claude_allowed_tools
+            sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+        options = ClaudeAgentOptions(
+            max_turns=self.config.claude_max_turns,
+            model=model or self.config.claude_model or None,
+            cwd=str(working_directory),
+            allowed_tools=sdk_allowed_tools,
+            disallowed_tools=sdk_disallowed_tools,
+            cli_path=self.config.claude_cli_path or None,
+            include_partial_messages=include_partial_messages,
+            sandbox={
+                "enabled": self.config.sandbox_enabled,
+                "autoAllowBashIfSandboxed": True,
+                "excludedCommands": self.config.sandbox_excluded_commands or [],
+            },
+            system_prompt=base_prompt,
+            setting_sources=["project", "user"],
+            stderr=stderr_callback,
+        )
+
+        # Pass MCP server configuration if enabled
+        if self.config.enable_mcp and self.config.mcp_config_path:
+            options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
+            logger.info(
+                "MCP servers configured",
+                mcp_config_path=str(self.config.mcp_config_path),
+            )
+
+        # Wire can_use_tool callback for preventive tool validation
+        if self.security_validator:
+            options.can_use_tool = _make_can_use_tool_callback(
+                security_validator=self.security_validator,
+                working_directory=working_directory,
+                approved_directory=self.config.approved_directory,
+            )
+
+        # Resume previous session if we have a session_id
+        if session_id and continue_session:
+            options.resume = session_id
+            logger.info(
+                "Resuming previous session",
+                session_id=session_id,
+            )
+
+        return options
+
     async def execute_command(
         self,
         prompt: str,
@@ -153,6 +265,7 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        model: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -172,76 +285,21 @@ class ClaudeSDKManager:
                 stderr_lines.append(line)
                 logger.debug("Claude CLI stderr", line=line)
 
-            # Build system prompt, loading CLAUDE.md from working directory if present
-            base_prompt = (
-                f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
-            )
-            claude_md_path = Path(working_directory) / "CLAUDE.md"
-            if claude_md_path.exists():
-                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
-                logger.info(
-                    "Loaded CLAUDE.md into system prompt",
-                    path=str(claude_md_path),
-                )
-
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
-            if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
-            else:
-                sdk_allowed_tools = self.config.claude_allowed_tools
-                sdk_disallowed_tools = self.config.claude_disallowed_tools
-
-            # Build Claude Agent options
-            options = ClaudeAgentOptions(
-                max_turns=self.config.claude_max_turns,
-                model=self.config.claude_model or None,
-                max_budget_usd=self.config.claude_max_cost_per_request,
-                cwd=str(working_directory),
-                allowed_tools=sdk_allowed_tools,
-                disallowed_tools=sdk_disallowed_tools,
-                cli_path=self.config.claude_cli_path or None,
+            options = self.build_options(
+                working_directory=working_directory,
+                model=model,
+                session_id=session_id,
+                continue_session=continue_session,
                 include_partial_messages=stream_callback is not None,
-                sandbox={
-                    "enabled": self.config.sandbox_enabled,
-                    "autoAllowBashIfSandboxed": True,
-                    "excludedCommands": self.config.sandbox_excluded_commands or [],
-                },
-                system_prompt=base_prompt,
-                setting_sources=["project"],
-                stderr=_stderr_callback,
+                stderr_callback=_stderr_callback,
             )
-
-            # Pass MCP server configuration if enabled
-            if self.config.enable_mcp and self.config.mcp_config_path:
-                options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
-                logger.info(
-                    "MCP servers configured",
-                    mcp_config_path=str(self.config.mcp_config_path),
-                )
-
-            # Wire can_use_tool callback for preventive tool validation
-            if self.security_validator:
-                options.can_use_tool = _make_can_use_tool_callback(
-                    security_validator=self.security_validator,
-                    working_directory=working_directory,
-                    approved_directory=self.config.approved_directory,
-                )
-
-            # Resume previous session if we have a session_id
-            if session_id and continue_session:
-                options.resume = session_id
-                logger.info(
-                    "Resuming previous session",
-                    session_id=session_id,
-                )
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
+            result_raw_data: Dict[str, Any] = {}
 
             async def _run_client() -> None:
+                nonlocal result_raw_data
                 # Use connect(None) + query(prompt) pattern because
                 # can_use_tool requires the prompt as AsyncIterable, not
                 # a plain string. connect(None) uses an empty async
@@ -271,6 +329,7 @@ class ClaudeSDKManager:
                         messages.append(message)
 
                         if isinstance(message, ResultMessage):
+                            result_raw_data.update(raw_data)
                             break
 
                         # Handle streaming callback
@@ -364,6 +423,38 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts)
 
+            # Extract context window size from modelUsage (static per model)
+            context_window = None
+            model_usage = result_raw_data.get("modelUsage", {})
+            if model_usage:
+                first_model = next(iter(model_usage.values()), {})
+                context_window = first_model.get("contextWindow")
+
+            # Extract actual context usage from the LAST API call's
+            # stream events.  modelUsage token counts are cumulative
+            # across all API calls in the session, so dividing them by
+            # contextWindow grossly overestimates usage — especially in
+            # multi-turn tool-use conversations where the full history
+            # is re-sent every turn.
+            #
+            # The message_start stream event carries per-request usage
+            # with input_tokens, cache_read_input_tokens, and
+            # cache_creation_input_tokens.  The sum of all three is the
+            # actual number of tokens occupying the context window for
+            # that single request.
+            total_input_tokens = None
+            for msg in reversed(messages):
+                if isinstance(msg, StreamEvent):
+                    event = getattr(msg, "event", None) or {}
+                    if event.get("type") == "message_start":
+                        usage = (event.get("message") or {}).get("usage", {})
+                        total_input_tokens = (
+                            usage.get("input_tokens", 0)
+                            + usage.get("cache_read_input_tokens", 0)
+                            + usage.get("cache_creation_input_tokens", 0)
+                        )
+                        break
+
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
@@ -377,6 +468,8 @@ class ClaudeSDKManager:
                     ]
                 ),
                 tools_used=tools_used,
+                context_window=context_window,
+                total_input_tokens=total_input_tokens,
             )
 
         except asyncio.TimeoutError:
@@ -466,6 +559,8 @@ class ClaudeSDKManager:
                 text_parts = []
                 tool_calls = []
 
+                thinking_parts = []
+
                 if content and isinstance(content, list):
                     for block in content:
                         if isinstance(block, ToolUseBlock):
@@ -476,8 +571,20 @@ class ClaudeSDKManager:
                                     "id": getattr(block, "id", None),
                                 }
                             )
+                        elif isinstance(block, ThinkingBlock):
+                            thinking_text = getattr(block, "thinking", "")
+                            if thinking_text and thinking_text.strip():
+                                thinking_parts.append(thinking_text)
                         elif hasattr(block, "text"):
                             text_parts.append(block.text)
+
+                # Emit thinking blocks first (if any)
+                if thinking_parts:
+                    thinking_update = StreamUpdate(
+                        type="thinking",
+                        content="\n".join(thinking_parts),
+                    )
+                    await stream_callback(thinking_update)
 
                 if text_parts or tool_calls:
                     update = StreamUpdate(

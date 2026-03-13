@@ -77,6 +77,7 @@ def test_security_relaxation_settings_defaults_and_overrides():
     """Security relaxation settings should default to False and be configurable."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         defaults = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -85,6 +86,7 @@ def test_security_relaxation_settings_defaults_and_overrides():
         assert defaults.disable_tool_validation is False
 
         overridden = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -285,6 +287,7 @@ def test_project_threads_validation_requires_chat_id_in_group_mode(tmp_path):
 
     with pytest.raises(ValidationError) as exc_info:
         Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=str(project_dir),
@@ -345,6 +348,7 @@ def test_project_threads_validation_private_mode_no_chat_id(tmp_path):
     )
 
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test_token",
         telegram_bot_username="test_bot",
         approved_directory=str(project_dir),

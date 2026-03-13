@@ -60,6 +60,12 @@ class ClaudeCodeBot:
         builder.write_timeout(30)
         builder.pool_timeout(30)
 
+        # Enable concurrent handler processing so different Telegram threads
+        # can run handlers in parallel. PTB's default concurrent_updates=1
+        # looks truthy but means "1 at a time" — the internal check is
+        # max_concurrent_updates > 1. Must be True (bool) not a number.
+        builder.concurrent_updates(True)
+
         self.app = builder.build()
 
         # Initialize feature registry
@@ -257,13 +263,38 @@ class ClaudeCodeBot:
     ) -> None:
         """Handle errors globally."""
         error = context.error
+
+        # Suppress errors from message-reaction updates (e.g. double-tap
+        # heart on iOS).  These don't carry a .message, so middleware that
+        # assumes one will crash.  Log at info with the traceback so we
+        # can identify the actual crash site if it recurs.
+        is_reaction = update and (
+            getattr(update, "message_reaction", None) is not None
+            or getattr(update, "message_reaction_count", None) is not None
+        )
+        if is_reaction:
+            logger.info(
+                "Suppressed error from reaction update",
+                error=str(error),
+                error_type=type(error).__name__,
+                user_id=(
+                    update.effective_user.id
+                    if update.effective_user
+                    else None
+                ),
+                exc_info=error,
+            )
+            return
+
         logger.error(
             "Global error handler triggered",
             error=str(error),
+            error_type=type(error).__name__,
             update_type=type(update).__name__ if update else None,
             user_id=(
                 update.effective_user.id if update and update.effective_user else None
             ),
+            exc_info=error,
         )
 
         # Determine error message for user
@@ -274,12 +305,15 @@ class ClaudeCodeBot:
             SecurityError,
         )
 
+        from telegram.error import NetworkError
+
         error_messages = {
             AuthenticationError: "🔒 Authentication required. Please contact the administrator.",
             SecurityError: "🛡️ Security violation detected. This incident has been logged.",
             RateLimitExceeded: "⏱️ Rate limit exceeded. Please wait before sending more messages.",
             ConfigurationError: "⚙️ Configuration error. Please contact the administrator.",
             asyncio.TimeoutError: "⏰ Operation timed out. Please try again with a simpler request.",
+            NetworkError: "📡 Network error talking to Telegram. Your message may not have been processed — try sending it again.",
         }
 
         error_type = type(error)
