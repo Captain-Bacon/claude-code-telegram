@@ -205,6 +205,46 @@ class ClaudeSDKManager:
                 path=str(claude_md_path),
             )
 
+        # Add scheduler API instructions if both API server and scheduler
+        # are enabled, so Claude can create/list/remove cron jobs.
+        if (
+            self.config.enable_api_server
+            and self.config.enable_scheduler
+            and self.config.webhook_api_secret
+        ):
+            api_port = self.config.api_server_port
+            api_secret = self.config.webhook_api_secret
+            base_prompt += f"""
+
+## Scheduler API
+
+You can create, list, and remove scheduled cron jobs using these HTTP endpoints on the local API server. Use WebFetch to call them.
+
+**Authentication**: Include the header `Authorization: Bearer {api_secret}` with every request.
+
+**Base URL**: `http://localhost:{api_port}`
+
+### Create a job
+POST http://localhost:{api_port}/scheduler/jobs
+Content-Type: application/json
+
+Body: {{"name": "daily-standup", "cron_expression": "0 9 * * 1-5", "prompt": "Give me a morning status update", "description": "Optional description"}}
+
+Response: {{"status": "created", "job_id": "<id>"}}
+
+### List all jobs
+GET http://localhost:{api_port}/scheduler/jobs
+
+Response: [{{"job_id": "<id>", "name": "...", "cron_expression": "...", "prompt": "...", "next_run_time": "..."}}]
+
+### Remove a job
+DELETE http://localhost:{api_port}/scheduler/jobs/<job_id>
+
+Response: {{"status": "deleted", "job_id": "<id>"}}
+
+Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every 30 min), "0 0 * * 0" (weekly Sunday midnight).
+"""
+
         # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
         # tools so the SDK does not restrict tool usage (e.g. MCP tools).
         if self.config.disable_tool_validation:

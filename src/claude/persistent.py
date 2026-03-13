@@ -62,6 +62,8 @@ class TurnContext:
     last_message_at: float = 0.0
     last_message_type: str = ""
     last_stream_event_type: str = ""  # Inner event type from most recent StreamEvent
+    # Context window tracking — overwritten per API call, not accumulated
+    last_input_tokens: int = 0  # input tokens from most recent API call
 
 
 @dataclass
@@ -571,8 +573,9 @@ class PersistentClientManager:
                         turn.total_cache_creation_tokens += cache_create
                         turn.total_output_tokens += output_tok
 
-                        # Cache hit rate for THIS api call
+                        # Last call's context usage (for context window %)
                         total_in = input_tok + cache_read + cache_create
+                        turn.last_input_tokens = total_in
                         cache_pct = (cache_read / total_in * 100) if total_in > 0 else 0
 
                         logger.info(
@@ -876,26 +879,32 @@ class PersistentClientManager:
         # Session ID
         session_id = getattr(result, "session_id", None) or entry.session_id or ""
 
-        # Context window from modelUsage
+        # Context window from modelUsage, with fallback
         context_window = None
         model_usage = raw_data.get("modelUsage", {})
         if model_usage:
             first_model = next(iter(model_usage.values()), {})
             context_window = first_model.get("contextWindow")
+        if context_window is None:
+            context_window = 200_000  # All current Claude models
 
-        # Input tokens from last StreamEvent
-        total_input_tokens = None
-        for msg in reversed(turn.messages):
-            if isinstance(msg, StreamEvent):
-                event = getattr(msg, "event", None) or {}
-                if event.get("type") == "message_start":
-                    usage = (event.get("message") or {}).get("usage", {})
-                    total_input_tokens = (
-                        usage.get("input_tokens", 0)
-                        + usage.get("cache_read_input_tokens", 0)
-                        + usage.get("cache_creation_input_tokens", 0)
-                    )
-                    break
+        # Input tokens: use collector-tracked value (last API call's context)
+        total_input_tokens: Optional[int] = None
+        if turn.last_input_tokens > 0:
+            total_input_tokens = turn.last_input_tokens
+        else:
+            # Fallback: walk messages in reverse for last message_start
+            for msg in reversed(turn.messages):
+                if isinstance(msg, StreamEvent):
+                    event = getattr(msg, "event", None) or {}
+                    if event.get("type") == "message_start":
+                        usage = (event.get("message") or {}).get("usage", {})
+                        total_input_tokens = (
+                            usage.get("input_tokens", 0)
+                            + usage.get("cache_read_input_tokens", 0)
+                            + usage.get("cache_creation_input_tokens", 0)
+                        )
+                        break
 
         # Count turns
         num_turns = len(

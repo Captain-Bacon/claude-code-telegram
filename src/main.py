@@ -309,17 +309,9 @@ async def run_application(app: Dict[str, Any]) -> None:
         bot_task = asyncio.create_task(bot.start())
         tasks.append(bot_task)
 
-        # API server (if enabled)
-        if features.api_server_enabled:
-            from src.api.server import run_api_server
-
-            api_task = asyncio.create_task(
-                run_api_server(event_bus, config, storage.db_manager)
-            )
-            tasks.append(api_task)
-            logger.info("API server enabled", port=config.api_server_port)
-
-        # Scheduler (if enabled)
+        # Scheduler (if enabled) — created before API server so it can
+        # be passed to the scheduler API routes.
+        scheduler: Optional[JobScheduler] = None
         if features.scheduler_enabled:
             scheduler = JobScheduler(
                 event_bus=event_bus,
@@ -328,6 +320,18 @@ async def run_application(app: Dict[str, Any]) -> None:
             )
             await scheduler.start()
             logger.info("Job scheduler enabled")
+
+        # API server (if enabled)
+        if features.api_server_enabled:
+            from src.api.server import run_api_server
+
+            api_task = asyncio.create_task(
+                run_api_server(
+                    event_bus, config, storage.db_manager, scheduler=scheduler
+                )
+            )
+            tasks.append(api_task)
+            logger.info("API server enabled", port=config.api_server_port)
 
         # Shutdown task
         shutdown_task = asyncio.create_task(shutdown_event.wait())
