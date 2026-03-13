@@ -919,3 +919,249 @@ async def test_private_mode_rejects_help_outside_topics(private_thread_settings,
 
     assert called["value"] is False
     update.effective_message.reply_text.assert_called_once()
+
+
+# --- Message queuing (ceq) tests ---
+
+
+class TestEnqueueMessage:
+    """Verify _enqueue_message queues and sends placeholder."""
+
+    async def test_enqueue_sends_placeholder_and_stores(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        placeholder_msg = MagicMock()
+        placeholder_msg.message_id = 999
+
+        update = MagicMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder_msg)
+
+        await orchestrator._enqueue_message("key1", "hello", update)
+
+        # Placeholder sent
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "Queued" in text
+
+        # Stored in queue
+        assert len(orchestrator._message_queues["key1"]) == 1
+        qm = orchestrator._message_queues["key1"][0]
+        assert qm.text == "hello"
+        assert qm.placeholder_message_id == 999
+
+    async def test_enqueue_appends_multiple(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        placeholder = MagicMock()
+        placeholder.message_id = 100
+
+        update = MagicMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder)
+
+        await orchestrator._enqueue_message("key1", "first", update)
+        await orchestrator._enqueue_message("key1", "second", update)
+
+        assert len(orchestrator._message_queues["key1"]) == 2
+        assert orchestrator._message_queues["key1"][0].text == "first"
+        assert orchestrator._message_queues["key1"][1].text == "second"
+
+
+class TestCombineQueuedMessages:
+    """Verify _combine_queued_messages formats correctly."""
+
+    def test_single_message(self):
+        from src.bot.orchestrator import QueuedMessage
+
+        qm = QueuedMessage(text="do the thing", sent_at=1710300000.0)
+        result = MessageOrchestrator._combine_queued_messages([qm])
+
+        assert "queued during your previous turn" in result
+        assert "do the thing" in result
+        assert "UTC" in result
+
+    def test_multiple_messages(self):
+        from src.bot.orchestrator import QueuedMessage
+
+        msgs = [
+            QueuedMessage(text="first thought", sent_at=1710300000.0),
+            QueuedMessage(text="second thought", sent_at=1710300005.0),
+        ]
+        result = MessageOrchestrator._combine_queued_messages(msgs)
+
+        assert "2 messages were queued" in result
+        assert "first thought" in result
+        assert "second thought" in result
+
+
+class TestDrainQueue:
+    """Verify _drain_queue sends combined messages to Claude."""
+
+    async def test_drain_empty_queue_is_noop(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        update = MagicMock()
+        context = MagicMock()
+        context.bot_data = {"persistent_manager": MagicMock()}
+
+        # No queue entries — should return immediately
+        await orchestrator._drain_queue("key1", update, context)
+
+    async def test_drain_sends_combined_to_claude(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        from src.bot.orchestrator import QueuedMessage
+
+        orchestrator._message_queues["key1"] = [
+            QueuedMessage(
+                text="queued msg",
+                sent_at=1710300000.0,
+                placeholder_message_id=50,
+            ),
+        ]
+
+        mock_response = MagicMock()
+        mock_response.session_id = "drain-session"
+        mock_response.content = "Got your queued message"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
+
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.effective_chat.send_action = AsyncMock()
+        update.effective_chat.delete_message = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"persistent_manager": persistent_manager}
+
+        await orchestrator._drain_queue("key1", update, context)
+
+        # Placeholder deleted
+        update.effective_chat.delete_message.assert_awaited_once_with(50)
+
+        # Claude was called with the combined prompt
+        persistent_manager.send_message.assert_awaited_once()
+        prompt = persistent_manager.send_message.call_args.kwargs["prompt"]
+        assert "queued msg" in prompt
+        assert "queued during your previous turn" in prompt
+
+        # Progress message deleted
+        progress_msg.delete.assert_awaited()
+
+        # Queue is now empty
+        assert "key1" not in orchestrator._message_queues
+
+    async def test_drain_requeues_on_race(self, agentic_settings, deps):
+        """If send_message returns None (race), re-queue the combined prompt."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        from src.bot.orchestrator import QueuedMessage
+
+        orchestrator._message_queues["key1"] = [
+            QueuedMessage(text="lost msg", sent_at=1710300000.0),
+        ]
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+
+        update = MagicMock()
+        update.effective_chat.delete_message = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"persistent_manager": persistent_manager}
+
+        await orchestrator._drain_queue("key1", update, context)
+
+        # Message was re-queued
+        assert len(orchestrator._message_queues["key1"]) == 1
+        assert "lost msg" in orchestrator._message_queues["key1"][0].text
+
+
+class TestAgenticTextQueuesWhenBusy:
+    """Verify agentic_text queues instead of injecting when client is busy."""
+
+    async def test_busy_client_queues_message(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="busy")
+
+        placeholder_msg = MagicMock()
+        placeholder_msg.message_id = 42
+
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "follow up thought"
+        update.message.message_id = 2
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        # Should NOT have called send_message (queued instead)
+        persistent_manager.send_message.assert_not_called()
+
+        # Should have queued
+        state_key = orchestrator._state_key(update)
+        assert len(orchestrator._message_queues[state_key]) == 1
+        assert orchestrator._message_queues[state_key][0].text == "follow up thought"
+
+    async def test_draining_client_queues_message(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="draining")
+
+        placeholder_msg = MagicMock()
+        placeholder_msg.message_id = 43
+
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "another thought"
+        update.message.message_id = 3
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        persistent_manager.send_message.assert_not_called()
+        state_key = orchestrator._state_key(update)
+        assert len(orchestrator._message_queues[state_key]) == 1

@@ -8,6 +8,7 @@ import os
 import signal
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -765,6 +766,218 @@ class MessageOrchestrator:
             discarded_queued=len(queued),
         )
 
+    # ------------------------------------------------------------------
+    # Message queuing (ceq) — queue messages while Claude is busy
+    # ------------------------------------------------------------------
+
+    async def _enqueue_message(
+        self,
+        state_key: str,
+        message_text: str,
+        update: Update,
+    ) -> None:
+        """Queue a message for delivery after the current Claude turn finishes."""
+        placeholder = await update.message.reply_text(
+            "\U0001f554 Queued \u2014 Claude will see this when the current task finishes"
+        )
+        qm = QueuedMessage(
+            text=message_text,
+            sent_at=time.time(),
+            placeholder_message_id=placeholder.message_id,
+        )
+        self._message_queues.setdefault(state_key, []).append(qm)
+        logger.info(
+            "message.queued",
+            state_key=state_key,
+            queue_depth=len(self._message_queues[state_key]),
+            preview=message_text[:80],
+        )
+
+    @staticmethod
+    def _combine_queued_messages(queued: List[QueuedMessage]) -> str:
+        """Combine queued messages into a single prompt with temporal context."""
+        if len(queued) == 1:
+            qm = queued[0]
+            ts = datetime.fromtimestamp(qm.sent_at, tz=UTC).strftime("%H:%M:%S UTC")
+            return (
+                f"[This message was queued during your previous turn, "
+                f"originally sent at {ts}]\n\n{qm.text}"
+            )
+        parts = [
+            f"[The following {len(queued)} messages were queued "
+            f"during your previous turn]\n"
+        ]
+        for qm in queued:
+            ts = datetime.fromtimestamp(qm.sent_at, tz=UTC).strftime("%H:%M:%S UTC")
+            parts.append(f"[{ts}] {qm.text}")
+        return "\n\n".join(parts)
+
+    async def _drain_queue(
+        self,
+        state_key: str,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Send any queued messages to Claude as a normal turn.
+
+        Loops until the queue is empty — if the user sends more messages
+        while the drain turn is running, they get queued and drained next
+        iteration.
+        """
+        while True:
+            queued = self._message_queues.pop(state_key, [])
+            if not queued:
+                return
+
+            chat = update.effective_chat
+
+            # Delete placeholder messages
+            for qm in queued:
+                if qm.placeholder_message_id and chat:
+                    try:
+                        await chat.delete_message(qm.placeholder_message_id)
+                    except Exception:
+                        pass
+
+            combined = self._combine_queued_messages(queued)
+            logger.info(
+                "queue.draining",
+                state_key=state_key,
+                message_count=len(queued),
+            )
+
+            persistent_manager: Optional[PersistentClientManager] = (
+                context.bot_data.get("persistent_manager")
+            )
+            if not persistent_manager:
+                return
+
+            progress_msg = await update.message.reply_text("Working (queued)...")
+            verbose_level = self._get_verbose_level(context)
+            tool_log: List[Dict[str, Any]] = []
+            start_time = time.time()
+            mcp_images: List[ImageAttachment] = []
+
+            on_stream = make_stream_callback(
+                self.settings,
+                verbose_level,
+                progress_msg,
+                tool_log,
+                start_time,
+                mcp_images=mcp_images,
+                approved_directory=self.settings.approved_directory,
+                draft_streamer=None,
+                telegram_update=update,
+            )
+
+            heartbeat = self._start_typing_heartbeat(chat)
+            formatted_messages: List["FormattedMessage"] = []
+
+            try:
+                current_dir = context.user_data.get(
+                    "current_directory", self.settings.approved_directory
+                )
+                claude_response = await persistent_manager.send_message(
+                    state_key=state_key,
+                    prompt=combined,
+                    working_directory=current_dir,
+                    stream_callback=on_stream,
+                    model=context.user_data.get("claude_model"),
+                )
+
+                if claude_response is None:
+                    # Race — client went busy. Re-queue for next drain cycle.
+                    re_qm = QueuedMessage(text=combined, sent_at=time.time())
+                    self._message_queues.setdefault(state_key, []).append(re_qm)
+                    logger.warning("queue.drain_raced", state_key=state_key)
+                    return
+
+                await flush_stream_callback(on_stream)
+
+                text_already_sent = (
+                    on_stream
+                    and hasattr(on_stream, "text_was_sent")
+                    and on_stream.text_was_sent[0]
+                )
+
+                from .utils.formatting import FormattedMessage, ResponseFormatter
+
+                if text_already_sent:
+                    formatted_messages = []
+                else:
+                    formatter = ResponseFormatter(self.settings)
+                    formatted_messages = formatter.format_claude_response(
+                        claude_response.content
+                    )
+
+                if claude_response.is_interrupted:
+                    formatted_messages.append(
+                        FormattedMessage("[Interrupted]", parse_mode=None)
+                    )
+
+                stop_notice = self._abnormal_stop_notice(claude_response)
+                if stop_notice:
+                    formatted_messages.append(stop_notice)
+
+                ctx_warn = self._context_warning(
+                    claude_response, context.user_data
+                )
+                if ctx_warn:
+                    if formatted_messages:
+                        formatted_messages[-1].text += ctx_warn
+                    else:
+                        formatted_messages.append(
+                            FormattedMessage(ctx_warn, parse_mode="HTML")
+                        )
+
+            except asyncio.CancelledError:
+                from .utils.formatting import FormattedMessage
+
+                formatted_messages = [
+                    FormattedMessage("Stopped.", parse_mode=None)
+                ]
+            except Exception as e:
+                logger.error(
+                    "Queue drain failed", error=str(e), state_key=state_key
+                )
+                from .utils.formatting import FormattedMessage
+
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(e), parse_mode="HTML"
+                    )
+                ]
+            finally:
+                heartbeat.cancel()
+                try:
+                    await flush_stream_callback(on_stream)
+                except Exception:
+                    pass
+
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+
+            for message in formatted_messages:
+                if not message.text or not message.text.strip():
+                    continue
+                try:
+                    await update.message.reply_text(
+                        message.text, parse_mode=message.parse_mode
+                    )
+                except Exception:
+                    try:
+                        await update.message.reply_text(message.text)
+                    except Exception as plain_err:
+                        await update.message.reply_text(
+                            f"Failed to deliver queued response "
+                            f"(Telegram error: {str(plain_err)[:150]})."
+                        )
+
+            await cleanup_thinking_messages(on_stream)
+            # Loop back to check if more messages were queued during this turn
+
     @staticmethod
     def _start_typing_heartbeat(
         chat: Any,
@@ -1178,6 +1391,9 @@ class MessageOrchestrator:
                 args=[message_text[:100]],
                 success=success,
             )
+
+        # Drain any messages that were queued while this turn was running.
+        await self._drain_queue(state_key, update, context)
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
