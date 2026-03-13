@@ -34,6 +34,8 @@ poetry run mypy src
 
 **SDK injection is undocumented behaviour.** Calling `query()` on a busy client works because the CLI reads stdin continuously — not by design. The draining state handles the ambiguity of whether the CLI produces a continuation ResultMessage. The 120s drain timeout is a guess. See bead 9mb notes for full research.
 
+**No hard timeout on send_message.** Turns can run 25+ minutes when subagents are involved. Stall detection is via the watchdog callback (30s/60s silence thresholds), not a timeout. Do NOT wrap send_message in asyncio.wait_for.
+
 ### Request Flow
 
 **User messages:**
@@ -127,4 +129,4 @@ Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`
 
 ## Git Workflow
 
-Working on branch `cleanup/phase1-strip` (off `feature/persistent-client-v2`). Pre-commit hook: beads chains a pre-commit hook but no `.pre-commit-config.yaml` exists. Use `PRE_COMMIT_ALLOW_NO_CONFIG=1` before git commands, or see bead claude-code-telegram-005.
+Working on branch `cleanup/phase1-strip` (off `feature/persistent-client-v2`). Pre-commit hook: beads auto-flushes issues.jsonl on commit. No other pre-commit framework in use.
