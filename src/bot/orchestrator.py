@@ -901,26 +901,58 @@ class MessageOrchestrator:
         # and the cancel-and-recreate pattern for _text_batch_task.
         _stream_lock = asyncio.Lock()
 
+        # Serialises Telegram sends so two concurrent flushes don't
+        # interleave messages.  Separate from _stream_lock so that
+        # network I/O never blocks _enqueue_text / _on_stream.
+        _send_lock = asyncio.Lock()
+
         async def _flush_pending_text() -> None:
-            """Send accumulated text/thinking as persistent messages."""
+            """Send accumulated text/thinking as persistent messages.
+
+            Collects pending data under _stream_lock (microseconds),
+            then sends to Telegram under _send_lock (network I/O).
+            This prevents slow/failing Telegram sends from blocking
+            the SDK message pipeline.
+            """
+            # --- Phase 1: collect under _stream_lock ---
+            t0 = time.time()
             async with _stream_lock:
+                lock_wait_ms = (time.time() - t0) * 1000
+                if lock_wait_ms > 100:
+                    logger.warning(
+                        "stream_lock.slow_acquire",
+                        wait_ms=round(lock_wait_ms, 1),
+                        phase="flush_collect",
+                    )
+
                 if not telegram_update:
                     return
 
-                # Flush thinking as ephemeral messages (deleted after final response)
-                if _pending_thinking:
+                # Snapshot and clear — releases lock quickly
+                thinking_snapshot = list(_pending_thinking)
+                _pending_thinking.clear()
+                text_snapshot = list(_pending_text)
+                _pending_text.clear()
+
+            # Nothing to send
+            if not thinking_snapshot and not text_snapshot:
+                return
+
+            # --- Phase 2: send under _send_lock (network I/O) ---
+            async with _send_lock:
+                # Send thinking as ephemeral messages
+                if thinking_snapshot:
                     from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
 
-                    thinking_text = "\n\n".join(_pending_thinking)
-                    _pending_thinking.clear()
+                    thinking_text = "\n\n".join(thinking_snapshot)
                     escaped = html_mod.escape(thinking_text)
-                    # Reserve space for prefix "🧠 " (6 bytes encoded)
                     prefix = "\U0001f9e0 "
                     max_content = TELEGRAM_MAX_MESSAGE_LENGTH - len(prefix)
                     if len(escaped) > max_content:
                         escaped = escaped[: max_content - 1] + "\u2026"
                     thinking_msg = f"{prefix}{escaped}"
                     try:
+                        send_t0 = time.time()
                         sent = await telegram_update.effective_message.reply_text(
                             thinking_msg,
                             parse_mode="HTML",
@@ -929,12 +961,17 @@ class MessageOrchestrator:
                         _thinking_message_ids.append(sent.message_id)
                         await asyncio.sleep(0.3)
                     except Exception as e:
-                        logger.debug("Failed to send thinking message", error=str(e))
+                        send_duration_ms = (time.time() - send_t0) * 1000
+                        logger.warning(
+                            "Failed to send thinking message",
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            send_duration_ms=round(send_duration_ms, 1),
+                        )
 
-                # Flush commentary text
-                if _pending_text:
-                    combined = "\n\n".join(_pending_text)
-                    _pending_text.clear()
+                # Send commentary text
+                if text_snapshot:
+                    combined = "\n\n".join(text_snapshot)
                     if not combined.strip():
                         return
 
@@ -946,6 +983,7 @@ class MessageOrchestrator:
                         if not msg.text or not msg.text.strip():
                             continue
                         try:
+                            send_t0 = time.time()
                             await telegram_update.effective_message.reply_text(
                                 msg.text,
                                 parse_mode=msg.parse_mode,
@@ -956,9 +994,13 @@ class MessageOrchestrator:
                             _text_was_sent[0] = True
                             await asyncio.sleep(0.3)
                         except Exception as send_err:
+                            send_duration_ms = (time.time() - send_t0) * 1000
                             logger.warning(
                                 "Failed to send intermediate text",
                                 error=str(send_err),
+                                error_type=type(send_err).__name__,
+                                send_duration_ms=round(send_duration_ms, 1),
+                                text_length=len(msg.text),
                             )
                             # Fallback: send as plain text
                             try:
@@ -979,7 +1021,16 @@ class MessageOrchestrator:
 
         async def _enqueue_text(text: str, is_thinking: bool = False) -> None:
             """Add text to the pending batch and schedule a flush."""
+            t0 = time.time()
             async with _stream_lock:
+                lock_wait_ms = (time.time() - t0) * 1000
+                if lock_wait_ms > 100:
+                    logger.warning(
+                        "stream_lock.slow_acquire",
+                        wait_ms=round(lock_wait_ms, 1),
+                        phase="enqueue",
+                    )
+
                 if is_thinking:
                     _pending_thinking.append(text)
                 else:
@@ -1257,7 +1308,7 @@ class MessageOrchestrator:
         # If client is busy, inject the message into the current turn
         # and return immediately.  The CLI absorbs it as a system reminder
         # between tool calls — no separate response is produced.
-        if client_state == "busy":
+        if client_state in ("busy", "draining"):
             try:
                 await update.message.set_reaction("\U0001f440")  # 👀
             except Exception:
@@ -1273,6 +1324,7 @@ class MessageOrchestrator:
                 "Follow-up injected (client busy)",
                 user_id=user_id,
                 state_key=state_key,
+                client_state=client_state,
             )
             return
 

@@ -38,6 +38,10 @@ _INTERRUPT_TIMEOUT_S = 10.0
 # Default idle timeout for cleanup (30 minutes)
 _DEFAULT_IDLE_TIMEOUT_S = 1800
 
+# How long to wait for the continuation ResultMessage after injection
+# If the second turn doesn't complete within this window, fall back to idle
+_INJECTION_DRAIN_TIMEOUT_S = 120.0
+
 
 @dataclass
 class TurnContext:
@@ -89,7 +93,7 @@ class PersistentClientEntry:
     """A persistent Claude client for a single Telegram thread."""
 
     client: ClaudeSDKClient
-    state: str  # "idle" or "busy"
+    state: str  # "idle", "busy", or "draining"
     state_key: str
     working_directory: Path
     session_id: Optional[str] = None
@@ -101,6 +105,8 @@ class PersistentClientEntry:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _interrupted: bool = False
     _watchdog_task: Optional[asyncio.Task] = None
+    _injection_count: int = 0  # injections during current turn
+    _drain_timeout_task: Optional[asyncio.Task] = None
 
 
 def derive_state_key(chat_id: int, thread_id: Optional[int], user_id: int) -> str:
@@ -167,19 +173,20 @@ class PersistentClientManager:
             entry.last_activity = time.time()
             previous_state = entry.state
 
-            if entry.state == "busy":
-                # Client is mid-turn.  query() injects this message into
-                # the current turn (appears as a system reminder between
-                # tool calls).  The CLI does NOT produce a separate
-                # ResultMessage for injected queries, so we must NOT
-                # create a TurnContext or increment pending_turns —
-                # doing so would leave the state permanently stuck on
-                # "busy" waiting for a ResultMessage that never comes.
+            if entry.state in ("busy", "draining"):
+                # Client is mid-turn (or draining after injection).
+                # query() injects this message.  The CLI processes
+                # injected messages as a second internal turn with its
+                # own ResultMessage.  We track injections so
+                # _handle_result_message enters/stays in "draining".
                 await entry.client.query(prompt)
+                entry._injection_count += 1
                 logger.info(
                     "turn.injected",
                     state_key=state_key,
                     prompt_len=len(prompt),
+                    injection_count=entry._injection_count,
+                    state=entry.state,
                 )
                 return None
 
@@ -195,6 +202,7 @@ class PersistentClientManager:
 
             entry.state = "busy"
             entry.current_turn = turn
+            entry._injection_count = 0  # reset for new turn
             # Start stall watchdog for this turn
             if entry._watchdog_task and not entry._watchdog_task.done():
                 entry._watchdog_task.cancel()
@@ -223,12 +231,18 @@ class PersistentClientManager:
         so there is nothing to discard.
         """
         entry = self._clients.get(state_key)
-        if entry is None or entry.state != "busy":
+        if entry is None or entry.state not in ("busy", "draining"):
             return StopResult(was_busy=False, discarded_messages=[])
 
         # Signal interrupt
         entry._interrupted = True
         entry.pending_turns = 1  # Only current turn remains
+        entry._injection_count = 0  # Cancel any pending drain
+
+        # Cancel drain timeout if active
+        if entry._drain_timeout_task and not entry._drain_timeout_task.done():
+            entry._drain_timeout_task.cancel()
+            entry._drain_timeout_task = None
 
         try:
             await entry.client.interrupt()
@@ -260,6 +274,8 @@ class PersistentClientManager:
         interrupt() does NOT produce a ResultMessage, so the response collector
         would wait forever. This fires after _INTERRUPT_TIMEOUT_S and resolves
         the turn as interrupted if it's still pending.
+
+        Also handles the case where interrupt is called during draining state.
         """
         await asyncio.sleep(_INTERRUPT_TIMEOUT_S)
         turn = entry.current_turn
@@ -282,6 +298,19 @@ class PersistentClientManager:
             entry.current_turn = None
             entry.pending_turns = 0
             entry._interrupted = False
+            entry._injection_count = 0
+        elif entry.state == "draining" and entry._interrupted:
+            # Interrupted during drain — just go idle
+            logger.warning(
+                "Interrupt timeout during drain — going idle",
+                state_key=entry.state_key,
+                timeout_s=_INTERRUPT_TIMEOUT_S,
+            )
+            entry.state = "idle"
+            entry.current_turn = None
+            entry.pending_turns = 0
+            entry._interrupted = False
+            entry._injection_count = 0
 
     async def _turn_watchdog(self, entry: PersistentClientEntry) -> None:
         """Monitor active turns for silence — logs when the CLI goes quiet.
@@ -466,6 +495,10 @@ class PersistentClientManager:
         if entry.current_turn and not entry.current_turn.response_future.done():
             entry.current_turn.response_future.cancel()
 
+        # Cancel drain timeout if active
+        if entry._drain_timeout_task and not entry._drain_timeout_task.done():
+            entry._drain_timeout_task.cancel()
+
         # Disconnect the SDK client
         try:
             await entry.client.disconnect()
@@ -580,9 +613,22 @@ class PersistentClientManager:
                             error=str(e),
                             state_key=entry.state_key,
                         )
+                elif not turn and entry.state == "draining":
+                    # We're in draining state — these are the second
+                    # turn's messages after injection.  Log them as
+                    # expected continuation, not orphans.
+                    logger.debug(
+                        "sdk.drain_message",
+                        state_key=entry.state_key,
+                        msg_type=msg_type,
+                        msg_num=msg_count,
+                        state=entry.state,
+                    )
                 elif not turn:
-                    # SDK sent us something but we have no active turn —
-                    # this is exactly the "no response requested" scenario
+                    # SDK sent us something but we have no active turn
+                    # and we're not draining — genuine orphan.
+                    # Log content summary to help diagnose what was lost.
+                    content_summary = self._summarize_message_content(message)
                     logger.warning(
                         "sdk.orphan_message",
                         state_key=entry.state_key,
@@ -590,6 +636,7 @@ class PersistentClientManager:
                         msg_num=msg_count,
                         state=entry.state,
                         pending_turns=entry.pending_turns,
+                        content_summary=content_summary,
                         raw_keys=list(raw_data.keys()) if isinstance(raw_data, dict) else None,
                     )
 
@@ -625,12 +672,44 @@ class PersistentClientManager:
         result: ResultMessage,
         raw_data: Dict[str, Any],
     ) -> None:
-        """Process a ResultMessage — marks the end of a turn."""
+        """Process a ResultMessage — marks the end of a turn.
+
+        If injections occurred during this turn, the CLI processes the
+        injected message as a second internal turn with its own
+        ResultMessage.  Instead of going idle immediately, we enter
+        "draining" state to collect that second turn's messages.
+        """
         turn = entry.current_turn
+
+        # --- Draining state: this is the SECOND ResultMessage ---
+        if entry.state == "draining" and turn is None:
+            # We were waiting for exactly this.  Cancel drain timeout.
+            if entry._drain_timeout_task and not entry._drain_timeout_task.done():
+                entry._drain_timeout_task.cancel()
+                entry._drain_timeout_task = None
+
+            entry.state = "idle"
+            entry.pending_turns = 0
+            entry._injection_count = 0
+
+            # Extract session_id if present
+            result_session_id = getattr(result, "session_id", None)
+            if result_session_id:
+                entry.session_id = result_session_id
+
+            logger.info(
+                "turn.drain_completed",
+                state_key=entry.state_key,
+                transition="draining->idle",
+                session_id=entry.session_id,
+            )
+            return
+
         if turn is None:
             logger.warning(
                 "ResultMessage with no active turn",
                 state_key=entry.state_key,
+                state=entry.state,
             )
             return
 
@@ -657,37 +736,87 @@ class PersistentClientManager:
         if entry._watchdog_task and not entry._watchdog_task.done():
             entry._watchdog_task.cancel()
 
-        # Go idle.  Injected messages (sent while busy) are absorbed
-        # into the current turn by the CLI — they don't produce their
-        # own ResultMessage, so there is never a queued turn to dequeue.
-        entry.state = "idle"
-        entry.current_turn = None
-        entry.pending_turns = 0  # defensive reset
-
         # Per-turn token summary — the key diagnostic for cost analysis
         total_in = turn.total_input_tokens + turn.total_cache_read_tokens + turn.total_cache_creation_tokens
         cache_pct = (turn.total_cache_read_tokens / total_in * 100) if total_in > 0 else 0
 
-        logger.info(
-            "turn.completed",
-            state_key=entry.state_key,
-            cost=response.cost,
-            duration_ms=response.duration_ms,
-            is_interrupted=response.is_interrupted,
-            stop_reason=response.stop_reason,
-            num_turns=response.num_turns,
-            pending_turns=entry.pending_turns,
-            transition=f"busy→{entry.state}",
-            session_id=entry.session_id,
-            # Token accounting for this turn
-            api_calls=turn.api_call_count,
-            input_tokens=turn.total_input_tokens,
-            cache_read_tokens=turn.total_cache_read_tokens,
-            cache_creation_tokens=turn.total_cache_creation_tokens,
-            output_tokens=turn.total_output_tokens,
-            total_context_tokens=total_in,
-            cache_hit_pct=round(cache_pct, 1),
-        )
+        # Decide next state: if injections occurred, expect continuation
+        if entry._injection_count > 0:
+            # The CLI will process the injected message(s) as a second
+            # internal turn.  Stay in "draining" to collect those messages
+            # instead of discarding them as orphans.
+            entry.state = "draining"
+            entry.current_turn = None  # first turn done, clear it
+
+            # Safety timeout: if the continuation never produces a
+            # ResultMessage, fall back to idle
+            entry._drain_timeout_task = asyncio.create_task(
+                self._drain_timeout(entry),
+                name=f"drain-timeout:{entry.state_key}",
+            )
+
+            logger.info(
+                "turn.completed",
+                state_key=entry.state_key,
+                cost=response.cost,
+                duration_ms=response.duration_ms,
+                is_interrupted=response.is_interrupted,
+                stop_reason=response.stop_reason,
+                num_turns=response.num_turns,
+                pending_turns=entry.pending_turns,
+                transition="busy->draining",
+                injection_count=entry._injection_count,
+                session_id=entry.session_id,
+                api_calls=turn.api_call_count,
+                input_tokens=turn.total_input_tokens,
+                cache_read_tokens=turn.total_cache_read_tokens,
+                cache_creation_tokens=turn.total_cache_creation_tokens,
+                output_tokens=turn.total_output_tokens,
+                total_context_tokens=total_in,
+                cache_hit_pct=round(cache_pct, 1),
+            )
+        else:
+            # No injections — normal idle transition
+            entry.state = "idle"
+            entry.current_turn = None
+            entry.pending_turns = 0  # defensive reset
+
+            logger.info(
+                "turn.completed",
+                state_key=entry.state_key,
+                cost=response.cost,
+                duration_ms=response.duration_ms,
+                is_interrupted=response.is_interrupted,
+                stop_reason=response.stop_reason,
+                num_turns=response.num_turns,
+                pending_turns=entry.pending_turns,
+                transition=f"busy->idle",
+                session_id=entry.session_id,
+                api_calls=turn.api_call_count,
+                input_tokens=turn.total_input_tokens,
+                cache_read_tokens=turn.total_cache_read_tokens,
+                cache_creation_tokens=turn.total_cache_creation_tokens,
+                output_tokens=turn.total_output_tokens,
+                total_context_tokens=total_in,
+                cache_hit_pct=round(cache_pct, 1),
+            )
+
+    async def _drain_timeout(self, entry: PersistentClientEntry) -> None:
+        """Safety net: if draining state doesn't receive a ResultMessage
+        within _INJECTION_DRAIN_TIMEOUT_S, fall back to idle.
+        """
+        await asyncio.sleep(_INJECTION_DRAIN_TIMEOUT_S)
+        if entry.state == "draining":
+            logger.warning(
+                "turn.drain_timeout",
+                state_key=entry.state_key,
+                timeout_s=_INJECTION_DRAIN_TIMEOUT_S,
+                injection_count=entry._injection_count,
+            )
+            entry.state = "idle"
+            entry.current_turn = None
+            entry.pending_turns = 0
+            entry._injection_count = 0
 
     def _build_persistent_response(
         self,
@@ -801,6 +930,10 @@ class PersistentClientManager:
         if entry._watchdog_task and not entry._watchdog_task.done():
             entry._watchdog_task.cancel()
 
+        # Cancel drain timeout on death
+        if entry._drain_timeout_task and not entry._drain_timeout_task.done():
+            entry._drain_timeout_task.cancel()
+
         turn = entry.current_turn
         logger.error(
             "client.death",
@@ -828,6 +961,37 @@ class PersistentClientManager:
 
         # Remove from registry
         self._clients.pop(entry.state_key, None)
+
+    @staticmethod
+    def _summarize_message_content(message: Message) -> str:
+        """Produce a short summary of message content for diagnostic logging.
+
+        Returns a string like "AssistantMessage: 3 blocks (text, tool_use, text)"
+        or "UserMessage: 42 chars" — enough to understand what was lost without
+        logging the full content.
+        """
+        msg_type = type(message).__name__
+        try:
+            if isinstance(message, AssistantMessage):
+                content = getattr(message, "content", [])
+                if content and isinstance(content, list):
+                    block_types = [type(b).__name__ for b in content]
+                    return f"{msg_type}: {len(content)} blocks ({', '.join(block_types)})"
+                return f"{msg_type}: empty"
+            elif isinstance(message, UserMessage):
+                content = getattr(message, "content", "")
+                length = len(content) if isinstance(content, str) else len(str(content))
+                return f"{msg_type}: {length} chars"
+            elif isinstance(message, ResultMessage):
+                result_text = getattr(message, "result", "")
+                return f"{msg_type}: result={len(result_text) if result_text else 0} chars"
+            elif isinstance(message, StreamEvent):
+                event = getattr(message, "event", None) or {}
+                return f"{msg_type}: {event.get('type', 'unknown')}"
+            else:
+                return msg_type
+        except Exception:
+            return msg_type
 
     @staticmethod
     def _message_to_stream_update(

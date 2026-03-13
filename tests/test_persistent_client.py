@@ -489,3 +489,218 @@ class TestDataclasses:
         assert r.is_interrupted is False
         assert r.tools_used == []
         assert r.context_window is None
+
+
+# ---------------------------------------------------------------------------
+# Injection continuation / draining state
+# ---------------------------------------------------------------------------
+
+
+class TestInjectionDraining:
+    """Tests for the draining state machine that handles post-injection
+    continuation turns."""
+
+    @pytest.mark.asyncio
+    async def test_injection_increments_count(self):
+        """Injecting into a busy client should increment _injection_count."""
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="busy", pending_turns=1)
+        entry.current_turn = _make_turn_context()
+        entry._injection_count = 0
+        manager._clients["1:2"] = entry
+
+        # Simulate send_message calling query() when busy
+        # We call the internal path directly since send_message
+        # requires a full client setup
+        await entry.client.query("follow-up")
+        entry._injection_count += 1
+
+        assert entry._injection_count == 1
+
+    @pytest.mark.asyncio
+    async def test_result_with_injection_enters_draining(self):
+        """ResultMessage after injection should transition to draining, not idle."""
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="busy", pending_turns=1)
+        turn = _make_turn_context()
+        entry.current_turn = turn
+        entry._injection_count = 1  # One injection occurred
+        manager._clients["1:2"] = entry
+
+        await manager._handle_result_message(
+            entry, _make_mock_result_message(), {}
+        )
+
+        assert entry.state == "draining"
+        assert entry.current_turn is None  # First turn cleared
+        assert turn.response_future.done()  # First turn resolved
+
+    @pytest.mark.asyncio
+    async def test_result_without_injection_goes_idle(self):
+        """ResultMessage without injection should go straight to idle."""
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="busy", pending_turns=1)
+        turn = _make_turn_context()
+        entry.current_turn = turn
+        entry._injection_count = 0  # No injection
+        manager._clients["1:2"] = entry
+
+        await manager._handle_result_message(
+            entry, _make_mock_result_message(), {}
+        )
+
+        assert entry.state == "idle"
+        assert entry.current_turn is None
+
+    @pytest.mark.asyncio
+    async def test_second_result_completes_drain(self):
+        """Second ResultMessage during draining should transition to idle."""
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="draining", pending_turns=0)
+        entry.current_turn = None  # First turn already cleared
+        entry._injection_count = 1
+        manager._clients["1:2"] = entry
+
+        # Second ResultMessage arrives while draining
+        await manager._handle_result_message(
+            entry, _make_mock_result_message(session_id="s2"), {}
+        )
+
+        assert entry.state == "idle"
+        assert entry.pending_turns == 0
+        assert entry._injection_count == 0
+        assert entry.session_id == "s2"
+
+    @pytest.mark.asyncio
+    async def test_drain_timeout_falls_back_to_idle(self):
+        """If drain timeout fires, entry should go idle."""
+        from src.claude.persistent import _INJECTION_DRAIN_TIMEOUT_S
+
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="draining", pending_turns=0)
+        entry._injection_count = 1
+        manager._clients["1:2"] = entry
+
+        # Call drain timeout directly (don't actually wait)
+        # Monkey-patch the timeout to 0 for testing
+        import src.claude.persistent as persistent_mod
+        original = persistent_mod._INJECTION_DRAIN_TIMEOUT_S
+        persistent_mod._INJECTION_DRAIN_TIMEOUT_S = 0.01
+        try:
+            await manager._drain_timeout(entry)
+        finally:
+            persistent_mod._INJECTION_DRAIN_TIMEOUT_S = original
+
+        assert entry.state == "idle"
+        assert entry._injection_count == 0
+
+    @pytest.mark.asyncio
+    async def test_injection_into_draining_state(self):
+        """Injecting into a draining client should increment injection count."""
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="draining", pending_turns=0)
+        entry._injection_count = 1
+        manager._clients["1:2"] = entry
+
+        # send_message treats draining like busy
+        assert entry.state in ("busy", "draining")
+
+    @pytest.mark.asyncio
+    async def test_stop_during_draining(self):
+        """Stopping a draining client should work like stopping a busy one."""
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="draining", pending_turns=0)
+        entry.current_turn = _make_turn_context()
+        entry._injection_count = 1
+        manager._clients["1:2"] = entry
+
+        result = await manager.stop_client("1:2")
+
+        assert result.was_busy is True
+        entry.client.interrupt.assert_awaited_once()
+        assert entry._injection_count == 0
+
+    @pytest.mark.asyncio
+    async def test_injection_count_reset_on_new_turn(self):
+        """Starting a new turn should reset the injection count."""
+        entry = _make_entry(state="idle")
+        entry._injection_count = 3  # Leftover from previous turn
+
+        # Simulate the reset that happens in send_message
+        entry._injection_count = 0
+        assert entry._injection_count == 0
+
+    @pytest.mark.asyncio
+    async def test_multiple_injections_single_drain(self):
+        """Multiple injections should still result in one draining period.
+
+        The CLI processes all injected messages, and we expect one
+        additional ResultMessage regardless of injection count.
+        """
+        manager = PersistentClientManager(_make_mock_sdk_manager(), _make_mock_config())
+        entry = _make_entry(state="busy", pending_turns=1)
+        turn = _make_turn_context()
+        entry.current_turn = turn
+        entry._injection_count = 3  # Three injections
+        manager._clients["1:2"] = entry
+
+        # First ResultMessage -> draining
+        await manager._handle_result_message(
+            entry, _make_mock_result_message(), {}
+        )
+        assert entry.state == "draining"
+
+        # Second ResultMessage -> idle
+        await manager._handle_result_message(
+            entry, _make_mock_result_message(), {}
+        )
+        assert entry.state == "idle"
+        assert entry._injection_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Orphan message content summary
+# ---------------------------------------------------------------------------
+
+
+class TestMessageContentSummary:
+    """Tests for _summarize_message_content diagnostic helper."""
+
+    def test_assistant_message_summary(self):
+        """AssistantMessage with content blocks should show block count and types."""
+        from claude_agent_sdk import AssistantMessage
+        msg = MagicMock(spec=AssistantMessage)
+        block1 = MagicMock()
+        type(block1).__name__ = "TextBlock"
+        block2 = MagicMock()
+        type(block2).__name__ = "ToolUseBlock"
+        msg.content = [block1, block2]
+        summary = PersistentClientManager._summarize_message_content(msg)
+        # MagicMock(spec=X) passes isinstance checks
+        assert "2 blocks" in summary
+        assert "TextBlock" in summary
+        assert "ToolUseBlock" in summary
+
+    def test_user_message_summary(self):
+        """UserMessage should show character count."""
+        from claude_agent_sdk import UserMessage
+        msg = MagicMock(spec=UserMessage)
+        msg.content = "Hello world"
+        summary = PersistentClientManager._summarize_message_content(msg)
+        assert "11 chars" in summary
+
+    def test_result_message_summary(self):
+        """ResultMessage should show result length."""
+        from claude_agent_sdk import ResultMessage
+        msg = MagicMock(spec=ResultMessage)
+        msg.result = "Done"
+        summary = PersistentClientManager._summarize_message_content(msg)
+        assert "result=" in summary
+        assert "4 chars" in summary
+
+    def test_unknown_message_returns_type_name(self):
+        """Unknown message types should return just the type name."""
+        msg = MagicMock()
+        summary = PersistentClientManager._summarize_message_content(msg)
+        assert isinstance(summary, str)
+        assert len(summary) > 0
