@@ -954,10 +954,16 @@ class MessageOrchestrator:
                 except Exception:
                     pass
 
+            drain_elapsed = int(time.time() - start_time)
             try:
-                await progress_msg.delete()
+                await progress_msg.edit_text(
+                    f"\u2705 Done ({drain_elapsed}s)"
+                )
             except Exception:
-                pass
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
 
             for message in formatted_messages:
                 if not message.text or not message.text.strip():
@@ -1179,15 +1185,38 @@ class MessageOrchestrator:
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
 
+        # Stall callback — edits progress message when watchdog detects silence
+        async def on_stall(
+            silence_seconds: float,
+            total_elapsed_seconds: float,
+            cli_alive: bool,
+            is_dead: bool,
+        ) -> None:
+            if is_dead:
+                text = "\u26a0 Claude process died \u2014 try sending your message again"
+            else:
+                text = (
+                    f"\u26a0 No activity for {int(silence_seconds)}s "
+                    f"(elapsed {int(total_elapsed_seconds)}s) \u2014 still checking\u2026"
+                )
+            try:
+                await progress_msg.edit_text(text)
+            except Exception:
+                pass
+
         success = True
         try:
-            claude_response = await persistent_manager.send_message(
-                state_key=state_key,
-                prompt=message_text,
-                working_directory=current_dir,
-                stream_callback=on_stream,
-                model=context.user_data.get("claude_model"),
-                force_new=force_new,
+            claude_response = await asyncio.wait_for(
+                persistent_manager.send_message(
+                    state_key=state_key,
+                    prompt=message_text,
+                    working_directory=current_dir,
+                    stream_callback=on_stream,
+                    stall_callback=on_stall,
+                    model=context.user_data.get("claude_model"),
+                    force_new=force_new,
+                ),
+                timeout=600,  # 10 min hard ceiling
             )
 
             # None means the message was injected into a busy turn
@@ -1283,6 +1312,20 @@ class MessageOrchestrator:
                         FormattedMessage(ctx_warn, parse_mode="HTML")
                     )
 
+        except asyncio.TimeoutError:
+            success = False
+            logger.error(
+                "Claude request timed out", user_id=user_id, timeout_s=600
+            )
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [
+                FormattedMessage(
+                    "\u26a0 Request timed out after 10 minutes. "
+                    "Try sending your message again.",
+                    parse_mode=None,
+                )
+            ]
         except asyncio.CancelledError:
             success = False
             logger.info("Claude request cancelled", user_id=user_id)
@@ -1313,10 +1356,19 @@ class MessageOrchestrator:
             except Exception:
                 logger.debug("Stream callback flush failed in finally block", user_id=user_id)
 
+        # Edit progress message to final state instead of deleting.
+        # The user always sees a definitive outcome.
+        elapsed = int(time.time() - start_time)
         try:
-            await progress_msg.delete()
+            if success:
+                await progress_msg.edit_text(f"\u2705 Done ({elapsed}s)")
+            else:
+                await progress_msg.edit_text(f"\u274c Failed ({elapsed}s)")
         except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         images: List[ImageAttachment] = mcp_images

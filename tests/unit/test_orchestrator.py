@@ -293,8 +293,10 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
     # Session ID updated
     assert context.user_data["claude_session_id"] == "session-abc"
 
-    # Progress message deleted
-    progress_msg.delete.assert_called_once()
+    # Progress message edited to final state (not deleted)
+    progress_msg.edit_text.assert_called()
+    final_text = progress_msg.edit_text.call_args[0][0]
+    assert "\u2705" in final_text  # ✅ Done
 
     # Response sent without keyboard (reply_markup=None)
     response_calls = [
@@ -1054,8 +1056,10 @@ class TestDrainQueue:
         assert "queued msg" in prompt
         assert "queued during your previous turn" in prompt
 
-        # Progress message deleted
-        progress_msg.delete.assert_awaited()
+        # Progress message edited to final state
+        progress_msg.edit_text.assert_called()
+        final_text = progress_msg.edit_text.call_args[0][0]
+        assert "\u2705" in final_text
 
         # Queue is now empty
         assert "key1" not in orchestrator._message_queues
@@ -1165,3 +1169,139 @@ class TestAgenticTextQueuesWhenBusy:
         persistent_manager.send_message.assert_not_called()
         state_key = orchestrator._state_key(update)
         assert len(orchestrator._message_queues[state_key]) == 1
+
+
+class TestActivityLifecycle:
+    """Verify status message lifecycle: Working -> Done/Failed/Stalled."""
+
+    async def test_error_shows_failed_status(self, agentic_settings, deps):
+        """When Claude errors, progress message shows Failed."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(
+            side_effect=Exception("Claude broke")
+        )
+        persistent_manager.get_client_state = MagicMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        progress_msg.edit_text = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "do something"
+        update.message.message_id = 1
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        # Progress message should show failed, not be deleted
+        progress_msg.edit_text.assert_called()
+        final_text = progress_msg.edit_text.call_args[0][0]
+        assert "\u274c" in final_text  # ❌ Failed
+
+    async def test_stall_callback_passed_to_persistent_manager(
+        self, agentic_settings, deps
+    ):
+        """send_message receives a stall_callback."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        mock_response = MagicMock()
+        mock_response.session_id = "session-abc"
+        mock_response.content = "response"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
+        persistent_manager.get_client_state = MagicMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "test"
+        update.message.message_id = 1
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        # stall_callback should have been passed
+        call_kwargs = persistent_manager.send_message.call_args.kwargs
+        assert "stall_callback" in call_kwargs
+        assert callable(call_kwargs["stall_callback"])
+
+    async def test_timeout_shows_message(self, agentic_settings, deps):
+        """When send_message times out, user sees timeout message."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(
+            side_effect=asyncio.TimeoutError()
+        )
+        persistent_manager.get_client_state = MagicMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "test"
+        update.message.message_id = 1
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        # Patch wait_for to propagate the TimeoutError directly
+        # (in real code, wait_for wraps send_message, but here
+        # send_message itself raises TimeoutError which has the same effect)
+        await orchestrator.agentic_text(update, context)
+
+        # Should show failed status
+        progress_msg.edit_text.assert_called()
+        final_text = progress_msg.edit_text.call_args[0][0]
+        assert "\u274c" in final_text  # ❌ Failed
+
+        # Response should mention timeout
+        reply_calls = [
+            c
+            for c in update.message.reply_text.call_args_list
+            if "timed out" in str(c)
+        ]
+        assert len(reply_calls) >= 1
