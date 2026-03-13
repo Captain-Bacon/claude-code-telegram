@@ -28,9 +28,11 @@ poetry run mypy src
 
 ### Claude SDK Integration
 
-`ClaudeIntegration` (facade in `src/claude/facade.py`) wraps `ClaudeSDKManager` (`src/claude/sdk_integration.py`), which uses `claude-agent-sdk` with `ClaudeSDKClient` for async streaming. Session IDs come from Claude's `ResultMessage`, not generated locally.
+**Agentic mode uses `PersistentClientManager`** (`src/claude/persistent.py`), NOT the facade. One long-lived `ClaudeSDKClient` subprocess per Telegram thread, with idle→busy→draining state machine, message injection mid-turn, interrupt support, and per-turn cost deltas.
 
-Sessions auto-resume: per user+directory, persisted in SQLite.
+`ClaudeIntegration` (facade in `src/claude/facade.py`) is the old fire-and-forget path — **scheduled for removal**. Do not use it for new work.
+
+Both paths share `ClaudeSDKManager.build_options()` (`src/claude/sdk_integration.py`) for SDK configuration. **WARNING:** `max_budget_usd` in build_options tells Claude to ration itself — harmful on subscription billing. Scheduled for removal (claude-code-telegram-pa8). Do not increase or rely on budget parameters.
 
 ### Request Flow
 
@@ -39,8 +41,8 @@ Sessions auto-resume: per user+directory, persisted in SQLite.
 ```
 Telegram message -> Security middleware (group -3) -> Auth middleware (group -2)
 -> Rate limit (group -1) -> MessageOrchestrator.agentic_text() (group 10)
--> ClaudeIntegration.run_command() -> SDK
--> Response parsed -> Stored in SQLite -> Sent back to Telegram
+-> PersistentClientManager.send_message() -> ClaudeSDKClient (long-lived)
+-> Response streamed -> Sent back to Telegram
 ```
 
 **External triggers** (webhooks, scheduler):
@@ -131,7 +133,4 @@ Agentic mode commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`. If `ENA
 
 ### Classic mode
 
-1. Add handler function in `src/bot/handlers/command.py`
-2. Register in `MessageOrchestrator._register_classic_handlers()`
-3. Add to `MessageOrchestrator.get_bot_commands()` for Telegram's command menu
-4. Add audit logging for the command
+**DEPRECATED — scheduled for removal (see epic claude-code-telegram-kyj).** Do not add classic mode commands.

@@ -1,12 +1,12 @@
 """Message orchestrator — single entry point for all Telegram updates.
 
-Routes messages based on agentic vs classic mode. In agentic mode, provides
-a minimal conversational interface (3 commands, no inline keyboards). In
-classic mode, delegates to existing full-featured handlers.
+Provides a minimal agentic conversational interface (commands + text/file/photo).
 """
 
 import asyncio
+import os
 import re
+import signal
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -31,8 +31,10 @@ from telegram.ext import (
 from ..claude.persistent import PersistentClientManager, derive_state_key
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
-from ..projects import PrivateTopicsUnavailableError
+from ..projects import PrivateTopicsUnavailableError, load_project_registry
+from ..security.audit import AuditLogger
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
+from .utils.error_format import _format_error_message, _update_working_directory_from_claude_response
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
     ImageAttachment,
@@ -108,6 +110,144 @@ _TOOL_ICONS: Dict[str, str] = {
 def _tool_icon(name: str) -> str:
     """Return emoji for a tool, with a default wrench."""
     return _TOOL_ICONS.get(name, "\U0001f527")
+
+
+def _is_private_chat(update: Update) -> bool:
+    """Return True when update is from a private chat."""
+    chat = update.effective_chat
+    return bool(chat and getattr(chat, "type", "") == "private")
+
+
+async def restart_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /restart command - gracefully restart the bot process.
+
+    Sends a confirmation message then triggers SIGTERM so systemd
+    (or any process manager with restart-on-exit) brings the bot back up.
+
+    Auth: protected by the auth middleware (group -2) which raises
+    ``ApplicationHandlerStop`` for unauthenticated users before any
+    handler in group 10 runs.  No per-handler check is needed.
+    """
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    await update.message.reply_text(
+        "🔄 <b>Restarting bot…</b>\n\nBack shortly.",
+        parse_mode="HTML",
+    )
+
+    if audit_logger:
+        await audit_logger.log_command(user_id, "restart", [], True)
+
+    logger.info("Restart requested via /restart command", user_id=user_id)
+
+    # SIGTERM triggers the existing graceful-shutdown handler in main.py;
+    # systemd Restart=always will bring the process back up.
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+async def sync_threads(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Synchronize project topics in the configured forum chat."""
+    settings: Settings = context.bot_data["settings"]
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    if not settings.enable_project_threads:
+        await update.message.reply_text(
+            "ℹ️ <b>Project thread mode is disabled.</b>", parse_mode="HTML"
+        )
+        return
+
+    manager = context.bot_data.get("project_threads_manager")
+    if not manager:
+        await update.message.reply_text(
+            "❌ <b>Project thread manager not initialized.</b>", parse_mode="HTML"
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        "🔄 <b>Syncing project topics...</b>", parse_mode="HTML"
+    )
+
+    if settings.project_threads_mode == "private":
+        if not _is_private_chat(update):
+            await status_msg.edit_text(
+                "❌ <b>Private Thread Mode</b>\n\n"
+                "Run <code>/sync_threads</code> in your private chat with the bot.",
+                parse_mode="HTML",
+            )
+            return
+        target_chat_id = update.effective_chat.id
+    else:
+        if settings.project_threads_chat_id is None:
+            await status_msg.edit_text(
+                "❌ <b>Group Thread Mode Misconfigured</b>\n\n"
+                "Set <code>PROJECT_THREADS_CHAT_ID</code> first.",
+                parse_mode="HTML",
+            )
+            return
+        if (
+            not update.effective_chat
+            or update.effective_chat.id != settings.project_threads_chat_id
+        ):
+            await status_msg.edit_text(
+                "❌ <b>Group Thread Mode</b>\n\n"
+                "Run <code>/sync_threads</code> in the configured project threads group.",
+                parse_mode="HTML",
+            )
+            return
+        target_chat_id = settings.project_threads_chat_id
+
+    try:
+        if not settings.projects_config_path:
+            await status_msg.edit_text(
+                "❌ <b>Project thread mode is misconfigured</b>\n\n"
+                "Set <code>PROJECTS_CONFIG_PATH</code> to a valid YAML file.",
+                parse_mode="HTML",
+            )
+            if audit_logger:
+                await audit_logger.log_command(user_id, "sync_threads", [], False)
+            return
+
+        registry = load_project_registry(
+            config_path=settings.projects_config_path,
+            approved_directory=settings.approved_directory,
+        )
+        manager.registry = registry
+        context.bot_data["project_registry"] = registry
+
+        result = await manager.sync_topics(context.bot, chat_id=target_chat_id)
+        await status_msg.edit_text(
+            "✅ <b>Project topic sync complete</b>\n\n"
+            f"• Created: <b>{result.created}</b>\n"
+            f"• Reused: <b>{result.reused}</b>\n"
+            f"• Renamed: <b>{result.renamed}</b>\n"
+            f"• Reopened: <b>{result.reopened}</b>\n"
+            f"• Closed: <b>{result.closed}</b>\n"
+            f"• Deactivated: <b>{result.deactivated}</b>\n"
+            f"• Failed: <b>{result.failed}</b>",
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(user_id, "sync_threads", [], True)
+    except PrivateTopicsUnavailableError:
+        await status_msg.edit_text(
+            manager.private_topics_unavailable_message(),
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(user_id, "sync_threads", [], False)
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ <b>Project topic sync failed</b>\n\n{escape_html(str(e))}",
+            parse_mode="HTML",
+        )
+        if audit_logger:
+            await audit_logger.log_command(user_id, "sync_threads", [], False)
 
 
 class MessageOrchestrator:
@@ -362,29 +502,24 @@ class MessageOrchestrator:
             await update.effective_message.reply_text(message, parse_mode="HTML")
 
     def register_handlers(self, app: Application) -> None:
-        """Register handlers based on mode."""
-        if self.settings.agentic_mode:
-            self._register_agentic_handlers(app)
-        else:
-            self._register_classic_handlers(app)
+        """Register agentic handlers."""
+        self._register_agentic_handlers(app)
 
     def _register_agentic_handlers(self, app: Application) -> None:
         """Register agentic handlers: commands + text/file/photo."""
-        from .handlers import command
-
         # Commands
-        handlers = [
+        handlers: list[tuple[str, Callable]] = [
             ("start", self.agentic_start),
             ("new", self.agentic_new),
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("model", self.agentic_model),
-            ("restart", command.restart_command),
+            ("restart", restart_command),
             ("stop", self.agentic_stop),
         ]
         if self.settings.enable_project_threads:
-            handlers.append(("sync_threads", command.sync_threads))
+            handlers.append(("sync_threads", sync_threads))
 
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
@@ -428,95 +563,21 @@ class MessageOrchestrator:
 
         logger.info("Agentic handlers registered")
 
-    def _register_classic_handlers(self, app: Application) -> None:
-        """Register full classic handler set (moved from core.py)."""
-        from .handlers import callback, command, message
-
-        handlers = [
-            ("start", command.start_command),
-            ("help", command.help_command),
-            ("new", command.new_session),
-            ("continue", command.continue_session),
-            ("end", command.end_session),
-            ("ls", command.list_files),
-            ("cd", command.change_directory),
-            ("pwd", command.print_working_directory),
-            ("projects", command.show_projects),
-            ("status", command.session_status),
-            ("export", command.export_session),
-            ("actions", command.quick_actions),
-            ("git", command.git_command),
-            ("restart", command.restart_command),
+    async def get_bot_commands(self) -> list:  # type: ignore[type-arg]
+        """Return bot commands for the Telegram command menu."""
+        commands = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("new", "Start a fresh session"),
+            BotCommand("status", "Show session status"),
+            BotCommand("verbose", "Set output verbosity (0/1/2)"),
+            BotCommand("repo", "List repos / switch workspace"),
+            BotCommand("model", "Switch Claude model"),
+            BotCommand("restart", "Restart the bot"),
+            BotCommand("stop", "Cancel the current Claude request"),
         ]
         if self.settings.enable_project_threads:
-            handlers.append(("sync_threads", command.sync_threads))
-
-        for cmd, handler in handlers:
-            app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
-
-        app.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._inject_deps(message.handle_text_message),
-            ),
-            group=10,
-        )
-        app.add_handler(
-            MessageHandler(
-                filters.Document.ALL, self._inject_deps(message.handle_document)
-            ),
-            group=10,
-        )
-        app.add_handler(
-            MessageHandler(filters.PHOTO, self._inject_deps(message.handle_photo)),
-            group=10,
-        )
-        app.add_handler(
-            MessageHandler(filters.VOICE, self._inject_deps(message.handle_voice)),
-            group=10,
-        )
-        app.add_handler(
-            CallbackQueryHandler(self._inject_deps(callback.handle_callback_query))
-        )
-
-        logger.info("Classic handlers registered (13 commands + full handler set)")
-
-    async def get_bot_commands(self) -> list:  # type: ignore[type-arg]
-        """Return bot commands appropriate for current mode."""
-        if self.settings.agentic_mode:
-            commands = [
-                BotCommand("start", "Start the bot"),
-                BotCommand("new", "Start a fresh session"),
-                BotCommand("status", "Show session status"),
-                BotCommand("verbose", "Set output verbosity (0/1/2)"),
-                BotCommand("repo", "List repos / switch workspace"),
-                BotCommand("model", "Switch Claude model"),
-                BotCommand("restart", "Restart the bot"),
-                BotCommand("stop", "Cancel the current Claude request"),
-            ]
-            if self.settings.enable_project_threads:
-                commands.append(BotCommand("sync_threads", "Sync project topics"))
-            return commands
-        else:
-            commands = [
-                BotCommand("start", "Start bot and show help"),
-                BotCommand("help", "Show available commands"),
-                BotCommand("new", "Clear context and start fresh session"),
-                BotCommand("continue", "Explicitly continue last session"),
-                BotCommand("end", "End current session and clear context"),
-                BotCommand("ls", "List files in current directory"),
-                BotCommand("cd", "Change directory (resumes project session)"),
-                BotCommand("pwd", "Show current directory"),
-                BotCommand("projects", "Show all projects"),
-                BotCommand("status", "Show session status"),
-                BotCommand("export", "Export current session"),
-                BotCommand("actions", "Show quick actions"),
-                BotCommand("git", "Git repository commands"),
-                BotCommand("restart", "Restart the bot"),
-            ]
-            if self.settings.enable_project_threads:
-                commands.append(BotCommand("sync_threads", "Sync project topics"))
-            return commands
+            commands.append(BotCommand("sync_threads", "Sync project topics"))
+        return commands
 
     # --- Agentic handlers ---
 
@@ -1402,7 +1463,7 @@ class MessageOrchestrator:
             context.user_data["claude_session_id"] = claude_response.session_id
 
             # Track directory changes
-            from .handlers.message import _update_working_directory_from_claude_response
+
 
             _update_working_directory_from_claude_response(
                 claude_response, context, self.settings, user_id
@@ -1481,7 +1542,7 @@ class MessageOrchestrator:
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
-            from .handlers.message import _format_error_message
+
             from .utils.formatting import FormattedMessage
 
             formatted_messages = [
@@ -1690,7 +1751,7 @@ class MessageOrchestrator:
             )
 
         except Exception as e:
-            from .handlers.message import _format_error_message
+
 
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
             logger.error(
@@ -1738,7 +1799,7 @@ class MessageOrchestrator:
             )
 
         except Exception as e:
-            from .handlers.message import _format_error_message
+
 
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
             logger.error(
@@ -1825,8 +1886,6 @@ class MessageOrchestrator:
             context.user_data["force_new_session"] = False
 
         context.user_data["claude_session_id"] = claude_response.session_id
-
-        from .handlers.message import _update_working_directory_from_claude_response
 
         _update_working_directory_from_claude_response(
             claude_response, context, self.settings, user_id

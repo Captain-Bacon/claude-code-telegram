@@ -1,0 +1,45 @@
+projects:
+
+  - slug: telegram
+    name: "Telegram"
+    path: "claude_strategic_workspaces/telegram"
+
+  - slug: goose
+    name: "goose"
+    path: "goose"
+
+  - slug: claude-strategic-workspaces
+    name: "claude_strategic_workspaces"
+    path: "claude_strategic_workspaces"
+
+  - slug: collaboration-canvas
+    name: "collaboration-canvas"
+    path: "collaboration-canvas"
+
+  - slug: meal-planner-django
+    name: "Meal Planner - Django"
+    path: "Meal Planner - Django"
+
+  - slug: ace-step-15
+    name: "ACE-Step-1.5"
+    path: "ACE-Step-1.5"
+
+  - slug: toolbox
+    name: "Toolbox"
+    path: "Toolbox"
+
+  - slug: tb-claude-code-viewer
+    name: "TB-claude-code-viewer"
+    path: "TB-claude-code-viewer"
+
+  - slug: ugparser
+    name: "UGParser"
+    path: "UGParser"
+
+  - slug: collaboration-canvas-v2
+    name: "collaboration-canvas-v2"
+    path: "collaboration-canvas-v2"
+
+  - slug: chord-charts-2
+    name: "Chord Charts 2"
+    path: "Chord Charts 2"
