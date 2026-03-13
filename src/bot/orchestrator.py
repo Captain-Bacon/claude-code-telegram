@@ -1675,39 +1675,24 @@ class MessageOrchestrator:
         await chat.send_action("typing")
         progress_msg = await update.message.reply_text("Working...")
 
-        # Try enhanced file handler, fall back to basic
-        features = context.bot_data.get("features")
-        file_handler = features.get_file_handler() if features else None
         prompt: Optional[str] = None
 
-        if file_handler:
-            try:
-                processed_file = await file_handler.handle_document_upload(
-                    document,
-                    user_id,
-                    update.message.caption or "Please review this file:",
-                )
-                prompt = processed_file.prompt
-            except Exception:
-                file_handler = None
-
-        if not file_handler:
-            file = await document.get_file()
-            file_bytes = await file.download_as_bytearray()
-            try:
-                content = file_bytes.decode("utf-8")
-                if len(content) > 50000:
-                    content = content[:50000] + "\n... (truncated)"
-                caption = update.message.caption or "Please review this file:"
-                prompt = (
-                    f"{caption}\n\n**File:** `{document.file_name}`\n\n"
-                    f"```\n{content}\n```"
-                )
-            except UnicodeDecodeError:
-                await progress_msg.edit_text(
-                    "Unsupported file format. Must be text-based (UTF-8)."
-                )
-                return
+        file = await document.get_file()
+        file_bytes = await file.download_as_bytearray()
+        try:
+            content = file_bytes.decode("utf-8")
+            if len(content) > 50000:
+                content = content[:50000] + "\n... (truncated)"
+            caption = update.message.caption or "Please review this file:"
+            prompt = (
+                f"{caption}\n\n**File:** `{document.file_name}`\n\n"
+                f"```\n{content}\n```"
+            )
+        except UnicodeDecodeError:
+            await progress_msg.edit_text(
+                "Unsupported file format. Must be text-based (UTF-8)."
+            )
+            return
 
         # Process with Claude via persistent client
         await self._handle_agentic_media_message(

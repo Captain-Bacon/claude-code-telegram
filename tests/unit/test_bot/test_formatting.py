@@ -18,7 +18,6 @@ from src.config.settings import Settings
 def mock_settings():
     """Mock settings for testing."""
     settings = Mock(spec=Settings)
-    settings.enable_quick_actions = True
     return settings
 
 
@@ -206,18 +205,6 @@ class TestResponseFormatter:
         assert len(messages) >= 1
         full_text = "".join(m.text for m in messages)
         assert "truncated" not in full_text.lower()
-
-    def test_quick_actions_keyboard(self, formatter):
-        """Test quick actions keyboard generation."""
-        keyboard = formatter._get_quick_actions_keyboard()
-
-        assert keyboard is not None
-        assert len(keyboard.inline_keyboard) > 0
-
-        # Check that buttons have callback data
-        for row in keyboard.inline_keyboard:
-            for button in row:
-                assert button.callback_data.startswith("quick:")
 
     def test_confirmation_keyboard(self, formatter):
         """Test confirmation keyboard creation."""

@@ -57,10 +57,6 @@ class ResponseFormatter:
             text = self._format_code_blocks(text)
             messages = self._split_message(text)
 
-        # Add context-aware quick actions to the last message
-        if messages and self.settings.enable_quick_actions:
-            messages[-1].reply_markup = self._get_contextual_keyboard(context)
-
         # Filter out any empty messages produced by formatting/splitting
         messages = [m for m in messages if m.text and m.text.strip()]
 
@@ -409,38 +405,6 @@ class ResponseFormatter:
         # Split if still too long
         return self._split_message(text)
 
-    def _get_contextual_keyboard(
-        self, context: Optional[dict]
-    ) -> Optional[InlineKeyboardMarkup]:
-        """Get context-aware quick action keyboard."""
-        if not context:
-            return self._get_quick_actions_keyboard()
-
-        buttons = []
-
-        # Add context-specific buttons
-        if context.get("has_code"):
-            buttons.append(
-                [InlineKeyboardButton("💾 Save Code", callback_data="save_code")]
-            )
-
-        if context.get("has_file_operations"):
-            buttons.append(
-                [InlineKeyboardButton("📁 Show Files", callback_data="show_files")]
-            )
-
-        if context.get("has_errors"):
-            buttons.append([InlineKeyboardButton("🔧 Debug", callback_data="debug")])
-
-        # Add default actions
-        default_buttons = [
-            [InlineKeyboardButton("🔄 Continue", callback_data="continue")],
-            [InlineKeyboardButton("💡 Explain", callback_data="explain")],
-        ]
-        buttons.extend(default_buttons)
-
-        return InlineKeyboardMarkup(buttons) if buttons else None
-
     def _clean_whitespace(self, text: str) -> str:
         """Clean excessive whitespace from text."""
         text = re.sub(r"\n{3,}", "\n\n", text)
@@ -543,23 +507,6 @@ class ResponseFormatter:
             messages.append(FormattedMessage("\n".join(current_lines)))
 
         return messages
-
-    def _get_quick_actions_keyboard(self) -> InlineKeyboardMarkup:
-        """Get quick actions inline keyboard."""
-        keyboard = [
-            [
-                InlineKeyboardButton("🧪 Test", callback_data="quick:test"),
-                InlineKeyboardButton("📦 Install", callback_data="quick:install"),
-                InlineKeyboardButton("🎨 Format", callback_data="quick:format"),
-            ],
-            [
-                InlineKeyboardButton("🔍 Find TODOs", callback_data="quick:find_todos"),
-                InlineKeyboardButton("🔨 Build", callback_data="quick:build"),
-                InlineKeyboardButton("📊 Git Status", callback_data="quick:git_status"),
-            ],
-        ]
-
-        return InlineKeyboardMarkup(keyboard)
 
     def create_confirmation_keyboard(
         self, confirm_data: str, cancel_data: str = "confirm:no"
