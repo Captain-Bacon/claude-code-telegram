@@ -1258,21 +1258,27 @@ class TestActivityLifecycle:
         assert "stall_callback" in call_kwargs
         assert callable(call_kwargs["stall_callback"])
 
-    async def test_timeout_shows_message(self, agentic_settings, deps):
-        """When send_message times out, user sees timeout message."""
+    async def test_no_timeout_on_send_message(self, agentic_settings, deps):
+        """send_message is NOT wrapped in wait_for — turns can run indefinitely."""
         orchestrator = MessageOrchestrator(agentic_settings, deps)
 
+        mock_response = MagicMock()
+        mock_response.session_id = "long-session"
+        mock_response.content = "done after a long time"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
         persistent_manager = MagicMock()
-        persistent_manager.send_message = AsyncMock(
-            side_effect=asyncio.TimeoutError()
-        )
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
         persistent_manager.get_client_state = MagicMock(return_value=None)
 
         progress_msg = AsyncMock()
         update = MagicMock()
         update.effective_user.id = 123
         update.effective_chat.id = 456
-        update.message.text = "test"
+        update.message.text = "do a big task"
         update.message.message_id = 1
         update.message.message_thread_id = None
         update.message.chat.send_action = AsyncMock()
@@ -1288,20 +1294,10 @@ class TestActivityLifecycle:
             "audit_logger": None,
         }
 
-        # Patch wait_for to propagate the TimeoutError directly
-        # (in real code, wait_for wraps send_message, but here
-        # send_message itself raises TimeoutError which has the same effect)
         await orchestrator.agentic_text(update, context)
 
-        # Should show failed status
-        progress_msg.edit_text.assert_called()
-        final_text = progress_msg.edit_text.call_args[0][0]
-        assert "\u274c" in final_text  # ❌ Failed
-
-        # Response should mention timeout
-        reply_calls = [
-            c
-            for c in update.message.reply_text.call_args_list
-            if "timed out" in str(c)
-        ]
-        assert len(reply_calls) >= 1
+        # send_message called directly (not via wait_for)
+        persistent_manager.send_message.assert_awaited_once()
+        # Stall detection is via callback, not timeout
+        call_kwargs = persistent_manager.send_message.call_args.kwargs
+        assert callable(call_kwargs["stall_callback"])

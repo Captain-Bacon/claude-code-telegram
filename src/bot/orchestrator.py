@@ -1206,17 +1206,14 @@ class MessageOrchestrator:
 
         success = True
         try:
-            claude_response = await asyncio.wait_for(
-                persistent_manager.send_message(
-                    state_key=state_key,
-                    prompt=message_text,
-                    working_directory=current_dir,
-                    stream_callback=on_stream,
-                    stall_callback=on_stall,
-                    model=context.user_data.get("claude_model"),
-                    force_new=force_new,
-                ),
-                timeout=600,  # 10 min hard ceiling
+            claude_response = await persistent_manager.send_message(
+                state_key=state_key,
+                prompt=message_text,
+                working_directory=current_dir,
+                stream_callback=on_stream,
+                stall_callback=on_stall,
+                model=context.user_data.get("claude_model"),
+                force_new=force_new,
             )
 
             # None means the message was injected into a busy turn
@@ -1312,20 +1309,6 @@ class MessageOrchestrator:
                         FormattedMessage(ctx_warn, parse_mode="HTML")
                     )
 
-        except asyncio.TimeoutError:
-            success = False
-            logger.error(
-                "Claude request timed out", user_id=user_id, timeout_s=600
-            )
-            from .utils.formatting import FormattedMessage
-
-            formatted_messages = [
-                FormattedMessage(
-                    "\u26a0 Request timed out after 10 minutes. "
-                    "Try sending your message again.",
-                    parse_mode=None,
-                )
-            ]
         except asyncio.CancelledError:
             success = False
             logger.info("Claude request cancelled", user_id=user_id)
