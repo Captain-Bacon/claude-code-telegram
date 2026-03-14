@@ -35,7 +35,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Heartbeat loop in main.py calls `persistent_manager.cleanup_idle_clients()` every 5 min.
 - AgentHandler uses PersistentClientManager with synthetic state keys (`webhook:{provider}:{id}`, `scheduled:{job_id}`).
 - `src/bot/stream_handler.py` is the single source for stream callback logic. Orchestrator imports and calls `make_stream_callback(settings, ...)`.
-- `_drain_queue` duplicates ~80 lines of response handling from `agentic_text` — change one, must update the other. amv will extract shared delivery path.
+- Response delivery goes through `_deliver_turn_result` (shared by agentic_text, _drain_queue, _handle_agentic_media_message). To change how responses are formatted, progress is finalised, or messages are sent — edit that one method, not the callers.
 
 <!-- Verify before trusting: claims that could be stale -->
 ## Verify Before Trusting
@@ -54,7 +54,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 <!-- What hasn't been decided -->
 ## Open Questions
 
-- amv scope: how far to restructure orchestrator vs minimal cleanup?
+- None currently open
 
 <!-- Quick lookups -->
 ## Quick Lookups

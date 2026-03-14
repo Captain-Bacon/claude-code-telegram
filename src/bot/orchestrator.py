@@ -871,8 +871,10 @@ class MessageOrchestrator:
             )
 
             heartbeat = self._start_typing_heartbeat(chat)
-            formatted_messages: List["FormattedMessage"] = []
 
+            error_messages = None
+            claude_response = None
+            success = True
             try:
                 current_dir = context.user_data.get(
                     "current_directory", self.settings.approved_directory
@@ -886,63 +888,26 @@ class MessageOrchestrator:
                 )
 
                 if claude_response is None:
-                    # Race — client went busy. Re-queue for next drain cycle.
                     re_qm = QueuedMessage(text=combined, sent_at=time.time())
                     self._message_queues.setdefault(state_key, []).append(re_qm)
                     logger.warning("queue.drain_raced", state_key=state_key)
                     return
 
-                await flush_stream_callback(on_stream)
-
-                text_already_sent = (
-                    on_stream
-                    and hasattr(on_stream, "text_was_sent")
-                    and on_stream.text_was_sent[0]
-                )
-
-                from .utils.formatting import FormattedMessage, ResponseFormatter
-
-                if text_already_sent:
-                    formatted_messages = []
-                else:
-                    formatter = ResponseFormatter(self.settings)
-                    formatted_messages = formatter.format_claude_response(
-                        claude_response.content
-                    )
-
-                if claude_response.is_interrupted:
-                    formatted_messages.append(
-                        FormattedMessage("[Interrupted]", parse_mode=None)
-                    )
-
-                stop_notice = self._abnormal_stop_notice(claude_response)
-                if stop_notice:
-                    formatted_messages.append(stop_notice)
-
-                ctx_warn = self._context_warning(
-                    claude_response, context.user_data
-                )
-                if ctx_warn:
-                    if formatted_messages:
-                        formatted_messages[-1].text += ctx_warn
-                    else:
-                        formatted_messages.append(
-                            FormattedMessage(ctx_warn, parse_mode="HTML")
-                        )
-
             except asyncio.CancelledError:
+                success = False
                 from .utils.formatting import FormattedMessage
 
-                formatted_messages = [
+                error_messages = [
                     FormattedMessage("Stopped.", parse_mode=None)
                 ]
             except Exception as e:
+                success = False
                 logger.error(
                     "Queue drain failed", error=str(e), state_key=state_key
                 )
                 from .utils.formatting import FormattedMessage
 
-                formatted_messages = [
+                error_messages = [
                     FormattedMessage(
                         _format_error_message(e), parse_mode="HTML"
                     )
@@ -954,34 +919,17 @@ class MessageOrchestrator:
                 except Exception:
                     pass
 
-            drain_elapsed = int(time.time() - start_time)
-            try:
-                await progress_msg.edit_text(
-                    f"\u2705 Done ({drain_elapsed}s)"
-                )
-            except Exception:
-                try:
-                    await progress_msg.delete()
-                except Exception:
-                    pass
-
-            for message in formatted_messages:
-                if not message.text or not message.text.strip():
-                    continue
-                try:
-                    await update.message.reply_text(
-                        message.text, parse_mode=message.parse_mode
-                    )
-                except Exception:
-                    try:
-                        await update.message.reply_text(message.text)
-                    except Exception as plain_err:
-                        await update.message.reply_text(
-                            f"Failed to deliver queued response "
-                            f"(Telegram error: {str(plain_err)[:150]})."
-                        )
-
-            await cleanup_thinking_messages(on_stream)
+            await self._deliver_turn_result(
+                update=update,
+                context=context,
+                claude_response=claude_response,
+                on_stream=on_stream,
+                progress_msg=progress_msg,
+                start_time=start_time,
+                mcp_images=mcp_images,
+                success=success,
+                error_messages=error_messages,
+            )
             # Loop back to check if more messages were queued during this turn
 
     @staticmethod
@@ -1098,6 +1046,139 @@ class MessageOrchestrator:
 
         return caption_sent
 
+    async def _deliver_turn_result(
+        self,
+        *,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        claude_response: Any,
+        on_stream: Optional[Callable],
+        progress_msg: Any,
+        start_time: float,
+        mcp_images: List[ImageAttachment],
+        success: bool = True,
+        error_messages: Optional[List[Any]] = None,
+    ) -> None:
+        """Format, finalize progress, and deliver a turn's result.
+
+        Shared pipeline for agentic_text, _drain_queue, and media handlers.
+        On success (error_messages is None): flushes stream, formats the
+        claude_response, appends notices.  On error: uses the pre-built
+        error_messages list directly.
+        """
+        from .utils.formatting import FormattedMessage, ResponseFormatter
+
+        if error_messages is not None:
+            formatted_messages = error_messages
+        else:
+            await flush_stream_callback(on_stream)
+
+            text_already_sent = (
+                on_stream
+                and hasattr(on_stream, "text_was_sent")
+                and on_stream.text_was_sent[0]
+            )
+
+            if text_already_sent:
+                formatted_messages: List[FormattedMessage] = []
+            else:
+                formatter = ResponseFormatter(self.settings)
+                formatted_messages = formatter.format_claude_response(
+                    claude_response.content
+                )
+
+            if claude_response.is_interrupted:
+                formatted_messages.append(
+                    FormattedMessage("[Interrupted]", parse_mode=None)
+                )
+
+            stop_notice = self._abnormal_stop_notice(claude_response)
+            if stop_notice:
+                formatted_messages.append(stop_notice)
+                logger.info(
+                    "turn.abnormal_stop",
+                    stop_reason=claude_response.stop_reason,
+                    num_turns=claude_response.num_turns,
+                )
+
+            ctx_warn = self._context_warning(claude_response, context.user_data)
+            if ctx_warn:
+                if formatted_messages:
+                    formatted_messages[-1].text += ctx_warn
+                else:
+                    formatted_messages.append(
+                        FormattedMessage(ctx_warn, parse_mode="HTML")
+                    )
+
+        # Finalize progress message — always edit to final state
+        elapsed = int(time.time() - start_time)
+        try:
+            if success:
+                await progress_msg.edit_text(f"\u2705 Done ({elapsed}s)")
+            else:
+                await progress_msg.edit_text(f"\u274c Failed ({elapsed}s)")
+        except Exception:
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+
+        # Send images + text with caption optimisation
+        images = mcp_images
+        caption_sent = False
+        if images and len(formatted_messages) == 1:
+            msg = formatted_messages[0]
+            if msg.text and len(msg.text) <= 1024:
+                try:
+                    caption_sent = await self._send_images(
+                        update,
+                        images,
+                        reply_to_message_id=update.message.message_id,
+                        caption=msg.text,
+                        caption_parse_mode=msg.parse_mode,
+                    )
+                except Exception as img_err:
+                    logger.warning("Image+caption send failed", error=str(img_err))
+
+        if not caption_sent:
+            for i, message in enumerate(formatted_messages):
+                if not message.text or not message.text.strip():
+                    continue
+                try:
+                    await update.message.reply_text(
+                        message.text,
+                        parse_mode=message.parse_mode,
+                        reply_markup=None,
+                    )
+                    if i < len(formatted_messages) - 1:
+                        await asyncio.sleep(0.5)
+                except Exception as send_err:
+                    logger.warning(
+                        "Failed to send HTML response, retrying as plain text",
+                        error=str(send_err),
+                    )
+                    try:
+                        await update.message.reply_text(
+                            message.text, reply_markup=None,
+                        )
+                    except Exception as plain_err:
+                        await update.message.reply_text(
+                            f"Failed to deliver response "
+                            f"(Telegram error: {str(plain_err)[:150]})."
+                        )
+
+            if images:
+                try:
+                    await self._send_images(
+                        update,
+                        images,
+                        reply_to_message_id=update.message.message_id,
+                    )
+                except Exception as img_err:
+                    logger.warning("Image send failed", error=str(img_err))
+
+        await cleanup_thinking_messages(on_stream)
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1171,7 +1252,8 @@ class MessageOrchestrator:
                 throttle_interval=self.settings.stream_draft_interval,
             )
 
-        on_stream = make_stream_callback(self.settings,
+        on_stream = make_stream_callback(
+            self.settings,
             verbose_level,
             progress_msg,
             tool_log,
@@ -1204,6 +1286,8 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
+        error_messages = None
+        claude_response = None
         success = True
         try:
             claude_response = await persistent_manager.send_message(
@@ -1216,10 +1300,7 @@ class MessageOrchestrator:
                 force_new=force_new,
             )
 
-            # None means the message was injected into a busy turn
-            # (race: state was idle at the orchestrator check but another
-            # concurrent handler claimed the turn before we acquired the
-            # send_lock inside send_message).
+            # None means race: another handler claimed the turn
             if claude_response is None:
                 heartbeat.cancel()
                 try:
@@ -1232,20 +1313,15 @@ class MessageOrchestrator:
                     pass
                 return
 
-            # New session created successfully — clear the one-shot flag
             if force_new:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
-            # Track directory changes
-
-
             _update_working_directory_from_claude_response(
                 claude_response, context, self.settings, user_id
             )
 
-            # Store interaction
             storage = context.bot_data.get("storage")
             if storage:
                 try:
@@ -1259,69 +1335,18 @@ class MessageOrchestrator:
                 except Exception as e:
                     logger.warning("Failed to log interaction", error=str(e))
 
-            # Drain any pending batched text BEFORE checking the flag.
-            # The 1.5s batch window means text can be enqueued but not yet
-            # flushed when the turn completes — checking the flag first
-            # would miss it and cause the final response to duplicate.
-            await flush_stream_callback(on_stream)
-
-            text_already_sent = (
-                on_stream
-                and hasattr(on_stream, "text_was_sent")
-                and on_stream.text_was_sent[0]
-            )
-
-            from .utils.formatting import FormattedMessage, ResponseFormatter
-
-            if text_already_sent:
-                formatted_messages: List[FormattedMessage] = []
-            else:
-                formatter = ResponseFormatter(self.settings)
-                formatted_messages = formatter.format_claude_response(
-                    claude_response.content
-                )
-
-            # Show [Interrupted] if the response was stopped
-            if claude_response.is_interrupted:
-                formatted_messages.append(
-                    FormattedMessage("[Interrupted]", parse_mode=None)
-                )
-
-            # Warn if the turn ended for a non-normal reason
-            stop_notice = self._abnormal_stop_notice(claude_response)
-            if stop_notice:
-                formatted_messages.append(stop_notice)
-                logger.warning(
-                    "turn.abnormal_stop",
-                    state_key=self._state_key(update),
-                    stop_reason=claude_response.stop_reason,
-                    num_turns=claude_response.num_turns,
-                )
-
-            # Append context window warning if threshold crossed
-            ctx_warn = self._context_warning(claude_response, context.user_data)
-            if ctx_warn:
-                if formatted_messages:
-                    formatted_messages[-1].text += ctx_warn
-                else:
-                    # No messages to append to — send as standalone
-                    formatted_messages.append(
-                        FormattedMessage(ctx_warn, parse_mode="HTML")
-                    )
-
         except asyncio.CancelledError:
             success = False
             logger.info("Claude request cancelled", user_id=user_id)
             from .utils.formatting import FormattedMessage
 
-            formatted_messages = [FormattedMessage("Stopped.", parse_mode=None)]
+            error_messages = [FormattedMessage("Stopped.", parse_mode=None)]
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
-
             from .utils.formatting import FormattedMessage
 
-            formatted_messages = [
+            error_messages = [
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
         finally:
@@ -1330,92 +1355,23 @@ class MessageOrchestrator:
                 try:
                     await draft_streamer.flush()
                 except Exception:
-                    logger.debug("Draft flush failed in finally block", user_id=user_id)
-            # Flush any pending batched intermediate text before final response.
-            # This runs in the finally block so buffered text is delivered even
-            # on error paths (previously only flushed on success).
+                    pass
             try:
                 await flush_stream_callback(on_stream)
             except Exception:
-                logger.debug("Stream callback flush failed in finally block", user_id=user_id)
-
-        # Edit progress message to final state instead of deleting.
-        # The user always sees a definitive outcome.
-        elapsed = int(time.time() - start_time)
-        try:
-            if success:
-                await progress_msg.edit_text(f"\u2705 Done ({elapsed}s)")
-            else:
-                await progress_msg.edit_text(f"\u274c Failed ({elapsed}s)")
-        except Exception:
-            try:
-                await progress_msg.delete()
-            except Exception:
                 pass
 
-        # Use MCP-collected images (from send_image_to_user tool calls)
-        images: List[ImageAttachment] = mcp_images
-
-        # Try to combine text + images in one message when possible
-        caption_sent = False
-        if images and len(formatted_messages) == 1:
-            msg = formatted_messages[0]
-            if msg.text and len(msg.text) <= 1024:
-                try:
-                    caption_sent = await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                        caption=msg.text,
-                        caption_parse_mode=msg.parse_mode,
-                    )
-                except Exception as img_err:
-                    logger.warning("Image+caption send failed", error=str(img_err))
-
-        # Send text messages (skip if caption was already embedded in photos)
-        if not caption_sent:
-            for i, message in enumerate(formatted_messages):
-                if not message.text or not message.text.strip():
-                    continue
-                try:
-                    await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=None,  # No keyboards in agentic mode
-                    )
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
-                except Exception as send_err:
-                    logger.warning(
-                        "Failed to send HTML response, retrying as plain text",
-                        error=str(send_err),
-                        message_index=i,
-                    )
-                    try:
-                        await update.message.reply_text(
-                            message.text,
-                            reply_markup=None,
-                        )
-                    except Exception as plain_err:
-                        await update.message.reply_text(
-                            f"Failed to deliver response "
-                            f"(Telegram error: {str(plain_err)[:150]}). "
-                            f"Please try again.",
-                        )
-
-            # Send images separately if caption wasn't used
-            if images:
-                try:
-                    await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                    )
-                except Exception as img_err:
-                    logger.warning("Image send failed", error=str(img_err))
-
-        # Delete ephemeral thinking messages now that the final response is sent
-        await cleanup_thinking_messages(on_stream)
+        await self._deliver_turn_result(
+            update=update,
+            context=context,
+            claude_response=claude_response,
+            on_stream=on_stream,
+            progress_msg=progress_msg,
+            start_time=start_time,
+            mcp_images=mcp_images,
+            success=success,
+            error_messages=error_messages,
+        )
 
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
@@ -1612,18 +1568,24 @@ class MessageOrchestrator:
 
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
+        start_time = time.time()
         mcp_images_media: List[ImageAttachment] = []
-        on_stream = make_stream_callback(self.settings,
+        on_stream = make_stream_callback(
+            self.settings,
             verbose_level,
             progress_msg,
             tool_log,
-            time.time(),
+            start_time,
             mcp_images=mcp_images_media,
             approved_directory=self.settings.approved_directory,
             telegram_update=update,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
+
+        error_messages = None
+        claude_response = None
+        success = True
         try:
             claude_response = await persistent_manager.send_message(
                 state_key=state_key,
@@ -1633,7 +1595,7 @@ class MessageOrchestrator:
                 model=context.user_data.get("claude_model"),
                 force_new=force_new,
             )
-            # None means the message was injected into a busy turn
+
             if claude_response is None:
                 heartbeat.cancel()
                 try:
@@ -1641,113 +1603,50 @@ class MessageOrchestrator:
                 except Exception:
                     pass
                 return
-        except asyncio.CancelledError:
-            logger.info("Claude media request cancelled", user_id=user_id)
-            try:
-                await progress_msg.delete()
-            except Exception:
-                pass
-            await update.message.reply_text("Stopped.")
-            return
-        except Exception as e:
-            from .handlers.message import _format_error_message
 
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            if force_new:
+                context.user_data["force_new_session"] = False
+
+            context.user_data["claude_session_id"] = claude_response.session_id
+
+            _update_working_directory_from_claude_response(
+                claude_response, context, self.settings, user_id
+            )
+
+        except asyncio.CancelledError:
+            success = False
+            logger.info("Claude media request cancelled", user_id=user_id)
+            from .utils.formatting import FormattedMessage
+
+            error_messages = [FormattedMessage("Stopped.", parse_mode=None)]
+        except Exception as e:
+            success = False
             logger.error(
                 "Claude media processing failed", error=str(e), user_id=user_id
             )
-            return
+            from .utils.formatting import FormattedMessage
+
+            error_messages = [
+                FormattedMessage(_format_error_message(e), parse_mode="HTML")
+            ]
         finally:
             heartbeat.cancel()
+            try:
+                await flush_stream_callback(on_stream)
+            except Exception:
+                pass
 
-        if force_new:
-            context.user_data["force_new_session"] = False
-
-        context.user_data["claude_session_id"] = claude_response.session_id
-
-        _update_working_directory_from_claude_response(
-            claude_response, context, self.settings, user_id
+        await self._deliver_turn_result(
+            update=update,
+            context=context,
+            claude_response=claude_response,
+            on_stream=on_stream,
+            progress_msg=progress_msg,
+            start_time=start_time,
+            mcp_images=mcp_images_media,
+            success=success,
+            error_messages=error_messages,
         )
-
-        from .utils.formatting import FormattedMessage, ResponseFormatter
-
-        # Drain any pending batched text BEFORE checking the flag.
-        await flush_stream_callback(on_stream)
-
-        text_already_sent = (
-            on_stream
-            and hasattr(on_stream, "text_was_sent")
-            and on_stream.text_was_sent[0]
-        )
-
-        if text_already_sent:
-            formatted_messages: List[FormattedMessage] = []
-        else:
-            formatter = ResponseFormatter(self.settings)
-            formatted_messages = formatter.format_claude_response(claude_response.content)
-
-        # Warn if the turn ended for a non-normal reason
-        stop_notice = self._abnormal_stop_notice(claude_response)
-        if stop_notice:
-            formatted_messages.append(stop_notice)
-
-        # Append context window warning if threshold crossed
-        ctx_warn = self._context_warning(claude_response, context.user_data)
-        if ctx_warn:
-            if formatted_messages:
-                formatted_messages[-1].text += ctx_warn
-            else:
-                formatted_messages.append(
-                    FormattedMessage(ctx_warn, parse_mode="HTML")
-                )
-
-        try:
-            await progress_msg.delete()
-        except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
-
-        # Use MCP-collected images (from send_image_to_user tool calls).
-        images: List[ImageAttachment] = mcp_images_media
-
-        caption_sent = False
-        if images and len(formatted_messages) == 1:
-            msg = formatted_messages[0]
-            if msg.text and len(msg.text) <= 1024:
-                try:
-                    caption_sent = await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                        caption=msg.text,
-                        caption_parse_mode=msg.parse_mode,
-                    )
-                except Exception as img_err:
-                    logger.warning("Image+caption send failed", error=str(img_err))
-
-        if not caption_sent:
-            for i, message in enumerate(formatted_messages):
-                if not message.text or not message.text.strip():
-                    continue
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=None,
-                )
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
-
-            if images:
-                try:
-                    await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                    )
-                except Exception as img_err:
-                    logger.warning("Image send failed", error=str(img_err))
-
-        # Delete ephemeral thinking messages now that the final response is sent
-        await cleanup_thinking_messages(on_stream)
 
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""
