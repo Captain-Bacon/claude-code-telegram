@@ -25,13 +25,7 @@ def mock_settings():
     settings.telegram_token_str = "test:token"
     settings.webhook_url = None
     settings.agentic_mode = True
-    settings.enable_quick_actions = False
     settings.enable_mcp = False
-    settings.enable_git_integration = False
-    settings.enable_file_uploads = False
-    settings.enable_session_export = False
-    settings.enable_image_uploads = False
-    settings.enable_conversation_mode = False
     settings.enable_api_server = False
     settings.enable_scheduler = False
     settings.approved_directory = "/tmp/test"

@@ -26,3 +26,29 @@ __author__ = "Richard Atkinson"
 __email__ = "richardatk01@gmail.com"
 __license__ = "MIT"
 __homepage__ = "https://github.com/richardatkinson/claude-code-telegram"
+
+
+def get_build_info() -> str:
+    """Return branch@commit for version identification.
+
+    Example: 'feature/persistent-client-v2@3e238ba'
+    Falls back to just the version string if git isn't available.
+    """
+    import subprocess
+
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=Path(__file__).resolve().parent.parent,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=Path(__file__).resolve().parent.parent,
+        ).stdout.strip()
+        if branch and commit:
+            return f"{branch}@{commit}"
+    except Exception:
+        pass
+    return __version__

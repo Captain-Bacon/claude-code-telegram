@@ -1,6 +1,6 @@
 """Event handlers that bridge the event bus to Claude and Telegram.
 
-AgentHandler: translates events into ClaudeIntegration.run_command() calls.
+AgentHandler: translates events into PersistentClientManager.send_message() calls.
 NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 import structlog
 
-from ..claude.facade import ClaudeIntegration
+from ..claude.persistent import PersistentClientManager
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -20,19 +20,19 @@ class AgentHandler:
     """Translates incoming events into Claude agent executions.
 
     Webhook and scheduled events are converted into prompts and sent
-    to ClaudeIntegration.run_command(). The response is published
+    to PersistentClientManager.send_message(). The response is published
     back as an AgentResponseEvent for delivery.
     """
 
     def __init__(
         self,
         event_bus: EventBus,
-        claude_integration: ClaudeIntegration,
+        persistent_manager: PersistentClientManager,
         default_working_directory: Path,
         default_user_id: int = 0,
     ) -> None:
         self.event_bus = event_bus
-        self.claude = claude_integration
+        self.persistent_manager = persistent_manager
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
 
@@ -54,15 +54,16 @@ class AgentHandler:
         )
 
         prompt = self._build_webhook_prompt(event)
+        state_key = f"webhook:{event.provider}:{event.delivery_id or 'none'}"
 
         try:
-            response = await self.claude.run_command(
+            response = await self.persistent_manager.send_message(
+                state_key=state_key,
                 prompt=prompt,
                 working_directory=self.default_working_directory,
-                user_id=self.default_user_id,
             )
 
-            if response.content:
+            if response and response.content:
                 # We don't know which chat to send to from a webhook alone.
                 # The notification service needs configured target chats.
                 # Publish with chat_id=0 — the NotificationService
@@ -99,15 +100,16 @@ class AgentHandler:
             )
 
         working_dir = event.working_directory or self.default_working_directory
+        state_key = f"scheduled:{event.job_id}"
 
         try:
-            response = await self.claude.run_command(
+            response = await self.persistent_manager.send_message(
+                state_key=state_key,
                 prompt=prompt,
                 working_directory=working_dir,
-                user_id=self.default_user_id,
             )
 
-            if response.content:
+            if response and response.content:
                 for chat_id in event.target_chat_ids:
                     await self.event_bus.publish(
                         AgentResponseEvent(

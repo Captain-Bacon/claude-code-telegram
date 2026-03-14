@@ -10,12 +10,9 @@ from typing import Any, Dict, Optional
 
 import structlog
 
-from src import __version__
+from src import __version__, get_build_info
 from src.bot.core import ClaudeCodeBot
-from src.claude import (
-    ClaudeIntegration,
-    SessionManager,
-)
+from src.claude.persistent import PersistentClientManager
 from src.claude.sdk_integration import ClaudeSDKManager
 from src.config.features import FeatureFlags
 from src.config.settings import Settings
@@ -36,18 +33,23 @@ from src.security.auth import (
 from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
-from src.storage.session_storage import SQLiteSessionStorage
 
 
 def setup_logging(debug: bool = False) -> None:
     """Configure structured logging."""
     level = logging.DEBUG if debug else logging.INFO
 
+    # Always write to both stdout AND bot-debug.log so diagnostics survive
+    log_file = Path(__file__).resolve().parent.parent / "bot-debug.log"
+    file_handler = logging.FileHandler(str(log_file), mode="a")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+
     # Configure standard logging
     logging.basicConfig(
         level=level,
         format="%(message)s",
-        stream=sys.stdout,
+        handlers=[logging.StreamHandler(sys.stdout), file_handler],
     )
 
     # Configure structlog
@@ -136,19 +138,10 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     audit_storage = InMemoryAuditStorage()  # TODO: Use database storage in production
     audit_logger = AuditLogger(audit_storage)
 
-    # Create Claude integration components with persistent storage
-    session_storage = SQLiteSessionStorage(storage.db_manager)
-    session_manager = SessionManager(config, session_storage)
-
-    # Create Claude SDK manager and integration facade
+    # Create Claude SDK manager and persistent client manager
     logger.info("Using Claude Python SDK integration")
     sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
-
-    claude_integration = ClaudeIntegration(
-        config=config,
-        sdk_manager=sdk_manager,
-        session_manager=session_manager,
-    )
+    persistent_manager = PersistentClientManager(sdk_manager, config)
 
     # --- Event bus and agentic platform components ---
     event_bus = EventBus()
@@ -164,7 +157,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # Agent handler — translates events into Claude executions
     agent_handler = AgentHandler(
         event_bus=event_bus,
-        claude_integration=claude_integration,
+        persistent_manager=persistent_manager,
         default_working_directory=config.approved_directory,
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
     )
@@ -176,7 +169,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "security_validator": security_validator,
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": storage,
         "event_bus": event_bus,
         "project_registry": None,
@@ -193,7 +186,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     return {
         "bot": bot,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": storage,
         "config": config,
         "features": features,
@@ -208,7 +201,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     """Run the application with graceful shutdown handling."""
     logger = structlog.get_logger()
     bot: ClaudeCodeBot = app["bot"]
-    claude_integration: ClaudeIntegration = app["claude_integration"]
+    persistent_manager: PersistentClientManager = app["persistent_manager"]
     storage: Storage = app["storage"]
     config: Settings = app["config"]
     features: FeatureFlags = app["features"]
@@ -292,21 +285,33 @@ async def run_application(app: Dict[str, Any]) -> None:
         # Collect concurrent tasks
         tasks = []
 
+        # Persistent client heartbeat + idle cleanup (runs every 5 minutes)
+        build_info = get_build_info()
+
+        async def _idle_cleanup_loop() -> None:
+            while True:
+                await asyncio.sleep(300)
+                try:
+                    cleaned = await persistent_manager.cleanup_idle_clients()
+                    logger.info(
+                        "Heartbeat",
+                        build=build_info,
+                        active_clients=len(persistent_manager._clients),
+                        cleaned=cleaned,
+                    )
+                except Exception as e:
+                    logger.warning("Idle cleanup error", error=str(e), build=build_info)
+
+        idle_cleanup_task = asyncio.create_task(_idle_cleanup_loop())
+        tasks.append(idle_cleanup_task)
+
         # Bot task — use start() which handles its own initialization check
         bot_task = asyncio.create_task(bot.start())
         tasks.append(bot_task)
 
-        # API server (if enabled)
-        if features.api_server_enabled:
-            from src.api.server import run_api_server
-
-            api_task = asyncio.create_task(
-                run_api_server(event_bus, config, storage.db_manager)
-            )
-            tasks.append(api_task)
-            logger.info("API server enabled", port=config.api_server_port)
-
-        # Scheduler (if enabled)
+        # Scheduler (if enabled) — created before API server so it can
+        # be passed to the scheduler API routes.
+        scheduler: Optional[JobScheduler] = None
         if features.scheduler_enabled:
             scheduler = JobScheduler(
                 event_bus=event_bus,
@@ -315,6 +320,18 @@ async def run_application(app: Dict[str, Any]) -> None:
             )
             await scheduler.start()
             logger.info("Job scheduler enabled")
+
+        # API server (if enabled)
+        if features.api_server_enabled:
+            from src.api.server import run_api_server
+
+            api_task = asyncio.create_task(
+                run_api_server(
+                    event_bus, config, storage.db_manager, scheduler=scheduler
+                )
+            )
+            tasks.append(api_task)
+            logger.info("API server enabled", port=config.api_server_port)
 
         # Shutdown task
         shutdown_task = asyncio.create_task(shutdown_event.wait())
@@ -358,7 +375,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 await notification_service.stop()
             await event_bus.stop()
             await bot.stop()
-            await claude_integration.shutdown()
+            await persistent_manager.shutdown()
             await storage.close()
         except Exception as e:
             logger.error("Error during shutdown", error=str(e))
@@ -372,7 +389,8 @@ async def main() -> None:
     setup_logging(debug=args.debug)
 
     logger = structlog.get_logger()
-    logger.info("Starting Claude Code Telegram Bot", version=__version__)
+    _build_info = get_build_info()
+    logger.info("Starting Claude Code Telegram Bot", version=__version__, build=_build_info)
 
     try:
         # Load configuration

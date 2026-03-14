@@ -4,11 +4,12 @@ import asyncio
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.bot.orchestrator import MessageOrchestrator, _redact_secrets
+from src.bot.orchestrator import MessageOrchestrator
+from src.bot.stream_handler import _redact_secrets, _summarize_tool_input
 from src.config import create_test_config
 
 
@@ -20,12 +21,12 @@ def tmp_dir():
 
 @pytest.fixture
 def agentic_settings(tmp_dir):
-    return create_test_config(approved_directory=str(tmp_dir), agentic_mode=True)
+    return create_test_config(approved_directory=str(tmp_dir), agentic_mode=True, enable_project_threads=False)
 
 
 @pytest.fixture
 def classic_settings(tmp_dir):
-    return create_test_config(approved_directory=str(tmp_dir), agentic_mode=False)
+    return create_test_config(approved_directory=str(tmp_dir), agentic_mode=False, enable_project_threads=False)
 
 
 @pytest.fixture
@@ -82,8 +83,8 @@ def deps():
     }
 
 
-def test_agentic_registers_6_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, restart commands."""
+def test_agentic_registers_8_commands(agentic_settings, deps):
+    """Agentic mode registers start, new, status, verbose, repo, model, restart, stop commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,32 +101,16 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 6
+    assert len(cmd_handlers) == 8
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
+    assert frozenset({"model"}) in commands
     assert frozenset({"restart"}) in commands
+    assert frozenset({"stop"}) in commands
 
-
-def test_classic_registers_14_commands(classic_settings, deps):
-    """Classic mode registers all 14 commands."""
-    orchestrator = MessageOrchestrator(classic_settings, deps)
-    app = MagicMock()
-    app.add_handler = MagicMock()
-
-    orchestrator.register_handlers(app)
-
-    from telegram.ext import CommandHandler
-
-    cmd_handlers = [
-        call
-        for call in app.add_handler.call_args_list
-        if isinstance(call[0][0], CommandHandler)
-    ]
-
-    assert len(cmd_handlers) == 14
 
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
@@ -156,33 +141,21 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 6 bot commands."""
+    """Agentic mode returns 8 bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 6
+    assert len(commands) == 8
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart"]
+    assert cmd_names == ["start", "new", "status", "verbose", "repo", "model", "restart", "stop"]
 
-
-async def test_classic_bot_commands(classic_settings, deps):
-    """Classic mode returns 14 bot commands."""
-    orchestrator = MessageOrchestrator(classic_settings, deps)
-    commands = await orchestrator.get_bot_commands()
-
-    assert len(commands) == 14
-    cmd_names = [c.command for c in commands]
-    assert "start" in cmd_names
-    assert "help" in cmd_names
-    assert "git" in cmd_names
-    assert "restart" in cmd_names
 
 
 async def test_restart_command_sends_sigterm(deps):
     """restart_command sends SIGTERM to the current process."""
     from unittest.mock import patch
 
-    from src.bot.handlers.command import restart_command
+    from src.bot.orchestrator import restart_command
 
     update = MagicMock()
     update.effective_user.id = 123
@@ -191,7 +164,7 @@ async def test_restart_command_sends_sigterm(deps):
     context = MagicMock()
     context.bot_data = {"audit_logger": None}
 
-    with patch("src.bot.handlers.command.os.kill") as mock_kill:
+    with patch("src.bot.orchestrator.os.kill") as mock_kill:
         await restart_command(update, context)
 
     import os
@@ -235,15 +208,20 @@ async def test_agentic_new_resets_session(agentic_settings, deps):
     """Agentic /new clears session and sends brief confirmation."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
+    persistent_manager = AsyncMock()
+    persistent_manager.disconnect_client = AsyncMock()
+
     update = MagicMock()
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
     context.user_data = {"claude_session_id": "old-session-123"}
+    context.bot_data = {"persistent_manager": persistent_manager}
 
     await orchestrator.agentic_new(update, context)
 
     assert context.user_data["claude_session_id"] is None
+    persistent_manager.disconnect_client.assert_awaited_once()
     update.message.reply_text.assert_called_once_with("Session reset. What's next?")
 
 
@@ -267,22 +245,28 @@ async def test_agentic_status_compact(agentic_settings, deps):
 
 
 async def test_agentic_text_calls_claude(agentic_settings, deps):
-    """Agentic text handler calls Claude and returns response without keyboard."""
+    """Agentic text handler calls Claude via persistent manager."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
-    # Mock Claude response
+    # Mock persistent response
     mock_response = MagicMock()
     mock_response.session_id = "session-abc"
     mock_response.content = "Hello, I can help with that!"
     mock_response.tools_used = []
+    mock_response.is_interrupted = False
+    mock_response.context_window = None
+    mock_response.total_input_tokens = None
 
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock(return_value=mock_response)
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock(return_value=mock_response)
+    persistent_manager.get_client_state = MagicMock(return_value=None)
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
     update.message.text = "Help me with this code"
     update.message.message_id = 1
+    update.message.message_thread_id = None
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
 
@@ -295,7 +279,7 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": None,
         "rate_limiter": None,
         "audit_logger": None,
@@ -303,14 +287,16 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
 
     await orchestrator.agentic_text(update, context)
 
-    # Claude was called
-    claude_integration.run_command.assert_called_once()
+    # Claude was called via persistent manager
+    persistent_manager.send_message.assert_awaited_once()
 
     # Session ID updated
     assert context.user_data["claude_session_id"] == "session-abc"
 
-    # Progress message deleted
-    progress_msg.delete.assert_called_once()
+    # Progress message edited to final state (not deleted)
+    progress_msg.edit_text.assert_called()
+    final_text = progress_msg.edit_text.call_args[0][0]
+    assert "\u2705" in final_text  # ✅ Done
 
     # Response sent without keyboard (reply_markup=None)
     response_calls = [
@@ -364,31 +350,38 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
 
 
 async def test_agentic_voice_calls_claude(agentic_settings, deps):
-    """Agentic voice handler transcribes and routes prompt to Claude."""
+    """Agentic voice handler transcribes and routes prompt via persistent manager."""
+    agentic_settings.enable_voice_messages = True
+    agentic_settings.voice_provider = "mistral"
+    agentic_settings.mistral_api_key = "test-key"
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
     mock_response = MagicMock()
     mock_response.session_id = "voice-session-123"
     mock_response.content = "Voice response from Claude"
     mock_response.tools_used = []
+    mock_response.is_interrupted = False
+    mock_response.context_window = None
+    mock_response.total_input_tokens = None
 
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock(return_value=mock_response)
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock(return_value=mock_response)
+    persistent_manager.get_client_state = MagicMock(return_value=None)
 
     processed_voice = MagicMock()
     processed_voice.prompt = "Voice prompt text"
+    processed_voice.transcription = "Voice prompt text"
 
-    voice_handler = MagicMock()
-    voice_handler.process_voice_message = AsyncMock(return_value=processed_voice)
-
-    features = MagicMock()
-    features.get_voice_handler.return_value = voice_handler
+    mock_voice_handler = MagicMock()
+    mock_voice_handler.process_voice_message = AsyncMock(return_value=processed_voice)
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
     update.message.voice = MagicMock()
     update.message.caption = "please summarize"
     update.message.message_id = 1
+    update.message.message_thread_id = None
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
 
@@ -401,16 +394,16 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "features": features,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
     }
 
-    await orchestrator.agentic_voice(update, context)
+    with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
+        await orchestrator.agentic_voice(update, context)
 
-    voice_handler.process_voice_message.assert_awaited_once_with(
+    mock_voice_handler.process_voice_message.assert_awaited_once_with(
         update.message.voice, "please summarize"
     )
-    claude_integration.run_command.assert_awaited_once()
+    persistent_manager.send_message.assert_awaited_once()
     assert context.user_data["claude_session_id"] == "voice-session-123"
 
 
@@ -444,18 +437,18 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
     agentic_settings, deps
 ):
     """Transcription failures are shown to users and do not call Claude."""
+    agentic_settings.enable_voice_messages = True
+    agentic_settings.voice_provider = "mistral"
+    agentic_settings.mistral_api_key = "test-key"
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
-    voice_handler = MagicMock()
-    voice_handler.process_voice_message = AsyncMock(
+    mock_voice_handler = MagicMock()
+    mock_voice_handler.process_voice_message = AsyncMock(
         side_effect=RuntimeError("Mistral transcription request failed: boom")
     )
 
-    features = MagicMock()
-    features.get_voice_handler.return_value = voice_handler
-
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock()
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock()
 
     update = MagicMock()
     update.effective_user.id = 123
@@ -472,17 +465,17 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "features": features,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
     }
 
-    await orchestrator.agentic_voice(update, context)
+    with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
+        await orchestrator.agentic_voice(update, context)
 
     progress_msg.edit_text.assert_awaited_once()
     error_text = progress_msg.edit_text.call_args.args[0]
     assert "Mistral transcription request failed" in error_text
     assert progress_msg.edit_text.call_args.kwargs["parse_mode"] == "HTML"
-    claude_integration.run_command.assert_not_awaited()
+    persistent_manager.send_message.assert_not_awaited()
 
 
 async def test_agentic_start_escapes_html_in_name(agentic_settings, deps):
@@ -510,16 +503,19 @@ async def test_agentic_text_logs_failure_on_error(agentic_settings, deps):
     """Failed Claude runs are logged with success=False."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
-    claude_integration = AsyncMock()
-    claude_integration.run_command = AsyncMock(side_effect=Exception("Claude broke"))
+    persistent_manager = MagicMock()
+    persistent_manager.send_message = AsyncMock(side_effect=Exception("Claude broke"))
+    persistent_manager.get_client_state = MagicMock(return_value=None)
 
     audit_logger = AsyncMock()
     audit_logger.log_command = AsyncMock()
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
     update.message.text = "do something"
     update.message.message_id = 1
+    update.message.message_thread_id = None
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
 
@@ -531,7 +527,7 @@ async def test_agentic_text_logs_failure_on_error(agentic_settings, deps):
     context.user_data = {}
     context.bot_data = {
         "settings": agentic_settings,
-        "claude_integration": claude_integration,
+        "persistent_manager": persistent_manager,
         "storage": None,
         "rate_limiter": None,
         "audit_logger": audit_logger,
@@ -606,8 +602,7 @@ class TestRedactSecrets:
 
     def test_summarize_tool_input_bash_redacts(self, agentic_settings, deps):
         """_summarize_tool_input applies redaction to Bash commands."""
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
-        result = orchestrator._summarize_tool_input(
+        result = _summarize_tool_input(
             "Bash",
             {"command": "curl --token=mysupersecrettoken123 https://api.example.com"},
         )
@@ -616,8 +611,7 @@ class TestRedactSecrets:
 
     def test_summarize_tool_input_non_bash_unchanged(self, agentic_settings, deps):
         """Non-Bash tools don't go through redaction."""
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
-        result = orchestrator._summarize_tool_input(
+        result = _summarize_tool_input(
             "Read", {"file_path": "/home/user/.env"}
         )
         assert result == ".env"
@@ -691,11 +685,12 @@ class TestTypingHeartbeat:
 
     async def test_stream_callback_independent_of_typing(self, agentic_settings, deps):
         """Stream callback no longer sends typing — that's the heartbeat's job."""
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        from src.bot.stream_handler import make_stream_callback
 
         progress_msg = AsyncMock()
         tool_log: list = []  # type: ignore[type-arg]
-        callback = orchestrator._make_stream_callback(
+        callback = make_stream_callback(
+            agentic_settings,
             verbose_level=1,
             progress_msg=progress_msg,
             tool_log=tool_log,
@@ -707,7 +702,7 @@ class TestTypingHeartbeat:
         # (typing is no longer handled by the stream callback)
         import inspect
 
-        sig = inspect.signature(orchestrator._make_stream_callback)
+        sig = inspect.signature(make_stream_callback)
         assert "chat" not in sig.parameters
 
 
@@ -926,3 +921,383 @@ async def test_private_mode_rejects_help_outside_topics(private_thread_settings,
 
     assert called["value"] is False
     update.effective_message.reply_text.assert_called_once()
+
+
+# --- Message queuing (ceq) tests ---
+
+
+class TestEnqueueMessage:
+    """Verify _enqueue_message queues and sends placeholder."""
+
+    async def test_enqueue_sends_placeholder_and_stores(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        placeholder_msg = MagicMock()
+        placeholder_msg.message_id = 999
+
+        update = MagicMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder_msg)
+
+        await orchestrator._enqueue_message("key1", "hello", update)
+
+        # Placeholder sent
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "Queued" in text
+
+        # Stored in queue
+        assert len(orchestrator._message_queues["key1"]) == 1
+        qm = orchestrator._message_queues["key1"][0]
+        assert qm.text == "hello"
+        assert qm.placeholder_message_id == 999
+
+    async def test_enqueue_appends_multiple(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        placeholder = MagicMock()
+        placeholder.message_id = 100
+
+        update = MagicMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder)
+
+        await orchestrator._enqueue_message("key1", "first", update)
+        await orchestrator._enqueue_message("key1", "second", update)
+
+        assert len(orchestrator._message_queues["key1"]) == 2
+        assert orchestrator._message_queues["key1"][0].text == "first"
+        assert orchestrator._message_queues["key1"][1].text == "second"
+
+
+class TestCombineQueuedMessages:
+    """Verify _combine_queued_messages formats correctly."""
+
+    def test_single_message(self):
+        from src.bot.orchestrator import QueuedMessage
+
+        qm = QueuedMessage(text="do the thing", sent_at=1710300000.0)
+        result = MessageOrchestrator._combine_queued_messages([qm])
+
+        assert "queued during your previous turn" in result
+        assert "do the thing" in result
+        assert "UTC" in result
+
+    def test_multiple_messages(self):
+        from src.bot.orchestrator import QueuedMessage
+
+        msgs = [
+            QueuedMessage(text="first thought", sent_at=1710300000.0),
+            QueuedMessage(text="second thought", sent_at=1710300005.0),
+        ]
+        result = MessageOrchestrator._combine_queued_messages(msgs)
+
+        assert "2 messages were queued" in result
+        assert "first thought" in result
+        assert "second thought" in result
+
+
+class TestDrainQueue:
+    """Verify _drain_queue sends combined messages to Claude."""
+
+    async def test_drain_empty_queue_is_noop(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        update = MagicMock()
+        context = MagicMock()
+        context.bot_data = {"persistent_manager": MagicMock()}
+
+        # No queue entries — should return immediately
+        await orchestrator._drain_queue("key1", update, context)
+
+    async def test_drain_sends_combined_to_claude(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        from src.bot.orchestrator import QueuedMessage
+
+        orchestrator._message_queues["key1"] = [
+            QueuedMessage(
+                text="queued msg",
+                sent_at=1710300000.0,
+                placeholder_message_id=50,
+            ),
+        ]
+
+        mock_response = MagicMock()
+        mock_response.session_id = "drain-session"
+        mock_response.content = "Got your queued message"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
+
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.effective_chat.send_action = AsyncMock()
+        update.effective_chat.delete_message = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"persistent_manager": persistent_manager}
+
+        await orchestrator._drain_queue("key1", update, context)
+
+        # Placeholder deleted
+        update.effective_chat.delete_message.assert_awaited_once_with(50)
+
+        # Claude was called with the combined prompt
+        persistent_manager.send_message.assert_awaited_once()
+        prompt = persistent_manager.send_message.call_args.kwargs["prompt"]
+        assert "queued msg" in prompt
+        assert "queued during your previous turn" in prompt
+
+        # Progress message edited to final state
+        progress_msg.edit_text.assert_called()
+        final_text = progress_msg.edit_text.call_args[0][0]
+        assert "\u2705" in final_text
+
+        # Queue is now empty
+        assert "key1" not in orchestrator._message_queues
+
+    async def test_drain_requeues_on_race(self, agentic_settings, deps):
+        """If send_message returns None (race), re-queue the combined prompt."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        from src.bot.orchestrator import QueuedMessage
+
+        orchestrator._message_queues["key1"] = [
+            QueuedMessage(text="lost msg", sent_at=1710300000.0),
+        ]
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+
+        update = MagicMock()
+        update.effective_chat.delete_message = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"persistent_manager": persistent_manager}
+
+        await orchestrator._drain_queue("key1", update, context)
+
+        # Message was re-queued
+        assert len(orchestrator._message_queues["key1"]) == 1
+        assert "lost msg" in orchestrator._message_queues["key1"][0].text
+
+
+class TestAgenticTextQueuesWhenBusy:
+    """Verify agentic_text queues instead of injecting when client is busy."""
+
+    async def test_busy_client_queues_message(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="busy")
+
+        placeholder_msg = MagicMock()
+        placeholder_msg.message_id = 42
+
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "follow up thought"
+        update.message.message_id = 2
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        # Should NOT have called send_message (queued instead)
+        persistent_manager.send_message.assert_not_called()
+
+        # Should have queued
+        state_key = orchestrator._state_key(update)
+        assert len(orchestrator._message_queues[state_key]) == 1
+        assert orchestrator._message_queues[state_key][0].text == "follow up thought"
+
+    async def test_draining_client_queues_message(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="draining")
+
+        placeholder_msg = MagicMock()
+        placeholder_msg.message_id = 43
+
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "another thought"
+        update.message.message_id = 3
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        persistent_manager.send_message.assert_not_called()
+        state_key = orchestrator._state_key(update)
+        assert len(orchestrator._message_queues[state_key]) == 1
+
+
+class TestActivityLifecycle:
+    """Verify status message lifecycle: Working -> Done/Failed/Stalled."""
+
+    async def test_error_shows_failed_status(self, agentic_settings, deps):
+        """When Claude errors, progress message shows Failed."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(
+            side_effect=Exception("Claude broke")
+        )
+        persistent_manager.get_client_state = MagicMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        progress_msg.edit_text = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "do something"
+        update.message.message_id = 1
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        # Progress message should show failed, not be deleted
+        progress_msg.edit_text.assert_called()
+        final_text = progress_msg.edit_text.call_args[0][0]
+        assert "\u274c" in final_text  # ❌ Failed
+
+    async def test_stall_callback_passed_to_persistent_manager(
+        self, agentic_settings, deps
+    ):
+        """send_message receives a stall_callback."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        mock_response = MagicMock()
+        mock_response.session_id = "session-abc"
+        mock_response.content = "response"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
+        persistent_manager.get_client_state = MagicMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "test"
+        update.message.message_id = 1
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        # stall_callback should have been passed
+        call_kwargs = persistent_manager.send_message.call_args.kwargs
+        assert "stall_callback" in call_kwargs
+        assert callable(call_kwargs["stall_callback"])
+
+    async def test_no_timeout_on_send_message(self, agentic_settings, deps):
+        """send_message is NOT wrapped in wait_for — turns can run indefinitely."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        mock_response = MagicMock()
+        mock_response.session_id = "long-session"
+        mock_response.content = "done after a long time"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
+        persistent_manager.get_client_state = MagicMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.effective_chat.id = 456
+        update.message.text = "do a big task"
+        update.message.message_id = 1
+        update.message.message_thread_id = None
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": agentic_settings,
+            "persistent_manager": persistent_manager,
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+
+        await orchestrator.agentic_text(update, context)
+
+        # send_message called directly (not via wait_for)
+        persistent_manager.send_message.assert_awaited_once()
+        # Stall detection is via callback, not timeout
+        call_kwargs = persistent_manager.send_message.call_args.kwargs
+        assert callable(call_kwargs["stall_callback"])

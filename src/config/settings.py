@@ -16,8 +16,6 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
-    DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
-    DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_TURNS,
     DEFAULT_CLAUDE_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
@@ -83,17 +81,6 @@ class Settings(BaseSettings):
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
     )
-    claude_max_cost_per_user: float = Field(
-        DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
-    )
-    claude_max_cost_per_request: float = Field(
-        DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
-        description="Max cost per individual request (SDK budget cap)",
-    )
-    # NOTE: When changing this list, also update docs/tools.md,
-    # docs/configuration.md, .env.example,
-    # src/claude/facade.py (_get_admin_instructions),
-    # and src/bot/orchestrator.py (_TOOL_ICONS).
     claude_allowed_tools: Optional[List[str]] = Field(
         default=[
             "Read",
@@ -164,8 +151,6 @@ class Settings(BaseSettings):
     mcp_config_path: Optional[Path] = Field(
         None, description="MCP configuration file path"
     )
-    enable_git_integration: bool = Field(True, description="Enable git commands")
-    enable_file_uploads: bool = Field(True, description="Enable file upload handling")
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
@@ -199,7 +184,6 @@ class Settings(BaseSettings):
         ge=1,
         le=200,
     )
-    enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
     agentic_mode: bool = Field(
         True,
         description="Conversational agentic mode (default) vs classic command mode",

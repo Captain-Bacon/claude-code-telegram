@@ -77,6 +77,7 @@ def test_security_relaxation_settings_defaults_and_overrides():
     """Security relaxation settings should default to False and be configurable."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         defaults = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -85,6 +86,7 @@ def test_security_relaxation_settings_defaults_and_overrides():
         assert defaults.disable_tool_validation is False
 
         overridden = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -285,6 +287,7 @@ def test_project_threads_validation_requires_chat_id_in_group_mode(tmp_path):
 
     with pytest.raises(ValidationError) as exc_info:
         Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=str(project_dir),
@@ -345,6 +348,7 @@ def test_project_threads_validation_private_mode_no_chat_id(tmp_path):
     )
 
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test_token",
         telegram_bot_username="test_bot",
         approved_directory=str(project_dir),
@@ -551,8 +555,6 @@ def test_feature_flags():
     settings = create_test_config(
         enable_mcp=True,
         mcp_config_path="/tmp/test_mcp.json",
-        enable_git_integration=True,
-        enable_file_uploads=False,
         enable_token_auth=True,
         auth_token_secret="secret",
     )
@@ -560,18 +562,13 @@ def test_feature_flags():
     features = FeatureFlags(settings)
 
     assert features.mcp_enabled is True
-    assert features.git_enabled is True
-    assert features.file_uploads_enabled is False
     assert features.token_auth_enabled is True
 
     enabled_features = features.get_enabled_features()
     assert "mcp" in enabled_features
-    assert "git" in enabled_features
-    assert "file_uploads" not in enabled_features
     assert "token_auth" in enabled_features
 
     # Test generic feature check
-    assert features.is_feature_enabled("git") is True
     assert features.is_feature_enabled("nonexistent") is False
 
     # Cleanup test file

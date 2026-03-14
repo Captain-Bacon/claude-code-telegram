@@ -153,25 +153,12 @@ def _validate_config(settings: Settings) -> None:
     if settings.claude_timeout_seconds <= 0:
         raise InvalidConfigError("claude_timeout_seconds must be positive")
 
-    # Validate cost limits
-    if settings.claude_max_cost_per_user <= 0:
-        raise InvalidConfigError("claude_max_cost_per_user must be positive")
-
-    if settings.claude_max_cost_per_request <= 0:
-        raise InvalidConfigError("claude_max_cost_per_request must be positive")
-
 
 def _get_enabled_features_summary(settings: Settings) -> list[str]:
     """Get a summary of enabled features for logging."""
     features = []
     if settings.enable_mcp:
         features.append("mcp")
-    if settings.enable_git_integration:
-        features.append("git")
-    if settings.enable_file_uploads:
-        features.append("file_uploads")
-    if settings.enable_quick_actions:
-        features.append("quick_actions")
     if settings.enable_token_auth:
         features.append("token_auth")
     if settings.webhook_url:

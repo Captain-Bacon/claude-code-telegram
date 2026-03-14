@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Telegram bot providing remote access to Claude Code. Python 3.10+, built with Poetry, using `python-telegram-bot` for Telegram and `claude-agent-sdk` for Claude Code integration.
+Telegram bot providing remote access to Claude Code. Python 3.10+, built with Poetry, using `python-telegram-bot` for Telegram and `claude-agent-sdk` for Claude Code integration. Personal tool for executive dysfunction mitigation (brain dumps, tasks, reminders), not developer tooling or community platform.
 
 ## Commands
 
@@ -28,19 +28,23 @@ poetry run mypy src
 
 ### Claude SDK Integration
 
-`ClaudeIntegration` (facade in `src/claude/facade.py`) wraps `ClaudeSDKManager` (`src/claude/sdk_integration.py`), which uses `claude-agent-sdk` with `ClaudeSDKClient` for async streaming. Session IDs come from Claude's `ResultMessage`, not generated locally.
+**`PersistentClientManager`** (`src/claude/persistent.py`) is the only Claude integration path. One long-lived `ClaudeSDKClient` subprocess per Telegram thread, with idle→busy→draining state machine, message injection mid-turn, interrupt support, and per-turn cost deltas.
 
-Sessions auto-resume: per user+directory, persisted in SQLite.
+`ClaudeSDKManager.build_options()` (`src/claude/sdk_integration.py`) builds SDK configuration (system prompt, allowed tools, MCP config).
+
+**SDK injection is undocumented behaviour.** Calling `query()` on a busy client works because the CLI reads stdin continuously — not by design. The draining state handles the ambiguity of whether the CLI produces a continuation ResultMessage. The 120s drain timeout is a guess. See bead 9mb notes for full research.
+
+**No hard timeout on send_message.** Turns can run 25+ minutes when subagents are involved. Stall detection is via the watchdog callback (30s/60s silence thresholds), not a timeout. Do NOT wrap send_message in asyncio.wait_for.
 
 ### Request Flow
 
-**Agentic mode** (default, `AGENTIC_MODE=true`):
+**User messages:**
 
 ```
 Telegram message -> Security middleware (group -3) -> Auth middleware (group -2)
 -> Rate limit (group -1) -> MessageOrchestrator.agentic_text() (group 10)
--> ClaudeIntegration.run_command() -> SDK
--> Response parsed -> Stored in SQLite -> Sent back to Telegram
+-> PersistentClientManager.send_message() -> ClaudeSDKClient (long-lived)
+-> Response streamed -> Sent back to Telegram
 ```
 
 **External triggers** (webhooks, scheduler):
@@ -48,36 +52,34 @@ Telegram message -> Security middleware (group -3) -> Auth middleware (group -2)
 ```
 Webhook POST /webhooks/{provider} -> Signature verification -> Deduplication
 -> Publish WebhookEvent to EventBus -> AgentHandler.handle_webhook()
--> ClaudeIntegration.run_command() -> Publish AgentResponseEvent
+-> PersistentClientManager.send_message() -> Publish AgentResponseEvent
 -> NotificationService -> Rate-limited Telegram delivery
 ```
-
-**Classic mode** (`AGENTIC_MODE=false`): Same middleware chain, but routes through full command/message handlers in `src/bot/handlers/` with 13 commands and inline keyboards.
 
 ### Dependency Injection
 
 Bot handlers access dependencies via `context.bot_data`:
 ```python
 context.bot_data["auth_manager"]
-context.bot_data["claude_integration"]
+context.bot_data["persistent_manager"]
 context.bot_data["storage"]
 context.bot_data["security_validator"]
 ```
 
 ### Key Directories
 
-- `src/config/` -- Pydantic Settings v2 config with env detection, feature flags (`features.py`), YAML project loader (`loader.py`)
-- `src/bot/handlers/` -- Telegram command, message, and callback handlers (classic mode + project thread commands)
+- `src/config/` -- Pydantic Settings v2 config, feature flags (`features.py`), YAML project loader (`loader.py`)
+- `src/bot/orchestrator.py` -- MessageOrchestrator: agentic message routing, stream callbacks, progress messages, project-topic routing
+- `src/bot/media/` -- Voice handler (Parakeet MLX), image handler. Instantiated directly by orchestrator.
 - `src/bot/middleware/` -- Auth, rate limit, security input validation
-- `src/bot/features/` -- Git integration, file handling, quick actions, session export
-- `src/bot/orchestrator.py` -- MessageOrchestrator: routes to agentic or classic handlers, project-topic routing
-- `src/claude/` -- Claude integration facade, SDK/CLI managers, session management, tool monitoring
-- `src/projects/` -- Multi-project support: `registry.py` (YAML project config), `thread_manager.py` (Telegram topic sync/routing)
-- `src/storage/` -- SQLite via aiosqlite, repository pattern (users, sessions, messages, tool_usage, audit_log, cost_tracking, project_threads)
-- `src/security/` -- Multi-provider auth (whitelist + token), input validators (with optional `disable_security_patterns`), rate limiter, audit logging
-- `src/events/` -- EventBus (async pub/sub), event types, AgentHandler, EventSecurityMiddleware
-- `src/api/` -- FastAPI webhook server, GitHub HMAC-SHA256 + Bearer token auth
-- `src/scheduler/` -- APScheduler cron jobs, persistent storage in SQLite
+- `src/bot/utils/` -- Formatting (HTML escape, message chunking), error formatting
+- `src/claude/` -- PersistentClientManager, SDK options builder, session management, tool monitoring
+- `src/projects/` -- Multi-project support: `registry.py` (YAML config), `thread_manager.py` (Telegram topic sync)
+- `src/storage/` -- SQLite via aiosqlite, repository pattern
+- `src/security/` -- Auth (whitelist/token), input validators, rate limiter, audit logging
+- `src/events/` -- EventBus (async pub/sub), event types, AgentHandler
+- `src/api/` -- FastAPI webhook server
+- `src/scheduler/` -- APScheduler cron jobs, SQLite persistence
 - `src/notifications/` -- NotificationService, rate-limited Telegram delivery
 
 ### Security Model
@@ -88,23 +90,21 @@ context.bot_data["security_validator"]
 
 `ToolMonitor` validates Claude's tool calls against allowlist/disallowlist, file path boundaries, and dangerous bash patterns. Tool name validation can be bypassed with `DISABLE_TOOL_VALIDATION=true`.
 
-Webhook authentication: GitHub HMAC-SHA256 signature verification, generic Bearer token for other providers, atomic deduplication via `webhook_events` table.
-
 ### Configuration
 
 Settings loaded from environment variables via Pydantic Settings. Required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `APPROVED_DIRECTORY`. Key optional: `ALLOWED_USERS` (comma-separated Telegram IDs), `ANTHROPIC_API_KEY`, `ENABLE_MCP`, `MCP_CONFIG_PATH`.
 
-Agentic platform settings: `AGENTIC_MODE` (default true), `ENABLE_API_SERVER`, `API_SERVER_PORT` (default 8080), `GITHUB_WEBHOOK_SECRET`, `WEBHOOK_API_SECRET`, `ENABLE_SCHEDULER`, `NOTIFICATION_CHAT_IDS`.
+Platform settings: `ENABLE_API_SERVER`, `API_SERVER_PORT` (default 8080), `GITHUB_WEBHOOK_SECRET`, `WEBHOOK_API_SECRET`, `ENABLE_SCHEDULER`, `NOTIFICATION_CHAT_IDS`.
 
 Security relaxation (trusted environments only): `DISABLE_SECURITY_PATTERNS` (default false), `DISABLE_TOOL_VALIDATION` (default false).
 
 Multi-project topics: `ENABLE_PROJECT_THREADS` (default false), `PROJECT_THREADS_MODE` (`private`|`group`), `PROJECT_THREADS_CHAT_ID` (required for group mode), `PROJECTS_CONFIG_PATH` (path to YAML project registry), `PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS` (default `1.1`, set `0` to disable pacing). See `config/projects.example.yaml`.
 
-Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). Controls how much of Claude's background activity is shown to the user in real-time. 0 = quiet (only final response, typing indicator still active), 1 = normal (tool names + reasoning snippets shown during execution), 2 = detailed (tool names with input summaries + longer reasoning text). Users can override per-session via `/verbose 0|1|2`. A persistent typing indicator is refreshed every ~2 seconds at all levels.
+Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool names + reasoning, 2 = detailed. Users override via `/verbose 0|1|2`. Typing indicator refreshes every ~2 seconds at all levels.
 
-Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`, `VOICE_TRANSCRIPTION_MODEL`. Provider implementation is in `src/bot/features/voice_handler.py`.
+Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`. Implementation in `src/bot/media/voice_handler.py`.
 
-Feature flags in `src/config/features.py` control: MCP, git integration, file uploads, quick actions, session export, image uploads, voice messages, conversation mode, agentic mode, API server, scheduler.
+Feature flags in `src/config/features.py` control: MCP, image uploads, voice messages, API server, scheduler.
 
 ### DateTime Convention
 
@@ -120,18 +120,13 @@ All datetimes use timezone-aware UTC: `datetime.now(UTC)` (not `datetime.utcnow(
 
 ## Adding a New Bot Command
 
-### Agentic mode
-
-Agentic mode commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`. If `ENABLE_PROJECT_THREADS=true`: `/sync_threads`. To add a new command:
+Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`, `/stop`. If `ENABLE_PROJECT_THREADS=true`: `/sync_threads`.
 
 1. Add handler function in `src/bot/orchestrator.py`
 2. Register in `MessageOrchestrator._register_agentic_handlers()`
 3. Add to `MessageOrchestrator.get_bot_commands()` for Telegram's command menu
 4. Add audit logging for the command
 
-### Classic mode
+## Git Workflow
 
-1. Add handler function in `src/bot/handlers/command.py`
-2. Register in `MessageOrchestrator._register_classic_handlers()`
-3. Add to `MessageOrchestrator.get_bot_commands()` for Telegram's command menu
-4. Add audit logging for the command
+Working on branch `cleanup/phase1-strip` (off `feature/persistent-client-v2`). Pre-commit hook: beads auto-flushes issues.jsonl on commit. No other pre-commit framework in use.

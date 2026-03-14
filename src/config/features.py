@@ -19,21 +19,6 @@ class FeatureFlags:
         return self.settings.enable_mcp and self.settings.mcp_config_path is not None
 
     @property
-    def git_enabled(self) -> bool:
-        """Check if Git integration is enabled."""
-        return self.settings.enable_git_integration
-
-    @property
-    def file_uploads_enabled(self) -> bool:
-        """Check if file uploads are enabled."""
-        return self.settings.enable_file_uploads
-
-    @property
-    def quick_actions_enabled(self) -> bool:
-        """Check if quick action buttons are enabled."""
-        return self.settings.enable_quick_actions
-
-    @property
     def telemetry_enabled(self) -> bool:
         """Check if telemetry is enabled."""
         return self.settings.enable_telemetry
@@ -91,9 +76,6 @@ class FeatureFlags:
         """Generic feature check by name."""
         feature_map = {
             "mcp": self.mcp_enabled,
-            "git": self.git_enabled,
-            "file_uploads": self.file_uploads_enabled,
-            "quick_actions": self.quick_actions_enabled,
             "telemetry": self.telemetry_enabled,
             "token_auth": self.token_auth_enabled,
             "webhook": self.webhook_enabled,
@@ -111,12 +93,6 @@ class FeatureFlags:
         features = []
         if self.mcp_enabled:
             features.append("mcp")
-        if self.git_enabled:
-            features.append("git")
-        if self.file_uploads_enabled:
-            features.append("file_uploads")
-        if self.quick_actions_enabled:
-            features.append("quick_actions")
         if self.telemetry_enabled:
             features.append("telemetry")
         if self.token_auth_enabled:

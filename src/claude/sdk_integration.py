@@ -86,45 +86,70 @@ def _make_can_use_tool_callback(
         tool_input: Dict[str, Any],
         context: ToolPermissionContext,
     ) -> Any:
-        # File path validation
-        if tool_name in _FILE_TOOLS:
-            file_path = tool_input.get("file_path") or tool_input.get("path")
-            if file_path:
-                # Allow Claude Code internal paths (~/.claude/plans/, etc.)
-                if _is_claude_internal_path(file_path):
-                    return PermissionResultAllow()
+        import time as _time
 
-                valid, _resolved, error = security_validator.validate_path(
-                    file_path, working_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied file operation",
-                        tool_name=tool_name,
-                        file_path=file_path,
-                        error=error,
-                    )
-                    return PermissionResultDeny(message=error or "Invalid file path")
+        start = _time.time()
+        decision = "allow"
+        error_msg = None
 
-        # Bash directory boundary validation
-        if tool_name in _BASH_TOOLS:
-            command = tool_input.get("command", "")
-            if command:
-                valid, error = check_bash_directory_boundary(
-                    command, working_directory, approved_directory
-                )
-                if not valid:
-                    logger.warning(
-                        "can_use_tool denied bash command",
-                        tool_name=tool_name,
-                        command=command,
-                        error=error,
-                    )
-                    return PermissionResultDeny(
-                        message=error or "Bash directory boundary violation"
-                    )
+        try:
+            # File path validation
+            if tool_name in _FILE_TOOLS:
+                file_path = tool_input.get("file_path") or tool_input.get("path")
+                if file_path:
+                    # Allow Claude Code internal paths (~/.claude/plans/, etc.)
+                    if _is_claude_internal_path(file_path):
+                        return PermissionResultAllow()
 
-        return PermissionResultAllow()
+                    valid, _resolved, error = security_validator.validate_path(
+                        file_path, working_directory
+                    )
+                    if not valid:
+                        decision = "deny"
+                        error_msg = error
+                        return PermissionResultDeny(message=error or "Invalid file path")
+
+            # Bash directory boundary validation
+            if tool_name in _BASH_TOOLS:
+                command = tool_input.get("command", "")
+                if command:
+                    valid, error = check_bash_directory_boundary(
+                        command, working_directory, approved_directory
+                    )
+                    if not valid:
+                        decision = "deny"
+                        error_msg = error
+                        return PermissionResultDeny(
+                            message=error or "Bash directory boundary violation"
+                        )
+
+            return PermissionResultAllow()
+
+        except Exception as e:
+            # CRITICAL: Always return a result. An unhandled exception here
+            # means the CLI never gets a permission response and waits forever
+            # — this is a potential stall cause.
+            decision = "error"
+            error_msg = str(e)
+            logger.error(
+                "control.tool_check.error",
+                tool_name=tool_name,
+                error=error_msg,
+                error_type=type(e).__name__,
+            )
+            return PermissionResultDeny(
+                message=f"Internal error checking permission: {e}"
+            )
+
+        finally:
+            elapsed_ms = round((_time.time() - start) * 1000, 1)
+            logger.info(
+                "control.tool_check",
+                tool_name=tool_name,
+                decision=decision,
+                elapsed_ms=elapsed_ms,
+                error=error_msg,
+            )
 
     return can_use_tool
 
@@ -148,6 +173,130 @@ class ClaudeSDKManager:
             logger.info("Using provided API key for Claude SDK authentication")
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
+
+    def build_options(
+        self,
+        working_directory: Path,
+        model: Optional[str] = None,
+        session_id: Optional[str] = None,
+        continue_session: bool = False,
+        include_partial_messages: bool = False,
+        stderr_callback: Optional[Callable[[str], None]] = None,
+    ) -> ClaudeAgentOptions:
+        """Build ClaudeAgentOptions for either fire-and-forget or persistent use.
+
+        Shared options builder used by both execute_command() and
+        PersistentClientManager. Handles system prompt loading, MCP config,
+        tool validation, sandbox settings, and session resumption.
+        """
+        # Build system prompt as a plain string (replaces the default Claude
+        # Code SWE prompt). This is intentional — the SWE prompt's
+        # action-oriented personality conflicts with the bot's use case.
+        # CLAUDE.md in the working directory shapes the bot's behaviour.
+        base_prompt = (
+            f"All file operations must stay within {working_directory}. "
+            "Use relative paths."
+        )
+        claude_md_path = Path(working_directory) / "CLAUDE.md"
+        if claude_md_path.exists():
+            base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+            logger.info(
+                "Loaded CLAUDE.md into system prompt",
+                path=str(claude_md_path),
+            )
+
+        # Add scheduler API instructions if both API server and scheduler
+        # are enabled, so Claude can create/list/remove cron jobs.
+        if (
+            self.config.enable_api_server
+            and self.config.enable_scheduler
+            and self.config.webhook_api_secret
+        ):
+            api_port = self.config.api_server_port
+            api_secret = self.config.webhook_api_secret
+            base_prompt += f"""
+
+## Scheduler API
+
+You can create, list, and remove scheduled cron jobs using these HTTP endpoints on the local API server. Use WebFetch to call them.
+
+**Authentication**: Include the header `Authorization: Bearer {api_secret}` with every request.
+
+**Base URL**: `http://localhost:{api_port}`
+
+### Create a job
+POST http://localhost:{api_port}/scheduler/jobs
+Content-Type: application/json
+
+Body: {{"name": "daily-standup", "cron_expression": "0 9 * * 1-5", "prompt": "Give me a morning status update", "description": "Optional description"}}
+
+Response: {{"status": "created", "job_id": "<id>"}}
+
+### List all jobs
+GET http://localhost:{api_port}/scheduler/jobs
+
+Response: [{{"job_id": "<id>", "name": "...", "cron_expression": "...", "prompt": "...", "next_run_time": "..."}}]
+
+### Remove a job
+DELETE http://localhost:{api_port}/scheduler/jobs/<job_id>
+
+Response: {{"status": "deleted", "job_id": "<id>"}}
+
+Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every 30 min), "0 0 * * 0" (weekly Sunday midnight).
+"""
+
+        # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
+        # tools so the SDK does not restrict tool usage (e.g. MCP tools).
+        if self.config.disable_tool_validation:
+            sdk_allowed_tools = None
+            sdk_disallowed_tools = None
+        else:
+            sdk_allowed_tools = self.config.claude_allowed_tools
+            sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+        options = ClaudeAgentOptions(
+            max_turns=self.config.claude_max_turns,
+            model=model or self.config.claude_model or None,
+            cwd=str(working_directory),
+            allowed_tools=sdk_allowed_tools,
+            disallowed_tools=sdk_disallowed_tools,
+            cli_path=self.config.claude_cli_path or None,
+            include_partial_messages=include_partial_messages,
+            sandbox={
+                "enabled": self.config.sandbox_enabled,
+                "autoAllowBashIfSandboxed": True,
+                "excludedCommands": self.config.sandbox_excluded_commands or [],
+            },
+            system_prompt=base_prompt,
+            setting_sources=["project", "user"],
+            stderr=stderr_callback,
+        )
+
+        # Pass MCP server configuration if enabled
+        if self.config.enable_mcp and self.config.mcp_config_path:
+            options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
+            logger.info(
+                "MCP servers configured",
+                mcp_config_path=str(self.config.mcp_config_path),
+            )
+
+        # Wire can_use_tool callback for preventive tool validation
+        if self.security_validator:
+            options.can_use_tool = _make_can_use_tool_callback(
+                security_validator=self.security_validator,
+                working_directory=working_directory,
+                approved_directory=self.config.approved_directory,
+            )
+
+        # Resume previous session if we have a session_id
+        if session_id and continue_session:
+            options.resume = session_id
+            logger.info(
+                "Resuming previous session",
+                session_id=session_id,
+            )
+
+        return options
 
     async def execute_command(
         self,
@@ -176,71 +325,14 @@ class ClaudeSDKManager:
                 stderr_lines.append(line)
                 logger.debug("Claude CLI stderr", line=line)
 
-            # Build system prompt, loading CLAUDE.md from working directory if present
-            base_prompt = (
-                f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
-            )
-            claude_md_path = Path(working_directory) / "CLAUDE.md"
-            if claude_md_path.exists():
-                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
-                logger.info(
-                    "Loaded CLAUDE.md into system prompt",
-                    path=str(claude_md_path),
-                )
-
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
-            if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
-            else:
-                sdk_allowed_tools = self.config.claude_allowed_tools
-                sdk_disallowed_tools = self.config.claude_disallowed_tools
-
-            # Build Claude Agent options
-            options = ClaudeAgentOptions(
-                max_turns=self.config.claude_max_turns,
-                model=model or self.config.claude_model or None,
-                max_budget_usd=self.config.claude_max_cost_per_request,
-                cwd=str(working_directory),
-                allowed_tools=sdk_allowed_tools,
-                disallowed_tools=sdk_disallowed_tools,
-                cli_path=self.config.claude_cli_path or None,
+            options = self.build_options(
+                working_directory=working_directory,
+                model=model,
+                session_id=session_id,
+                continue_session=continue_session,
                 include_partial_messages=stream_callback is not None,
-                sandbox={
-                    "enabled": self.config.sandbox_enabled,
-                    "autoAllowBashIfSandboxed": True,
-                    "excludedCommands": self.config.sandbox_excluded_commands or [],
-                },
-                system_prompt=base_prompt,
-                setting_sources=["project", "user"],
-                stderr=_stderr_callback,
+                stderr_callback=_stderr_callback,
             )
-
-            # Pass MCP server configuration if enabled
-            if self.config.enable_mcp and self.config.mcp_config_path:
-                options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
-                logger.info(
-                    "MCP servers configured",
-                    mcp_config_path=str(self.config.mcp_config_path),
-                )
-
-            # Wire can_use_tool callback for preventive tool validation
-            if self.security_validator:
-                options.can_use_tool = _make_can_use_tool_callback(
-                    security_validator=self.security_validator,
-                    working_directory=working_directory,
-                    approved_directory=self.config.approved_directory,
-                )
-
-            # Resume previous session if we have a session_id
-            if session_id and continue_session:
-                options.resume = session_id
-                logger.info(
-                    "Resuming previous session",
-                    session_id=session_id,
-                )
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []

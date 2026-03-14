@@ -13,8 +13,10 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from ..config.settings import Settings
 from ..events.bus import EventBus
 from ..events.types import WebhookEvent
+from ..scheduler.scheduler import JobScheduler
 from ..storage.database import DatabaseManager
 from .auth import verify_github_signature, verify_shared_secret
+from .scheduler_routes import create_scheduler_router
 
 logger = structlog.get_logger()
 
@@ -23,6 +25,7 @@ def create_api_app(
     event_bus: EventBus,
     settings: Settings,
     db_manager: Optional[DatabaseManager] = None,
+    scheduler: Optional[JobScheduler] = None,
 ) -> FastAPI:
     """Create the FastAPI application."""
 
@@ -130,6 +133,15 @@ def create_api_app(
 
         return {"status": "accepted", "event_id": event.id}
 
+    # Mount scheduler routes if a scheduler instance was provided
+    if scheduler is not None:
+        scheduler_router = create_scheduler_router(
+            scheduler=scheduler,
+            webhook_api_secret=settings.webhook_api_secret,
+        )
+        app.include_router(scheduler_router)
+        logger.info("Scheduler API routes mounted")
+
     return app
 
 
@@ -176,11 +188,12 @@ async def run_api_server(
     event_bus: EventBus,
     settings: Settings,
     db_manager: Optional[DatabaseManager] = None,
+    scheduler: Optional[JobScheduler] = None,
 ) -> None:
     """Run the FastAPI server using uvicorn."""
     import uvicorn
 
-    app = create_api_app(event_bus, settings, db_manager)
+    app = create_api_app(event_bus, settings, db_manager, scheduler)
 
     config = uvicorn.Config(
         app=app,
