@@ -81,10 +81,6 @@ class Settings(BaseSettings):
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
     )
-    # NOTE: When changing this list, also update docs/tools.md,
-    # docs/configuration.md, .env.example,
-    # src/claude/facade.py (_get_admin_instructions),
-    # and src/bot/orchestrator.py (_TOOL_ICONS).
     claude_allowed_tools: Optional[List[str]] = Field(
         default=[
             "Read",
@@ -155,8 +151,6 @@ class Settings(BaseSettings):
     mcp_config_path: Optional[Path] = Field(
         None, description="MCP configuration file path"
     )
-    enable_git_integration: bool = Field(True, description="Enable git commands")
-    enable_file_uploads: bool = Field(True, description="Enable file upload handling")
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
@@ -190,7 +184,6 @@ class Settings(BaseSettings):
         ge=1,
         le=200,
     )
-    enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
     agentic_mode: bool = Field(
         True,
         description="Conversational agentic mode (default) vs classic command mode",

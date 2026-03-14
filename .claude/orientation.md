@@ -1,14 +1,14 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Epic kyj (strip and restructure) is well advanced. Classic mode, facade, budget enforcement all removed. Message queuing (ceq) and activity lifecycle (18q) implemented — the two highest-value user-facing changes. Next logical step: orchestrator restructure (amv) which is now unblocked. The bot is a personal executive dysfunction tool, not developer tooling.
+Epic kyj (strip and restructure) is well advanced. Classic mode, facade, budget enforcement all removed. Message queuing (ceq), activity lifecycle (18q), and orchestrator restructure (amv) all done. Remaining open items are investigations (worktree isolation, linter interference, SDK injection research) and a lower-priority feature (scheduler target_chat_ids). The bot is a personal executive dysfunction tool, not developer tooling.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
 
 ```
 Telegram -> PTB middleware (security -> auth -> rate limit)
-  -> MessageOrchestrator (src/bot/orchestrator.py, ~1,917 lines)
+  -> MessageOrchestrator (src/bot/orchestrator.py, ~1,813 lines)
     -> PersistentClientManager -> ClaudeSDKClient (long-lived subprocess per thread)
     -> Stream callbacks: src/bot/stream_handler.py (make_stream_callback, flush, cleanup)
     -> Message queuing: _enqueue_message / _drain_queue (busy path)
@@ -70,6 +70,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 | Where are stream callback functions? | src/bot/stream_handler.py (sole location) |
 | Where are voice/image handlers? | src/bot/media/ |
 | Where is message queuing? | src/bot/orchestrator.py — _enqueue_message, _drain_queue, _combine_queued_messages |
+| Where is response delivery? | src/bot/orchestrator.py — _deliver_turn_result (shared by all message types) |
 
 <!-- Gotchas -->
 ## Gotchas
@@ -80,4 +81,3 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Voice transcription uses Parakeet MLX locally, not cloud providers
 - Scheduler jobs without target_chat_ids fall back to NOTIFICATION_CHAT_IDS (bead lcs)
 - **Worktree isolation doesn't work** — agents modify main repo directly
-- Document/voice/photo handlers still delete progress_msg instead of editing to final state (only agentic_text and _drain_queue use the new lifecycle)

@@ -159,12 +159,6 @@ def _get_enabled_features_summary(settings: Settings) -> list[str]:
     features = []
     if settings.enable_mcp:
         features.append("mcp")
-    if settings.enable_git_integration:
-        features.append("git")
-    if settings.enable_file_uploads:
-        features.append("file_uploads")
-    if settings.enable_quick_actions:
-        features.append("quick_actions")
     if settings.enable_token_auth:
         features.append("token_auth")
     if settings.webhook_url:
