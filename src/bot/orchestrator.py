@@ -1493,6 +1493,8 @@ class MessageOrchestrator:
         from .media.voice_handler import VoiceHandler
 
         voice_key_available = (
+            self.settings.voice_provider == "parakeet"
+        ) or (
             self.settings.voice_provider == "openai"
             and self.settings.openai_api_key
         ) or (
