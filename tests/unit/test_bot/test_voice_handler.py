@@ -352,3 +352,118 @@ async def test_transcribe_openai_reuses_cached_client(openai_voice_handler):
 
     openai_ctor.assert_called_once_with(api_key="test-openai-key")
     assert mock_transcriptions.create.await_count == 2
+
+
+# --- Parakeet provider tests ---
+
+
+@pytest.fixture
+def parakeet_config():
+    """Create a mock config with Parakeet settings."""
+    cfg = MagicMock()
+    cfg.voice_provider = "parakeet"
+    cfg.resolved_voice_model = "mlx-community/parakeet-tdt-0.6b-v2"
+    cfg.voice_max_file_size_mb = 20
+    cfg.voice_max_file_size_bytes = 20 * 1024 * 1024
+    return cfg
+
+
+@pytest.fixture
+def parakeet_voice_handler(parakeet_config):
+    """Create a VoiceHandler instance with Parakeet config."""
+    return VoiceHandler(config=parakeet_config)
+
+
+async def test_process_voice_message_parakeet(parakeet_voice_handler):
+    """process_voice_message transcribes via Parakeet MLX."""
+    voice = _mock_voice(duration=5)
+
+    mock_result = MagicMock()
+    mock_result.text = "  Hello from Parakeet.  "
+
+    mock_model = MagicMock()
+    mock_model.transcribe = MagicMock(return_value=mock_result)
+    mock_from_pretrained = MagicMock(return_value=mock_model)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(
+            sys.modules,
+            "parakeet_mlx",
+            SimpleNamespace(from_pretrained=mock_from_pretrained),
+        )
+        result = await parakeet_voice_handler.process_voice_message(
+            voice, caption=None
+        )
+
+    assert isinstance(result, ProcessedVoice)
+    assert result.transcription == "Hello from Parakeet."
+    assert result.duration == 5
+    assert "Voice message transcription:" in result.prompt
+
+    mock_from_pretrained.assert_called_once_with(
+        "mlx-community/parakeet-tdt-0.6b-v2"
+    )
+    mock_model.transcribe.assert_called_once()
+
+
+async def test_transcribe_parakeet_missing_dependency(parakeet_voice_handler):
+    """Missing parakeet-mlx package returns a clear install hint."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(sys.modules, "parakeet_mlx", None)
+        with pytest.raises(RuntimeError, match="Optional dependency 'parakeet-mlx'"):
+            await parakeet_voice_handler._transcribe_parakeet(b"fake-ogg")
+
+
+async def test_transcribe_parakeet_empty_response(parakeet_voice_handler):
+    """Parakeet empty transcriptions are rejected."""
+    mock_result = MagicMock()
+    mock_result.text = ""
+    mock_model = MagicMock()
+    mock_model.transcribe = MagicMock(return_value=mock_result)
+    mock_from_pretrained = MagicMock(return_value=mock_model)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(
+            sys.modules,
+            "parakeet_mlx",
+            SimpleNamespace(from_pretrained=mock_from_pretrained),
+        )
+        with pytest.raises(ValueError, match="empty response"):
+            await parakeet_voice_handler._transcribe_parakeet(b"fake-ogg")
+
+
+async def test_transcribe_parakeet_reuses_cached_model(parakeet_voice_handler):
+    """Parakeet model is loaded once and reused across calls."""
+    mock_result = MagicMock()
+    mock_result.text = "ok"
+    mock_model = MagicMock()
+    mock_model.transcribe = MagicMock(return_value=mock_result)
+    mock_from_pretrained = MagicMock(return_value=mock_model)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(
+            sys.modules,
+            "parakeet_mlx",
+            SimpleNamespace(from_pretrained=mock_from_pretrained),
+        )
+        await parakeet_voice_handler._transcribe_parakeet(b"a")
+        await parakeet_voice_handler._transcribe_parakeet(b"b")
+
+    mock_from_pretrained.assert_called_once()
+    assert mock_model.transcribe.call_count == 2
+
+
+async def test_transcribe_parakeet_error_wrapping(parakeet_voice_handler):
+    """Parakeet errors are wrapped without leaking internals."""
+    mock_model = MagicMock()
+    mock_model.transcribe = MagicMock(side_effect=RuntimeError("MLX internal error"))
+    mock_from_pretrained = MagicMock(return_value=mock_model)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(
+            sys.modules,
+            "parakeet_mlx",
+            SimpleNamespace(from_pretrained=mock_from_pretrained),
+        )
+        with pytest.raises(RuntimeError, match="Parakeet transcription failed"):
+            await parakeet_voice_handler._transcribe_parakeet(b"fake-ogg")

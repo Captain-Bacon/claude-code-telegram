@@ -1,7 +1,9 @@
-"""Handle voice message transcription via Mistral (Voxtral) or OpenAI (Whisper)."""
+"""Handle voice message transcription via Parakeet MLX, Mistral, or OpenAI."""
 
+import tempfile
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Optional
 
 import structlog
@@ -22,12 +24,13 @@ class ProcessedVoice:
 
 
 class VoiceHandler:
-    """Transcribe Telegram voice messages using Mistral or OpenAI."""
+    """Transcribe Telegram voice messages using Parakeet MLX, Mistral, or OpenAI."""
 
     def __init__(self, config: Settings):
         self.config = config
         self._mistral_client: Optional[Any] = None
         self._openai_client: Optional[Any] = None
+        self._parakeet_model: Optional[Any] = None
 
     def _ensure_allowed_file_size(self, file_size: Optional[int]) -> None:
         """Reject files that exceed the configured max size."""
@@ -79,7 +82,9 @@ class VoiceHandler:
             file_size=initial_file_size or resolved_file_size or len(voice_bytes),
         )
 
-        if self.config.voice_provider == "openai":
+        if self.config.voice_provider == "parakeet":
+            transcription = await self._transcribe_parakeet(voice_bytes)
+        elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
         else:
             transcription = await self._transcribe_mistral(voice_bytes)
@@ -102,6 +107,55 @@ class VoiceHandler:
             transcription=transcription,
             duration=duration_secs,
         )
+
+    async def _transcribe_parakeet(self, voice_bytes: bytes) -> str:
+        """Transcribe audio locally using Parakeet MLX."""
+        import asyncio
+
+        model = self._get_parakeet_model()
+
+        def _run_transcription() -> str:
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=True) as tmp:
+                tmp.write(voice_bytes)
+                tmp.flush()
+                result = model.transcribe(Path(tmp.name))
+            return (result.text or "").strip()
+
+        try:
+            text = await asyncio.get_event_loop().run_in_executor(
+                None, _run_transcription
+            )
+        except Exception as exc:
+            logger.warning(
+                "Parakeet transcription failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise RuntimeError("Parakeet transcription failed.") from exc
+
+        if not text:
+            raise ValueError("Parakeet transcription returned an empty response.")
+        return text
+
+    def _get_parakeet_model(self) -> Any:
+        """Load and cache the Parakeet MLX model on first use."""
+        if self._parakeet_model is not None:
+            return self._parakeet_model
+
+        try:
+            import parakeet_mlx
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Optional dependency 'parakeet-mlx' is missing. "
+                "Install voice-local extras: "
+                'pip install "claude-code-telegram[voice-local]"'
+            ) from exc
+
+        logger.info("Loading Parakeet model", model=self.config.resolved_voice_model)
+        self._parakeet_model = parakeet_mlx.from_pretrained(
+            self.config.resolved_voice_model
+        )
+        return self._parakeet_model
 
     async def _transcribe_mistral(self, voice_bytes: bytes) -> str:
         """Transcribe audio using the Mistral API (Voxtral)."""
