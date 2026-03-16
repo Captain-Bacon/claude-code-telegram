@@ -102,9 +102,9 @@ Multi-project topics: `ENABLE_PROJECT_THREADS` (default false), `PROJECT_THREADS
 
 Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool names + reasoning, 2 = detailed. Users override via `/verbose 0|1|2`. Typing indicator refreshes every ~2 seconds at all levels.
 
-Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`. Implementation in `src/bot/media/voice_handler.py`.
+Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`|`parakeet`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`, `PARAKEET_MODEL`. Parakeet runs locally on Apple Silicon via MLX — no API key needed. Implementation in `src/bot/media/voice_handler.py`.
 
-Feature flags in `src/config/features.py` control: MCP, image uploads, voice messages, API server, scheduler.
+Feature flags in `src/config/features.py` control: MCP, voice messages, API server, scheduler.
 
 ### DateTime Convention
 
@@ -129,4 +129,4 @@ Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`
 
 ## Git Workflow
 
-Working on branch `cleanup/phase1-strip` (off `feature/persistent-client-v2`). Pre-commit hook: beads auto-flushes issues.jsonl on commit. No other pre-commit framework in use.
+Working on `main`. Feature branches `cleanup/phase1-strip` and `feature/persistent-client-v2` have been merged. Pre-commit hook: beads auto-flushes issues.jsonl on commit. No other pre-commit framework in use.
