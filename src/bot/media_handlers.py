@@ -8,9 +8,6 @@ Registered by orchestrator._register_agentic_handlers via wrapper
 functions that bind settings (handlers take settings as first arg,
 PTB expects update+context only).
 
-WARNING: agentic_voice checks voice provider availability inline.
-This duplicates logic in FeatureFlags.voice_messages_enabled —
-adding a new provider requires updating BOTH. See bead 0cz.
 """
 
 import asyncio
@@ -22,6 +19,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ..claude.persistent import PersistentClientManager, derive_state_key
+from ..config.features import FeatureFlags
 from ..config.settings import Settings
 from .delivery import deliver_turn_result, start_typing_heartbeat
 from .stream_handler import flush_stream_callback, make_stream_callback
@@ -181,16 +179,7 @@ async def agentic_voice(
 
     from .media.voice_handler import VoiceHandler
 
-    voice_key_available = (
-        settings.voice_provider == "parakeet"
-    ) or (
-        settings.voice_provider == "openai"
-        and settings.openai_api_key
-    ) or (
-        settings.voice_provider == "mistral"
-        and settings.mistral_api_key
-    )
-    if not (settings.enable_voice_messages and voice_key_available):
+    if not FeatureFlags(settings).voice_messages_enabled:
         await update.message.reply_text(_voice_unavailable_message(settings))
         return
 

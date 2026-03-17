@@ -41,7 +41,6 @@ def bot(mock_settings):
         "rate_limiter": MagicMock(),
         "audit_logger": MagicMock(),
         "storage": MagicMock(),
-        "claude_integration": MagicMock(),
     }
     return ClaudeCodeBot(mock_settings, deps)
 

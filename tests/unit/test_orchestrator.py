@@ -75,7 +75,6 @@ def private_thread_settings(tmp_dir):
 @pytest.fixture
 def deps():
     return {
-        "claude_integration": MagicMock(),
         "storage": MagicMock(),
         "security_validator": MagicMock(),
         "rate_limiter": MagicMock(),

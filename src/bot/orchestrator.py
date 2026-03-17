@@ -208,8 +208,6 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
-        # Track active Claude tasks per user so /stop can cancel them (legacy)
-        self._active_tasks: Dict[int, asyncio.Task] = {}  # type: ignore[type-arg]
         # Message queue per state_key — messages received while Claude is busy
         self._message_queues: Dict[str, List[QueuedMessage]] = {}
 
@@ -1124,24 +1122,12 @@ class MessageOrchestrator:
 
             context.user_data["current_directory"] = target_path
 
-            # Try to find a resumable session
-            claude_integration = context.bot_data.get("claude_integration")
-            session_id = None
-            if claude_integration:
-                existing = await claude_integration._find_resumable_session(
-                    update.effective_user.id, target_path
-                )
-                if existing:
-                    session_id = existing.session_id
-            context.user_data["claude_session_id"] = session_id
-
             is_git = (target_path / ".git").is_dir()
             git_badge = " (git)" if is_git else ""
-            session_badge = " · session resumed" if session_id else ""
 
             await update.message.reply_text(
                 f"Switched to <code>{escape_html(target_name)}/</code>"
-                f"{git_badge}{session_badge}",
+                f"{git_badge}",
                 parse_mode="HTML",
             )
             return
@@ -1217,24 +1203,12 @@ class MessageOrchestrator:
 
         context.user_data["current_directory"] = new_path
 
-        # Look for a resumable session instead of always clearing
-        claude_integration = context.bot_data.get("claude_integration")
-        session_id = None
-        if claude_integration:
-            existing = await claude_integration._find_resumable_session(
-                query.from_user.id, new_path
-            )
-            if existing:
-                session_id = existing.session_id
-        context.user_data["claude_session_id"] = session_id
-
         is_git = (new_path / ".git").is_dir()
         git_badge = " (git)" if is_git else ""
-        session_badge = " · session resumed" if session_id else ""
 
         await query.edit_message_text(
             f"Switched to <code>{escape_html(project_name)}/</code>"
-            f"{git_badge}{session_badge}",
+            f"{git_badge}",
             parse_mode="HTML",
         )
 
