@@ -23,7 +23,7 @@ One persistent client per Telegram thread (keyed by chat_id:thread_id or chat_id
 
 External triggers: EventBus -> AgentHandler -> PersistentClientManager.
 
-Voice/image: `src/bot/media/` — orchestrator instantiates handlers directly.
+Voice/image: `src/bot/media_handlers.py` (Telegram-facing) delegates to `src/bot/media/` (processing).
 
 Dependencies injected via context.bot_data dict, wired in main.py.
 
@@ -52,6 +52,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Draining state relies on undocumented SDK behaviour with 120s timeout guess
 - **Worktree agent isolation DOES NOT WORK** — agents write to main repo. Do not use `isolation: "worktree"`.
 - **Linter/autoformatter modifies files between Edit reads and writes** — cause unknown, likely IDE
+- `/repo` session resume is silently broken — `claude_integration` never set in bot_data (bead lqj)
 
 <!-- What hasn't been decided -->
 ## Open Questions
