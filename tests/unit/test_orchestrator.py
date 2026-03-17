@@ -332,7 +332,7 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):
     """Agentic document handler rejects files over 10MB."""
-    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    from src.bot.media_handlers import agentic_document
 
     update = MagicMock()
     update.effective_user.id = 123
@@ -343,7 +343,7 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
     context = MagicMock()
     context.bot_data = {"security_validator": None}
 
-    await orchestrator.agentic_document(update, context)
+    await agentic_document(agentic_settings, update, context)
 
     call_args = update.message.reply_text.call_args
     assert "too large" in call_args.args[0].lower()
@@ -351,10 +351,11 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
 
 async def test_agentic_voice_calls_claude(agentic_settings, deps):
     """Agentic voice handler transcribes and routes prompt via persistent manager."""
+    from src.bot.media_handlers import agentic_voice as _agentic_voice
+
     agentic_settings.enable_voice_messages = True
     agentic_settings.voice_provider = "mistral"
     agentic_settings.mistral_api_key = "test-key"
-    orchestrator = MessageOrchestrator(agentic_settings, deps)
 
     mock_response = MagicMock()
     mock_response.session_id = "voice-session-123"
@@ -398,7 +399,7 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     }
 
     with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
-        await orchestrator.agentic_voice(update, context)
+        await _agentic_voice(agentic_settings, update, context)
 
     mock_voice_handler.process_voice_message.assert_awaited_once_with(
         update.message.voice, "please summarize"
@@ -409,12 +410,13 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
 
 async def test_agentic_voice_missing_handler_is_provider_aware(tmp_path, deps):
     """Missing voice handler guidance references the configured provider key."""
+    from src.bot.media_handlers import agentic_voice as _agentic_voice
+
     settings = create_test_config(
         approved_directory=str(tmp_path),
         agentic_mode=True,
         voice_provider="openai",
     )
-    orchestrator = MessageOrchestrator(settings, deps)
 
     features = MagicMock()
     features.get_voice_handler.return_value = None
@@ -427,7 +429,7 @@ async def test_agentic_voice_missing_handler_is_provider_aware(tmp_path, deps):
     context.bot_data = {"features": features}
     context.user_data = {}
 
-    await orchestrator.agentic_voice(update, context)
+    await _agentic_voice(settings, update, context)
 
     call_args = update.message.reply_text.call_args
     assert "OPENAI_API_KEY" in call_args.args[0]
@@ -437,10 +439,11 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
     agentic_settings, deps
 ):
     """Transcription failures are shown to users and do not call Claude."""
+    from src.bot.media_handlers import agentic_voice as _agentic_voice
+
     agentic_settings.enable_voice_messages = True
     agentic_settings.voice_provider = "mistral"
     agentic_settings.mistral_api_key = "test-key"
-    orchestrator = MessageOrchestrator(agentic_settings, deps)
 
     mock_voice_handler = MagicMock()
     mock_voice_handler.process_voice_message = AsyncMock(
@@ -469,7 +472,7 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
     }
 
     with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
-        await orchestrator.agentic_voice(update, context)
+        await _agentic_voice(agentic_settings, update, context)
 
     progress_msg.edit_text.assert_awaited_once()
     error_text = progress_msg.edit_text.call_args.args[0]
@@ -625,11 +628,12 @@ class TestTypingHeartbeat:
 
     async def test_heartbeat_sends_typing_action(self, agentic_settings, deps):
         """Heartbeat sends typing actions at the configured interval."""
+        from src.bot.delivery import start_typing_heartbeat
+
         chat = AsyncMock()
         chat.send_action = AsyncMock()
 
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
-        heartbeat = orchestrator._start_typing_heartbeat(chat, interval=0.05)
+        heartbeat = start_typing_heartbeat(chat, interval=0.05)
 
         # Let the heartbeat fire a few times
         await asyncio.sleep(0.2)
@@ -645,9 +649,10 @@ class TestTypingHeartbeat:
 
     async def test_heartbeat_cancels_cleanly(self, agentic_settings, deps):
         """Cancelling the heartbeat task does not raise."""
+        from src.bot.delivery import start_typing_heartbeat
+
         chat = AsyncMock()
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
-        heartbeat = orchestrator._start_typing_heartbeat(chat, interval=0.05)
+        heartbeat = start_typing_heartbeat(chat, interval=0.05)
 
         heartbeat.cancel()
         # Should not raise
@@ -670,8 +675,9 @@ class TestTypingHeartbeat:
 
         chat.send_action = flaky_send_action
 
-        orchestrator = MessageOrchestrator(agentic_settings, deps)
-        heartbeat = orchestrator._start_typing_heartbeat(chat, interval=0.05)
+        from src.bot.delivery import start_typing_heartbeat
+
+        heartbeat = start_typing_heartbeat(chat, interval=0.05)
 
         await asyncio.sleep(0.3)
         heartbeat.cancel()
