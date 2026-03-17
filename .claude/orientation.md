@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Epic kyj (strip and restructure) merged to main. All structural work complete. Orchestrator split done (7yi closed) — delivery.py and media_handlers.py extracted. Remaining open items are investigations (worktree isolation, linter interference, SDK injection research), voice provider duplication fix (0cz), and a lower-priority feature (scheduler target_chat_ids). The bot is a personal executive dysfunction tool, not developer tooling.
+Epic kyj (strip and restructure) merged to main. All structural work complete. Orchestrator split done — delivery.py and media_handlers.py extracted. Dead code cleaned (session resume, _active_tasks, voice duplication consolidated). Remaining open items are investigations (worktree isolation, linter interference, SDK injection research) and a lower-priority feature (scheduler target_chat_ids). The bot is a personal executive dysfunction tool, not developer tooling.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -38,7 +38,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - `src/bot/stream_handler.py` is the single source for stream callback logic. Orchestrator imports and calls `make_stream_callback(settings, ...)`.
 - Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from orchestrator's agentic_text, _drain_queue, and media_handlers). To change how responses are formatted or sent — edit delivery.py, not callers.
 - Media handler registration in orchestrator uses inline wrappers to bind settings — adding a new media handler requires a wrapper in `_register_agentic_handlers`.
-- Voice provider availability is checked in TWO places: `FeatureFlags.voice_messages_enabled` AND `media_handlers.agentic_voice` (inline `voice_key_available` block). Adding a new provider requires updating both. Bead 0cz tracks consolidating this.
+- Voice provider availability: `FeatureFlags.voice_messages_enabled` is the single source of truth. `media_handlers.agentic_voice` calls it. Adding a new provider: update FeatureFlags only.
 
 <!-- Verify before trusting: claims that could be stale -->
 ## Verify Before Trusting
@@ -52,7 +52,6 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Draining state relies on undocumented SDK behaviour with 120s timeout guess
 - **Worktree agent isolation DOES NOT WORK** — agents write to main repo. Do not use `isolation: "worktree"`.
 - **Linter/autoformatter modifies files between Edit reads and writes** — cause unknown, likely IDE
-- `/repo` session resume is silently broken — `claude_integration` never set in bot_data (bead lqj)
 
 <!-- What hasn't been decided -->
 ## Open Questions
