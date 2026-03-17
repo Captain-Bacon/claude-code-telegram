@@ -69,8 +69,10 @@ context.bot_data["security_validator"]
 ### Key Directories
 
 - `src/config/` -- Pydantic Settings v2 config, feature flags (`features.py`), YAML project loader (`loader.py`)
-- `src/bot/orchestrator.py` -- MessageOrchestrator: agentic message routing, stream callbacks, progress messages, project-topic routing
-- `src/bot/media/` -- Voice handler (Parakeet MLX), image handler. Instantiated directly by orchestrator.
+- `src/bot/orchestrator.py` -- MessageOrchestrator: handler registration, commands, agentic_text, message queuing, thread routing
+- `src/bot/delivery.py` -- Response delivery: turn result formatting, image sending, context warnings, typing heartbeat
+- `src/bot/media_handlers.py` -- Telegram-facing document/photo/voice handlers (routes to media/ for processing)
+- `src/bot/media/` -- Voice transcription (Parakeet MLX), image processing
 - `src/bot/middleware/` -- Auth, rate limit, security input validation
 - `src/bot/utils/` -- Formatting (HTML escape, message chunking), error formatting
 - `src/claude/` -- PersistentClientManager, SDK options builder, session management, tool monitoring

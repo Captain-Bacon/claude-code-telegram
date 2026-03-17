@@ -1,18 +1,19 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Epic kyj (strip and restructure) merged to main. All structural work complete. Remaining open items are investigations (worktree isolation, linter interference, SDK injection research), orchestrator size assessment (7yi), and a lower-priority feature (scheduler target_chat_ids). The bot is a personal executive dysfunction tool, not developer tooling.
+Epic kyj (strip and restructure) merged to main. All structural work complete. Orchestrator split done (7yi closed) — delivery.py and media_handlers.py extracted. Remaining open items are investigations (worktree isolation, linter interference, SDK injection research), voice provider duplication fix (0cz), and a lower-priority feature (scheduler target_chat_ids). The bot is a personal executive dysfunction tool, not developer tooling.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
 
 ```
 Telegram -> PTB middleware (security -> auth -> rate limit)
-  -> MessageOrchestrator (src/bot/orchestrator.py, ~1,813 lines)
+  -> MessageOrchestrator (src/bot/orchestrator.py, ~1,242 lines)
+    -> Commands, handler registration, agentic_text, message queuing, thread routing
+    -> src/bot/delivery.py (~327 lines): turn result formatting, image sending, typing heartbeat
+    -> src/bot/media_handlers.py (~333 lines): document/photo/voice handlers
     -> PersistentClientManager -> ClaudeSDKClient (long-lived subprocess per thread)
     -> Stream callbacks: src/bot/stream_handler.py (make_stream_callback, flush, cleanup)
-    -> Message queuing: _enqueue_message / _drain_queue (busy path)
-    -> Activity lifecycle: progress msg edited to Done/Failed, stall_callback from watchdog
 
 Scheduler -> HTTP endpoints on FastAPI server -> Claude creates/lists/removes cron jobs via WebFetch
   -> APScheduler fires -> ScheduledEvent -> EventBus -> AgentHandler -> Claude -> NotificationService
@@ -35,8 +36,9 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Heartbeat loop in main.py calls `persistent_manager.cleanup_idle_clients()` every 5 min.
 - AgentHandler uses PersistentClientManager with synthetic state keys (`webhook:{provider}:{id}`, `scheduled:{job_id}`).
 - `src/bot/stream_handler.py` is the single source for stream callback logic. Orchestrator imports and calls `make_stream_callback(settings, ...)`.
-- Response delivery goes through `_deliver_turn_result` (shared by agentic_text, _drain_queue, _handle_agentic_media_message). To change how responses are formatted, progress is finalised, or messages are sent — edit that one method, not the callers.
-- Voice provider availability is checked in TWO places: `FeatureFlags.voice_messages_enabled` AND `orchestrator.agentic_voice` (inline `voice_key_available` block). Adding a new provider requires updating both. Bead 7yi tracks consolidating this.
+- Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from orchestrator's agentic_text, _drain_queue, and media_handlers). To change how responses are formatted or sent — edit delivery.py, not callers.
+- Media handler registration in orchestrator uses inline wrappers to bind settings — adding a new media handler requires a wrapper in `_register_agentic_handlers`.
+- Voice provider availability is checked in TWO places: `FeatureFlags.voice_messages_enabled` AND `media_handlers.agentic_voice` (inline `voice_key_available` block). Adding a new provider requires updating both. Bead 0cz tracks consolidating this.
 
 <!-- Verify before trusting: claims that could be stale -->
 ## Verify Before Trusting
@@ -68,9 +70,9 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 | Where are scheduler endpoints? | src/api/scheduler_routes.py |
 | What work is tracked? | bd ready / bd show claude-code-telegram-kyj (epic) |
 | Where are stream callback functions? | src/bot/stream_handler.py (sole location) |
-| Where are voice/image handlers? | src/bot/media/ |
+| Where are voice/image handlers? | src/bot/media_handlers.py (Telegram-facing), src/bot/media/ (processing) |
 | Where is message queuing? | src/bot/orchestrator.py — _enqueue_message, _drain_queue, _combine_queued_messages |
-| Where is response delivery? | src/bot/orchestrator.py — _deliver_turn_result (shared by all message types) |
+| Where is response delivery? | src/bot/delivery.py — deliver_turn_result (shared by all message types) |
 
 <!-- Gotchas -->
 ## Gotchas
