@@ -2,6 +2,11 @@
 
 Handles turn result formatting, image sending, context warnings,
 abnormal stop notices, and typing indicator heartbeat.
+
+deliver_turn_result is the shared pipeline called from three places:
+orchestrator.agentic_text, orchestrator._drain_queue, and
+media_handlers._handle_media_message. Changes here affect all
+response paths.
 """
 
 import asyncio

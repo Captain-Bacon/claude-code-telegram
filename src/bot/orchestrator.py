@@ -1,6 +1,10 @@
-"""Message orchestrator — single entry point for all Telegram updates.
+"""Message orchestrator — routing, commands, and session state.
 
-Provides a minimal agentic conversational interface (commands + text/file/photo).
+Registers all Telegram handlers, manages message queuing (busy path),
+and contains agentic_text (the main conversational path). Response
+delivery lives in delivery.py; media handlers (document/photo/voice)
+live in media_handlers.py. Commands remain here because they access
+orchestrator instance state (_message_queues, _state_key).
 """
 
 import asyncio
@@ -422,7 +426,10 @@ class MessageOrchestrator:
             group=10,
         )
 
-        # File uploads -> Claude
+        # Media handlers live in media_handlers.py as standalone functions
+        # that take (settings, update, context). These wrappers bind settings
+        # so _inject_deps can call them as (update, context). Follow this
+        # pattern when adding a new media handler.
         async def _document_handler(
             update: Update, context: ContextTypes.DEFAULT_TYPE
         ) -> None:

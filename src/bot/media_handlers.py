@@ -2,6 +2,15 @@
 
 Each handler validates input, then delegates to _handle_media_message
 which runs the prompt through Claude via PersistentClientManager.
+Response delivery uses deliver_turn_result from delivery.py.
+
+Registered by orchestrator._register_agentic_handlers via wrapper
+functions that bind settings (handlers take settings as first arg,
+PTB expects update+context only).
+
+WARNING: agentic_voice checks voice provider availability inline.
+This duplicates logic in FeatureFlags.voice_messages_enabled —
+adding a new provider requires updating BOTH. See bead 0cz.
 """
 
 import asyncio
@@ -29,7 +38,10 @@ logger = structlog.get_logger()
 def _get_verbose_level(
     settings: Settings, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Return effective verbose level: per-user override or global default."""
+    """Return effective verbose level: per-user override or global default.
+
+    Shared — imported by orchestrator.py for agentic_text and _drain_queue.
+    """
     user_override = context.user_data.get("verbose_level")
     if user_override is not None:
         return int(user_override)
