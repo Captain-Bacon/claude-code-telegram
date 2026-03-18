@@ -15,6 +15,7 @@ import structlog
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from .utils.draft_streamer import DraftStreamer
+from .utils.heartbeat_pin import HeartbeatPin
 from .utils.html_format import escape_html
 from .utils.image_extractor import ImageAttachment, validate_image_path
 
@@ -164,6 +165,7 @@ def make_stream_callback(
     approved_directory: Optional[Path] = None,
     draft_streamer: Optional[DraftStreamer] = None,
     telegram_update: Optional[Any] = None,
+    heartbeat_pin: Optional[HeartbeatPin] = None,
 ) -> Optional[Callable[[StreamUpdate], Any]]:
     """Create a stream callback for verbose progress updates.
 
@@ -194,6 +196,7 @@ def make_stream_callback(
         and not need_mcp_intercept
         and draft_streamer is None
         and telegram_update is None
+        and heartbeat_pin is None
     ):
         return None
 
@@ -393,6 +396,8 @@ def make_stream_callback(
                         f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
                     )
                     await draft_streamer.append_tool(line)
+                if heartbeat_pin:
+                    await heartbeat_pin.tool_called(name)
 
         # Send thinking blocks as ephemeral messages (deleted after response)
         if update_obj.type == "thinking" and update_obj.content:

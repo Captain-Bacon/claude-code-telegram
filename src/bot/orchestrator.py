@@ -48,6 +48,7 @@ from .stream_handler import (
     make_stream_callback,
 )
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
+from .utils.heartbeat_pin import HeartbeatPin
 from .utils.error_format import _format_error_message, _update_working_directory_from_claude_response
 from .utils.html_format import escape_html
 from .utils.image_extractor import ImageAttachment
@@ -962,6 +963,15 @@ class MessageOrchestrator:
                 throttle_interval=self.settings.stream_draft_interval,
             )
 
+        # Pinned heartbeat showing live tool activity
+        heartbeat_pin: Optional[HeartbeatPin] = None
+        if chat.type == "private":
+            heartbeat_pin = HeartbeatPin(
+                bot=context.bot,
+                chat_id=chat.id,
+                message_thread_id=update.message.message_thread_id,
+            )
+
         on_stream = make_stream_callback(
             self.settings,
             verbose_level,
@@ -972,6 +982,7 @@ class MessageOrchestrator:
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
             telegram_update=update,
+            heartbeat_pin=heartbeat_pin,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -1064,6 +1075,11 @@ class MessageOrchestrator:
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
+                except Exception:
+                    pass
+            if heartbeat_pin:
+                try:
+                    await heartbeat_pin.cleanup()
                 except Exception:
                     pass
             try:
