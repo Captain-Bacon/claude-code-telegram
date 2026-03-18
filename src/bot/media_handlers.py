@@ -65,12 +65,30 @@ def _voice_unavailable_message(settings: Settings) -> str:
     )
 
 
+# Native multimodal: file extensions Claude accepts directly as content blocks
+_NATIVE_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+_NATIVE_DOC_TYPES = {
+    ".pdf": "application/pdf",
+}
+_NATIVE_MULTIMODAL = {**_NATIVE_IMAGE_TYPES, **_NATIVE_DOC_TYPES}
+
+
 async def agentic_document(
     settings: Settings,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Process file upload -> Claude, minimal chrome."""
+    """Process file upload -> Claude, minimal chrome.
+
+    Native multimodal files (images, PDFs) are sent as content blocks.
+    Text files are inlined in the prompt. Other binary files are rejected.
+    """
     user_id = update.effective_user.id
     document = update.message.document
 
@@ -100,10 +118,39 @@ async def agentic_document(
     await chat.send_action("typing")
     progress_msg = await update.message.reply_text("Working...")
 
-    prompt: Optional[str] = None
-
     file = await document.get_file()
     file_bytes = await file.download_as_bytearray()
+
+    ext = _file_extension(document.file_name)
+    media_type = _NATIVE_MULTIMODAL.get(ext)
+
+    if media_type:
+        # Native multimodal — send as content block
+        import base64
+
+        b64 = base64.b64encode(file_bytes).decode("utf-8")
+        caption = update.message.caption or f"The user is sharing a file: {document.file_name}"
+        block_type = "document" if ext in _NATIVE_DOC_TYPES else "image"
+
+        await _handle_media_message(
+            settings=settings,
+            update=update,
+            context=context,
+            prompt=caption,
+            progress_msg=progress_msg,
+            user_id=user_id,
+            chat=chat,
+            images=[
+                {
+                    "base64_data": b64,
+                    "media_type": media_type,
+                    "block_type": block_type,
+                }
+            ],
+        )
+        return
+
+    # Text file — inline in prompt
     try:
         content = file_bytes.decode("utf-8")
         if len(content) > 50000:
@@ -115,11 +162,10 @@ async def agentic_document(
         )
     except UnicodeDecodeError:
         await progress_msg.edit_text(
-            "Unsupported file format. Must be text-based (UTF-8)."
+            "Unsupported file format. Supported: text files, images, PDFs."
         )
         return
 
-    # Process with Claude via persistent client
     await _handle_media_message(
         settings=settings,
         update=update,
@@ -129,6 +175,13 @@ async def agentic_document(
         user_id=user_id,
         chat=chat,
     )
+
+
+def _file_extension(filename: Optional[str]) -> str:
+    """Extract lowercased file extension, or empty string."""
+    if not filename or "." not in filename:
+        return ""
+    return "." + filename.rsplit(".", 1)[-1].lower()
 
 
 async def agentic_photo(

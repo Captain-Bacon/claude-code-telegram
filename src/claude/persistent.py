@@ -143,20 +143,26 @@ class PersistentClientManager:
         prompt: str,
         images: Optional[List[Dict[str, str]]],
     ) -> Any:
-        """Build query input: plain string or multimodal async iterable."""
+        """Build query input: plain string or multimodal async iterable.
+
+        Each entry in images may contain:
+            base64_data, media_type — required
+            block_type — "image" (default) or "document" (for PDFs)
+        """
         if not images:
             return prompt
 
-        # Multimodal: build content blocks with text + images
+        # Multimodal: build content blocks with text + media
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for img in images:
+        for item in images:
+            block_type = item.get("block_type", "image")
             content.append(
                 {
-                    "type": "image",
+                    "type": block_type,
                     "source": {
                         "type": "base64",
-                        "media_type": img["media_type"],
-                        "data": img["base64_data"],
+                        "media_type": item["media_type"],
+                        "data": item["base64_data"],
                     },
                 }
             )
