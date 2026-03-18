@@ -66,6 +66,7 @@ class QueuedMessage:
     text: str
     sent_at: float  # time.time() when user sent it
     placeholder_message_id: Optional[int] = None  # Telegram msg id of the placeholder
+    images: Optional[List[Dict[str, Any]]] = None  # media content blocks
 
 
 def _is_private_chat(update: Update) -> bool:
@@ -423,13 +424,15 @@ class MessageOrchestrator:
         )
 
         # Media handlers live in media_handlers.py as standalone functions
-        # that take (settings, update, context). These wrappers bind settings
-        # so _inject_deps can call them as (update, context). Follow this
-        # pattern when adding a new media handler.
+        # that take (settings, update, context, on_busy). These wrappers
+        # bind settings and create the on_busy callback so _inject_deps
+        # can call them as (update, context). Follow this pattern when
+        # adding a new media handler.
         async def _document_handler(
             update: Update, context: ContextTypes.DEFAULT_TYPE
         ) -> None:
-            await agentic_document(self.settings, update, context)
+            on_busy = self._make_media_busy_callback(update)
+            await agentic_document(self.settings, update, context, on_busy=on_busy)
 
         app.add_handler(
             MessageHandler(filters.Document.ALL, self._inject_deps(_document_handler)),
@@ -440,7 +443,8 @@ class MessageOrchestrator:
         async def _photo_handler(
             update: Update, context: ContextTypes.DEFAULT_TYPE
         ) -> None:
-            await agentic_photo(self.settings, update, context)
+            on_busy = self._make_media_busy_callback(update)
+            await agentic_photo(self.settings, update, context, on_busy=on_busy)
 
         app.add_handler(
             MessageHandler(filters.PHOTO, self._inject_deps(_photo_handler)),
@@ -451,7 +455,8 @@ class MessageOrchestrator:
         async def _voice_handler(
             update: Update, context: ContextTypes.DEFAULT_TYPE
         ) -> None:
-            await agentic_voice(self.settings, update, context)
+            on_busy = self._make_media_busy_callback(update)
+            await agentic_voice(self.settings, update, context, on_busy=on_busy)
 
         app.add_handler(
             MessageHandler(filters.VOICE, self._inject_deps(_voice_handler)),
@@ -718,20 +723,50 @@ class MessageOrchestrator:
     # Message queuing (ceq) — queue messages while Claude is busy
     # ------------------------------------------------------------------
 
+    def _make_media_busy_callback(
+        self, update: Update
+    ) -> "Callable[[str, str, Optional[List[Dict[str, Any]]], Optional[int]], Any]":
+        """Create a callback for media handlers to queue when Claude is busy.
+
+        Returns an async callable: (state_key, prompt, images, placeholder_id) -> None
+        """
+        async def _on_busy(
+            state_key: str,
+            prompt: str,
+            images: Optional[List[Dict[str, Any]]] = None,
+            placeholder_message_id: Optional[int] = None,
+        ) -> None:
+            await self._enqueue_message(
+                state_key=state_key,
+                message_text=prompt,
+                update=update,
+                images=images,
+                existing_placeholder_id=placeholder_message_id,
+            )
+
+        return _on_busy
+
     async def _enqueue_message(
         self,
         state_key: str,
         message_text: str,
         update: Update,
+        images: Optional[List[Dict[str, Any]]] = None,
+        existing_placeholder_id: Optional[int] = None,
     ) -> None:
         """Queue a message for delivery after the current Claude turn finishes."""
-        placeholder = await update.message.reply_text(
-            "\U0001f554 Queued \u2014 Claude will see this when the current task finishes"
-        )
+        if existing_placeholder_id:
+            placeholder_id = existing_placeholder_id
+        else:
+            placeholder = await update.message.reply_text(
+                "\U0001f554 Queued \u2014 Claude will see this when the current task finishes"
+            )
+            placeholder_id = placeholder.message_id
         qm = QueuedMessage(
             text=message_text,
             sent_at=time.time(),
-            placeholder_message_id=placeholder.message_id,
+            placeholder_message_id=placeholder_id,
+            images=images,
         )
         self._message_queues.setdefault(state_key, []).append(qm)
         logger.info(
@@ -779,19 +814,37 @@ class MessageOrchestrator:
 
             chat = update.effective_chat
 
-            # Delete placeholder messages
-            for qm in queued:
+            # If any queued message has images, process one at a time
+            # to preserve media content. Re-queue the rest for the next
+            # iteration. Text-only queues combine as before.
+            has_images = any(qm.images for qm in queued)
+            if has_images:
+                batch = [queued[0]]
+                if len(queued) > 1:
+                    self._message_queues[state_key] = queued[1:]
+            else:
+                batch = queued
+
+            # Delete placeholder messages for this batch
+            for qm in batch:
                 if qm.placeholder_message_id and chat:
                     try:
                         await chat.delete_message(qm.placeholder_message_id)
                     except Exception:
                         pass
 
-            combined = self._combine_queued_messages(queued)
+            if has_images:
+                combined = batch[0].text
+                drain_images = batch[0].images
+            else:
+                combined = self._combine_queued_messages(batch)
+                drain_images = None
+
             logger.info(
                 "queue.draining",
                 state_key=state_key,
-                message_count=len(queued),
+                message_count=len(batch),
+                has_images=has_images,
             )
 
             persistent_manager: Optional[PersistentClientManager] = (
@@ -843,10 +896,13 @@ class MessageOrchestrator:
                     stream_callback=on_stream,
                     stall_callback=on_stall,
                     model=context.user_data.get("claude_model"),
+                    images=drain_images,
                 )
 
                 if claude_response is None:
-                    re_qm = QueuedMessage(text=combined, sent_at=time.time())
+                    re_qm = QueuedMessage(
+                        text=combined, sent_at=time.time(), images=drain_images
+                    )
                     self._message_queues.setdefault(state_key, []).append(re_qm)
                     logger.warning("queue.drain_raced", state_key=state_key)
                     try:

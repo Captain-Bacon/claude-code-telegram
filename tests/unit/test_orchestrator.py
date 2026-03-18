@@ -1129,6 +1129,315 @@ class TestAgenticTextQueuesWhenBusy:
         assert len(orchestrator._message_queues[state_key]) == 1
 
 
+class TestMediaQueuesWhenBusy:
+    """Verify media handlers queue instead of injecting when client is busy."""
+
+    async def test_handle_media_message_queues_when_busy(self, agentic_settings, deps):
+        """_handle_media_message should queue via on_busy when client is busy."""
+        from src.bot.media_handlers import _handle_media_message
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="busy")
+
+        progress_msg = AsyncMock()
+        progress_msg.message_id = 55
+
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.effective_user.id = 123
+        update.message.message_thread_id = None
+
+        context = MagicMock()
+        context.bot_data = {"persistent_manager": persistent_manager}
+        context.user_data = {}
+
+        on_busy = AsyncMock()
+
+        await _handle_media_message(
+            settings=agentic_settings,
+            update=update,
+            context=context,
+            prompt="transcribed voice text",
+            progress_msg=progress_msg,
+            user_id=123,
+            chat=MagicMock(),
+            on_busy=on_busy,
+        )
+
+        # Should NOT have called send_message
+        persistent_manager.send_message.assert_not_called()
+
+        # Should have called the busy callback with prompt and placeholder id
+        on_busy.assert_awaited_once()
+        call_args = on_busy.call_args
+        assert call_args[0][1] == "transcribed voice text"  # prompt
+        assert call_args[0][3] == 55  # placeholder_message_id
+
+        # Progress msg edited to show queued status
+        progress_msg.edit_text.assert_awaited_once()
+        text = progress_msg.edit_text.call_args[0][0]
+        assert "Queued" in text
+
+    async def test_handle_media_message_queues_images(self, agentic_settings, deps):
+        """Image data should be passed through on_busy when busy."""
+        from src.bot.media_handlers import _handle_media_message
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="busy")
+
+        progress_msg = AsyncMock()
+        progress_msg.message_id = 56
+
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.effective_user.id = 123
+        update.message.message_thread_id = None
+
+        context = MagicMock()
+        context.bot_data = {"persistent_manager": persistent_manager}
+        context.user_data = {}
+
+        on_busy = AsyncMock()
+        test_images = [{"base64_data": "abc123", "media_type": "image/png"}]
+
+        await _handle_media_message(
+            settings=agentic_settings,
+            update=update,
+            context=context,
+            prompt="photo caption",
+            progress_msg=progress_msg,
+            user_id=123,
+            chat=MagicMock(),
+            images=test_images,
+            on_busy=on_busy,
+        )
+
+        persistent_manager.send_message.assert_not_called()
+        on_busy.assert_awaited_once()
+        # Images passed through
+        assert on_busy.call_args[0][2] == test_images
+
+    async def test_handle_media_message_fallback_without_on_busy(
+        self, agentic_settings, deps
+    ):
+        """Without on_busy callback, show a 'busy' message instead of silently losing."""
+        from src.bot.media_handlers import _handle_media_message
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="busy")
+
+        progress_msg = AsyncMock()
+        progress_msg.message_id = 57
+
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.effective_user.id = 123
+        update.message.message_thread_id = None
+
+        context = MagicMock()
+        context.bot_data = {"persistent_manager": persistent_manager}
+        context.user_data = {}
+
+        await _handle_media_message(
+            settings=agentic_settings,
+            update=update,
+            context=context,
+            prompt="will be lost",
+            progress_msg=progress_msg,
+            user_id=123,
+            chat=MagicMock(),
+        )
+
+        persistent_manager.send_message.assert_not_called()
+        progress_msg.edit_text.assert_awaited_once()
+        text = progress_msg.edit_text.call_args[0][0]
+        assert "busy" in text
+
+    async def test_handle_media_message_proceeds_when_idle(
+        self, agentic_settings, deps
+    ):
+        """When client is idle, _handle_media_message should call send_message."""
+        from unittest.mock import patch
+
+        from src.bot.media_handlers import _handle_media_message
+
+        mock_response = MagicMock()
+        mock_response.session_id = "media-session"
+        mock_response.content = "I see the image"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
+        persistent_manager = MagicMock()
+        persistent_manager.get_client_state = MagicMock(return_value="idle")
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
+
+        progress_msg = AsyncMock()
+        progress_msg.message_id = 58
+
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.effective_user.id = 123
+        update.message.message_thread_id = None
+
+        context = MagicMock()
+        context.bot_data = {"persistent_manager": persistent_manager}
+        context.user_data = {}
+
+        on_busy = AsyncMock()
+
+        with patch("src.bot.media_handlers.deliver_turn_result", new_callable=AsyncMock):
+            await _handle_media_message(
+                settings=agentic_settings,
+                update=update,
+                context=context,
+                prompt="look at this",
+                progress_msg=progress_msg,
+                user_id=123,
+                chat=MagicMock(),
+                on_busy=on_busy,
+            )
+
+        # Should have called send_message, NOT on_busy
+        persistent_manager.send_message.assert_awaited_once()
+        on_busy.assert_not_called()
+
+
+class TestEnqueueWithImages:
+    """Verify _enqueue_message handles images and existing placeholders."""
+
+    async def test_enqueue_with_images(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        placeholder_msg = MagicMock()
+        placeholder_msg.message_id = 999
+
+        update = MagicMock()
+        update.message.reply_text = AsyncMock(return_value=placeholder_msg)
+
+        test_images = [{"base64_data": "abc", "media_type": "image/png"}]
+        await orchestrator._enqueue_message(
+            "key1", "photo prompt", update, images=test_images
+        )
+
+        qm = orchestrator._message_queues["key1"][0]
+        assert qm.images == test_images
+
+    async def test_enqueue_with_existing_placeholder(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+
+        await orchestrator._enqueue_message(
+            "key1", "media prompt", update, existing_placeholder_id=77
+        )
+
+        # Should NOT have created a new placeholder
+        update.message.reply_text.assert_not_awaited()
+
+        qm = orchestrator._message_queues["key1"][0]
+        assert qm.placeholder_message_id == 77
+
+
+class TestDrainQueueWithImages:
+    """Verify _drain_queue handles image-bearing messages correctly."""
+
+    async def test_drain_sends_images_individually(self, agentic_settings, deps):
+        """Image-bearing messages should be sent one at a time, not combined."""
+        from src.bot.orchestrator import QueuedMessage
+
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        test_images = [{"base64_data": "abc", "media_type": "image/png"}]
+        orchestrator._message_queues["key1"] = [
+            QueuedMessage(
+                text="photo 1",
+                sent_at=1710300000.0,
+                placeholder_message_id=50,
+                images=test_images,
+            ),
+            QueuedMessage(
+                text="follow up text",
+                sent_at=1710300005.0,
+                placeholder_message_id=51,
+            ),
+        ]
+
+        mock_response = MagicMock()
+        mock_response.session_id = "drain-session"
+        mock_response.content = "Got it"
+        mock_response.tools_used = []
+        mock_response.is_interrupted = False
+        mock_response.context_window = None
+        mock_response.total_input_tokens = None
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=mock_response)
+
+        progress_msg = AsyncMock()
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.effective_chat.delete_message = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.message.message_thread_id = None
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"persistent_manager": persistent_manager}
+
+        await orchestrator._drain_queue("key1", update, context)
+
+        # Should have been called twice (once per message, since first has images)
+        assert persistent_manager.send_message.await_count == 2
+
+        # First call should include images
+        first_call = persistent_manager.send_message.call_args_list[0]
+        assert first_call.kwargs.get("images") == test_images
+
+        # Second call should NOT include images
+        second_call = persistent_manager.send_message.call_args_list[1]
+        assert second_call.kwargs.get("images") is None
+
+    async def test_drain_preserves_images_on_race(self, agentic_settings, deps):
+        """If send_message returns None during drain with images, re-queue with images."""
+        from src.bot.orchestrator import QueuedMessage
+
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        test_images = [{"base64_data": "abc", "media_type": "image/png"}]
+        orchestrator._message_queues["key1"] = [
+            QueuedMessage(
+                text="photo msg",
+                sent_at=1710300000.0,
+                images=test_images,
+            ),
+        ]
+
+        persistent_manager = MagicMock()
+        persistent_manager.send_message = AsyncMock(return_value=None)
+
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+
+        update = MagicMock()
+        update.effective_chat.delete_message = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.message.message_thread_id = None
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"persistent_manager": persistent_manager}
+
+        await orchestrator._drain_queue("key1", update, context)
+
+        # Re-queued with images preserved
+        assert len(orchestrator._message_queues["key1"]) == 1
+        re_queued = orchestrator._message_queues["key1"][0]
+        assert re_queued.images == test_images
+
+
 class TestActivityLifecycle:
     """Verify status message lifecycle: Working -> Done/Failed/Stalled."""
 

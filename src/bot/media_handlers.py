@@ -82,6 +82,7 @@ async def agentic_document(
     settings: Settings,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    on_busy: Optional[Any] = None,
 ) -> None:
     """Process file upload -> Claude, minimal chrome.
 
@@ -149,6 +150,7 @@ async def agentic_document(
                     "block_type": block_type,
                 }
             ],
+            on_busy=on_busy,
         )
         return
 
@@ -175,6 +177,7 @@ async def agentic_document(
         progress_msg=progress_msg,
         user_id=user_id,
         chat=chat,
+        on_busy=on_busy,
     )
 
 
@@ -189,6 +192,7 @@ async def agentic_photo(
     settings: Settings,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    on_busy: Optional[Any] = None,
 ) -> None:
     """Process photo -> Claude, minimal chrome."""
     user_id = update.effective_user.id
@@ -220,6 +224,7 @@ async def agentic_photo(
                     "media_type": processed_image.media_type,
                 }
             ],
+            on_busy=on_busy,
         )
 
     except Exception as e:
@@ -231,6 +236,7 @@ async def agentic_voice(
     settings: Settings,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    on_busy: Optional[Any] = None,
 ) -> None:
     """Transcribe voice message -> Claude, minimal chrome."""
     user_id = update.effective_user.id
@@ -269,6 +275,7 @@ async def agentic_voice(
             progress_msg=progress_msg,
             user_id=user_id,
             chat=chat,
+            on_busy=on_busy,
         )
 
     except Exception as e:
@@ -286,6 +293,7 @@ async def _handle_media_message(
     user_id: int,
     chat: Any,
     images: Optional[List[Dict[str, Any]]] = None,
+    on_busy: Optional[Any] = None,
 ) -> None:
     """Run a media-derived prompt through Claude and send responses."""
     persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
@@ -301,6 +309,24 @@ async def _handle_media_message(
     thread_id = getattr(update.message, "message_thread_id", None)
     user_id_for_key = update.effective_user.id
     state_key = derive_state_key(chat_id, thread_id, user_id_for_key)
+
+    # If client is busy, queue the processed media for delivery after
+    # the current turn finishes — same pattern as agentic_text.
+    client_state = persistent_manager.get_client_state(state_key)
+    if client_state in ("busy", "draining"):
+        if on_busy:
+            await on_busy(
+                state_key, prompt, images, progress_msg.message_id
+            )
+            await progress_msg.edit_text(
+                "\U0001f554 Queued \u2014 Claude will see this "
+                "when the current task finishes"
+            )
+        else:
+            await progress_msg.edit_text(
+                "Claude is busy \u2014 please try again in a moment."
+            )
+        return
 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
