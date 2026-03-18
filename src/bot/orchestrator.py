@@ -849,6 +849,10 @@ class MessageOrchestrator:
                     re_qm = QueuedMessage(text=combined, sent_at=time.time())
                     self._message_queues.setdefault(state_key, []).append(re_qm)
                     logger.warning("queue.drain_raced", state_key=state_key)
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
                     return
 
             except asyncio.CancelledError:

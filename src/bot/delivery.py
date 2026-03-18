@@ -224,14 +224,12 @@ async def deliver_turn_result(
     if error_messages is not None:
         formatted_messages = error_messages
     else:
+        # Defence: flush again in case the caller's finally block was
+        # skipped or errored.  No-op if already flushed (lists cleared).
         await flush_stream_callback(on_stream)
 
         text_already_sent = (
-            on_stream
-            and hasattr(on_stream, "text_was_sent")
-            and on_stream.text_was_sent
-            and hasattr(on_stream, "flush_succeeded")
-            and on_stream.flush_succeeded
+            on_stream and on_stream.text_was_sent and on_stream.flush_succeeded
         )
 
         if text_already_sent:

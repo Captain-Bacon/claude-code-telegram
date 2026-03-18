@@ -461,7 +461,10 @@ class StreamSession:
         """Wait for the batch window then flush."""
         await asyncio.sleep(self._TEXT_BATCH_WINDOW)
         await self.flush_pending()
-        self._text_batch_task = None
+        async with self._stream_lock:
+            # Clear under lock so _enqueue_text doesn't cancel a finished
+            # task and then have this line clobber its newly-created one.
+            self._text_batch_task = None
 
     async def _enqueue_text(self, text: str, is_thinking: bool = False) -> None:
         """Add text to the pending batch and schedule a flush."""
