@@ -65,9 +65,14 @@ All require `Authorization: Bearer {WEBHOOK_API_SECRET}` header.
   "name": "daily-inbox-check",
   "cron_expression": "0 9 * * 1-5",
   "prompt": "Check the inbox and progress anything that's ready",
-  "description": "Optional description"
+  "description": "Optional description",
+  "model": "haiku"
 }
 ```
+
+The `model` field is optional. When set, the job runs on that specific Claude model instead of the bot's default. Useful for routine tasks that don't need the most capable model — e.g. categorising emails with Haiku rather than waking up Opus.
+
+Valid values are model identifiers like `"haiku"`, `"sonnet"`, `"opus"`. When omitted, the job uses whatever model the bot is configured with.
 
 ### Cron expression examples
 
