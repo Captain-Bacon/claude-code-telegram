@@ -26,6 +26,10 @@ class CreateJobRequest(BaseModel):
     description: Optional[str] = Field(
         None, description="Optional description of what the job does"
     )
+    model: Optional[str] = Field(
+        None,
+        description='Claude model to use (e.g. "haiku", "sonnet"). Defaults to bot config.',
+    )
 
 
 class CreateJobResponse(BaseModel):
@@ -43,6 +47,7 @@ class JobResponse(BaseModel):
     cron_expression: str
     prompt: str
     description: Optional[str] = None
+    model: Optional[str] = None
     next_run_time: Optional[str] = None
 
 
@@ -91,6 +96,7 @@ def create_scheduler_router(
                 job_name=body.name,
                 cron_expression=body.cron_expression,
                 prompt=body.prompt,
+                model=body.model,
             )
         except Exception as e:
             logger.error("Failed to create scheduled job", error=str(e))
@@ -130,6 +136,7 @@ def create_scheduler_router(
                     "cron_expression": job.get("cron_expression", ""),
                     "prompt": job.get("prompt", ""),
                     "description": job.get("description"),
+                    "model": job.get("model"),
                     "next_run_time": next_run,
                 }
             )

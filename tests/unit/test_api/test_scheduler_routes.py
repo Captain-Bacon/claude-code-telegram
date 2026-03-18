@@ -114,6 +114,33 @@ class TestSchedulerAPICreateJob:
             job_name="daily-standup",
             cron_expression="0 9 * * 1-5",
             prompt="Give me a morning update",
+            model=None,
+        )
+
+    async def test_create_job_with_model(
+        self, app: FastAPI, mock_scheduler: MagicMock
+    ) -> None:
+        """Model field is passed through to scheduler."""
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/scheduler/jobs",
+                json={
+                    "name": "spam-filter",
+                    "cron_expression": "0 8 * * *",
+                    "prompt": "Categorise today's spam emails",
+                    "model": "haiku",
+                },
+                headers={"Authorization": AUTH_HEADER},
+            )
+
+        assert response.status_code == 200
+        mock_scheduler.add_job.assert_called_once_with(
+            job_name="spam-filter",
+            cron_expression="0 8 * * *",
+            prompt="Categorise today's spam emails",
+            model="haiku",
         )
 
     async def test_create_job_with_description(

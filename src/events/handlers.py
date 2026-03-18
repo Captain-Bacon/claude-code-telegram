@@ -107,6 +107,7 @@ class AgentHandler:
                 state_key=state_key,
                 prompt=prompt,
                 working_directory=working_dir,
+                model=event.model,
             )
 
             if response and response.content:

@@ -310,6 +310,13 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                """
+                -- Add model selection to scheduled jobs
+                ALTER TABLE scheduled_jobs ADD COLUMN model TEXT DEFAULT NULL;
+                """,
+            ),
         ]
 
     async def _init_pool(self):

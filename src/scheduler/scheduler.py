@@ -54,6 +54,7 @@ class JobScheduler:
         working_directory: Optional[Path] = None,
         skill_name: Optional[str] = None,
         created_by: int = 0,
+        model: Optional[str] = None,
     ) -> str:
         """Add a new scheduled job.
 
@@ -65,6 +66,7 @@ class JobScheduler:
             working_directory: Working directory for Claude execution.
             skill_name: Optional skill to invoke.
             created_by: Telegram user ID of the creator.
+            model: Claude model to use (e.g. "haiku", "sonnet"). None = default.
 
         Returns:
             The job ID.
@@ -81,6 +83,7 @@ class JobScheduler:
                 "working_directory": str(work_dir),
                 "target_chat_ids": target_chat_ids or [],
                 "skill_name": skill_name,
+                "model": model,
             },
             name=job_name,
         )
@@ -95,6 +98,7 @@ class JobScheduler:
             working_directory=str(work_dir),
             skill_name=skill_name,
             created_by=created_by,
+            model=model,
         )
 
         logger.info(
@@ -132,6 +136,7 @@ class JobScheduler:
         working_directory: str,
         target_chat_ids: List[int],
         skill_name: Optional[str],
+        model: Optional[str] = None,
     ) -> None:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
         event = ScheduledEvent(
@@ -140,6 +145,7 @@ class JobScheduler:
             working_directory=Path(working_directory),
             target_chat_ids=target_chat_ids,
             skill_name=skill_name,
+            model=model,
         )
 
         logger.info(
@@ -181,6 +187,7 @@ class JobScheduler:
                             "working_directory": row_dict["working_directory"],
                             "target_chat_ids": chat_ids,
                             "skill_name": row_dict.get("skill_name"),
+                            "model": row_dict.get("model"),
                         },
                         id=row_dict["job_id"],
                         name=row_dict["job_name"],
@@ -212,6 +219,7 @@ class JobScheduler:
         working_directory: str,
         skill_name: Optional[str],
         created_by: int,
+        model: Optional[str] = None,
     ) -> None:
         """Persist a job definition to the database."""
         chat_ids_str = ",".join(str(cid) for cid in target_chat_ids)
@@ -220,8 +228,8 @@ class JobScheduler:
                 """
                 INSERT OR REPLACE INTO scheduled_jobs
                 (job_id, job_name, cron_expression, prompt, target_chat_ids,
-                 working_directory, skill_name, created_by, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 working_directory, skill_name, created_by, is_active, model)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 """,
                 (
                     job_id,
@@ -232,6 +240,7 @@ class JobScheduler:
                     working_directory,
                     skill_name,
                     created_by,
+                    model,
                 ),
             )
             await conn.commit()
