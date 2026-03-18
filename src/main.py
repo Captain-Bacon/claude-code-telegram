@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -381,6 +382,10 @@ async def run_application(app: Dict[str, Any]) -> None:
             logger.error("Error during shutdown", error=str(e))
 
         logger.info("Application shutdown complete")
+
+        if os.environ.pop("_RESTART_REQUESTED", None):
+            logger.info("Restart requested — replacing process via execv")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 async def main() -> None:

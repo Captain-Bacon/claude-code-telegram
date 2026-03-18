@@ -76,12 +76,9 @@ async def restart_command(
 ) -> None:
     """Handle /restart command - gracefully restart the bot process.
 
-    Sends a confirmation message then triggers SIGTERM so systemd
-    (or any process manager with restart-on-exit) brings the bot back up.
-
-    Auth: protected by the auth middleware (group -2) which raises
-    ``ApplicationHandlerStop`` for unauthenticated users before any
-    handler in group 10 runs.  No per-handler check is needed.
+    Sets a restart flag then triggers SIGTERM. main.py performs ordered
+    shutdown, then os.execv() replaces the process with a fresh instance.
+    Works regardless of how the bot was launched (Toolbox, tmux, direct).
     """
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
     user_id = update.effective_user.id
@@ -96,8 +93,9 @@ async def restart_command(
 
     logger.info("Restart requested via /restart command", user_id=user_id)
 
-    # SIGTERM triggers the existing graceful-shutdown handler in main.py;
-    # systemd Restart=always will bring the process back up.
+    # Flag tells main.py to os.execv() after graceful shutdown instead of exiting.
+    os.environ["_RESTART_REQUESTED"] = "1"
+    # SIGTERM triggers the existing graceful-shutdown handler in main.py.
     os.kill(os.getpid(), signal.SIGTERM)
 
 

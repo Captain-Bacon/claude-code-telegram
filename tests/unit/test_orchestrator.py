@@ -151,7 +151,7 @@ async def test_agentic_bot_commands(agentic_settings, deps):
 
 
 async def test_restart_command_sends_sigterm(deps):
-    """restart_command sends SIGTERM to the current process."""
+    """restart_command sets restart flag and sends SIGTERM."""
     from unittest.mock import patch
 
     from src.bot.orchestrator import restart_command
@@ -170,6 +170,7 @@ async def test_restart_command_sends_sigterm(deps):
     import signal
 
     mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+    assert os.environ.pop("_RESTART_REQUESTED", None) == "1"
     # Verify confirmation message was sent
     update.message.reply_text.assert_called_once()
     msg = update.message.reply_text.call_args[0][0]
