@@ -20,6 +20,8 @@ from src.utils.constants import (
     DEFAULT_CLAUDE_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
     DEFAULT_MAX_SESSIONS_PER_USER,
+    DEFAULT_PROJECT_THREADS_DISCOVER_DAYS,
+    DEFAULT_PROJECT_THREADS_DISCOVER_LIMIT,
     DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS,
     DEFAULT_RATE_LIMIT_BURST,
     DEFAULT_RATE_LIMIT_REQUESTS,
@@ -306,6 +308,21 @@ class Settings(BaseSettings):
         ),
         ge=0.0,
     )
+    project_threads_discover: bool = Field(
+        True,
+        description="Auto-discover git repos by recent activity for project threads",
+    )
+    project_threads_discover_limit: int = Field(
+        DEFAULT_PROJECT_THREADS_DISCOVER_LIMIT,
+        description="Maximum number of repos to auto-discover",
+        ge=1,
+        le=50,
+    )
+    project_threads_discover_days: int = Field(
+        DEFAULT_PROJECT_THREADS_DISCOVER_DAYS,
+        description="Only discover repos with commits within this many days",
+        ge=1,
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
@@ -471,9 +488,10 @@ class Settings(BaseSettings):
                     "project_threads_chat_id required when "
                     "project_threads_mode is 'group'"
                 )
-            if not self.projects_config_path:
+            if not self.projects_config_path and not self.project_threads_discover:
                 raise ValueError(
-                    "projects_config_path required when enable_project_threads is True"
+                    "projects_config_path or project_threads_discover required "
+                    "when enable_project_threads is True"
                 )
 
         return self

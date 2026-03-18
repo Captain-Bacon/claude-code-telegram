@@ -22,7 +22,12 @@ from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
-from src.projects import ProjectThreadManager, load_project_registry
+from src.projects import (
+    ProjectThreadManager,
+    build_registry,
+    discover_active_repos,
+    load_pinned_projects,
+)
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
@@ -229,14 +234,32 @@ async def run_application(app: Dict[str, Any]) -> None:
         await bot.initialize()
 
         if config.enable_project_threads:
-            if not config.projects_config_path:
-                raise ConfigurationError(
-                    "Project thread mode enabled but required settings are missing"
+            pinned = []
+            if config.projects_config_path:
+                pinned = load_pinned_projects(
+                    config_path=config.projects_config_path,
+                    approved_directory=config.approved_directory,
                 )
-            registry = load_project_registry(
-                config_path=config.projects_config_path,
-                approved_directory=config.approved_directory,
-            )
+                logger.info("Loaded pinned projects", count=len(pinned))
+
+            discovered = []
+            if config.project_threads_discover:
+                pinned_slugs = {p.slug for p in pinned}
+                discovered = discover_active_repos(
+                    base_directory=config.approved_directory,
+                    max_results=config.project_threads_discover_limit,
+                    max_days=config.project_threads_discover_days,
+                    exclude_slugs=pinned_slugs,
+                )
+                logger.info("Discovered active repos", count=len(discovered))
+
+            if not pinned and not discovered:
+                raise ConfigurationError(
+                    "No projects found — check projects_config_path "
+                    "or ensure git repos exist in approved_directory"
+                )
+
+            registry = build_registry(pinned=pinned, discovered=discovered)
             project_threads_manager = ProjectThreadManager(
                 registry=registry,
                 repository=storage.project_threads,

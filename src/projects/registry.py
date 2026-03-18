@@ -4,12 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import structlog
 import yaml
+
+logger = structlog.get_logger()
 
 
 @dataclass(frozen=True)
 class ProjectDefinition:
-    """Project entry from YAML configuration."""
+    """Project entry from YAML configuration or auto-discovery."""
 
     slug: str
     name: str
@@ -39,10 +42,14 @@ class ProjectRegistry:
         return self._by_slug.get(slug)
 
 
-def load_project_registry(
+def load_pinned_projects(
     config_path: Path, approved_directory: Path
-) -> ProjectRegistry:
-    """Load and validate project definitions from YAML."""
+) -> List[ProjectDefinition]:
+    """Load pinned project definitions from YAML.
+
+    Returns an empty list if the file is empty or has no projects entry.
+    Raises ValueError for malformed entries.
+    """
     if not config_path.exists():
         raise ValueError(f"Projects config file does not exist: {config_path}")
 
@@ -53,13 +60,15 @@ def load_project_registry(
         raise ValueError("Projects config must be a YAML object")
 
     raw_projects = data.get("projects")
-    if not isinstance(raw_projects, list) or not raw_projects:
-        raise ValueError("Projects config must contain a non-empty 'projects' list")
+    if not raw_projects:
+        return []
+    if not isinstance(raw_projects, list):
+        raise ValueError("Projects 'projects' key must be a list")
 
     approved_root = approved_directory.resolve()
-    seen_slugs = set()
-    seen_names = set()
-    seen_rel_paths = set()
+    seen_slugs: set[str] = set()
+    seen_names: set[str] = set()
+    seen_rel_paths: set[str] = set()
     projects: List[ProjectDefinition] = []
 
     for idx, raw in enumerate(raw_projects):
@@ -92,10 +101,12 @@ def load_project_registry(
             ) from e
 
         if not absolute_path.exists() or not absolute_path.is_dir():
-            raise ValueError(
-                f"Project '{slug}' path does not exist or "
-                f"is not a directory: {absolute_path}"
+            logger.warning(
+                "Pinned project path missing, skipping",
+                slug=slug,
+                path=str(absolute_path),
             )
+            continue
 
         rel_path_norm = str(rel_path)
         if slug in seen_slugs:
@@ -119,4 +130,41 @@ def load_project_registry(
             )
         )
 
-    return ProjectRegistry(projects)
+    return projects
+
+
+def build_registry(
+    pinned: List[ProjectDefinition],
+    discovered: List[ProjectDefinition],
+) -> ProjectRegistry:
+    """Merge pinned and discovered projects into a registry.
+
+    Pinned projects come first. Discovered projects are appended
+    if their slug doesn't collide with a pinned entry.
+    """
+    by_slug: set[str] = set()
+    by_name: set[str] = set()
+    merged: List[ProjectDefinition] = []
+
+    for p in pinned:
+        by_slug.add(p.slug)
+        by_name.add(p.name)
+        merged.append(p)
+
+    for p in discovered:
+        if p.slug in by_slug or p.name in by_name:
+            continue
+        by_slug.add(p.slug)
+        by_name.add(p.name)
+        merged.append(p)
+
+    return ProjectRegistry(merged)
+
+
+# Backwards-compatible loader for existing code paths
+def load_project_registry(
+    config_path: Path, approved_directory: Path
+) -> ProjectRegistry:
+    """Load project registry from YAML only (no discovery)."""
+    pinned = load_pinned_projects(config_path, approved_directory)
+    return ProjectRegistry(pinned)

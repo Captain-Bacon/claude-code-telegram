@@ -76,7 +76,7 @@ context.bot_data["security_validator"]
 - `src/bot/middleware/` -- Auth, rate limit, security input validation
 - `src/bot/utils/` -- Formatting (HTML escape, message chunking), error formatting
 - `src/claude/` -- PersistentClientManager, SDK options builder, session management, tool monitoring
-- `src/projects/` -- Multi-project support: `registry.py` (YAML config), `thread_manager.py` (Telegram topic sync)
+- `src/projects/` -- Multi-project support: `registry.py` (YAML pins + merge), `discovery.py` (git activity scan), `thread_manager.py` (Telegram topic sync)
 - `src/storage/` -- SQLite via aiosqlite, repository pattern
 - `src/security/` -- Auth (whitelist/token), input validators, rate limiter, audit logging
 - `src/events/` -- EventBus (async pub/sub), event types, AgentHandler
@@ -100,7 +100,7 @@ Platform settings: `ENABLE_API_SERVER`, `API_SERVER_PORT` (default 8080), `GITHU
 
 Security relaxation (trusted environments only): `DISABLE_SECURITY_PATTERNS` (default false), `DISABLE_TOOL_VALIDATION` (default false).
 
-Multi-project topics: `ENABLE_PROJECT_THREADS` (default false), `PROJECT_THREADS_MODE` (`private`|`group`), `PROJECT_THREADS_CHAT_ID` (required for group mode), `PROJECTS_CONFIG_PATH` (path to YAML project registry), `PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS` (default `1.1`, set `0` to disable pacing). See `config/projects.example.yaml`.
+Multi-project topics: `ENABLE_PROJECT_THREADS` (default false), `PROJECT_THREADS_MODE` (`private`|`group`), `PROJECT_THREADS_CHAT_ID` (required for group mode), `PROJECTS_CONFIG_PATH` (optional YAML pin list), `PROJECT_THREADS_DISCOVER` (default true, auto-discovers git repos by activity), `PROJECT_THREADS_DISCOVER_LIMIT` (default 10), `PROJECT_THREADS_DISCOVER_DAYS` (default 30), `PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS` (default `1.1`, set `0` to disable pacing). Either `PROJECTS_CONFIG_PATH` or `PROJECT_THREADS_DISCOVER` required.
 
 Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool names + reasoning, 2 = detailed. Users override via `/verbose 0|1|2`. Typing indicator refreshes every ~2 seconds at all levels.
 

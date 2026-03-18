@@ -299,8 +299,8 @@ def test_project_threads_validation_requires_chat_id_in_group_mode(tmp_path):
     assert "project_threads_chat_id required" in str(exc_info.value)
 
 
-def test_project_threads_validation_requires_projects_config(tmp_path):
-    """Thread mode requires projects_config_path."""
+def test_project_threads_validation_requires_config_or_discover(tmp_path):
+    """Thread mode requires projects_config_path when discovery disabled."""
     project_dir = tmp_path / "projects"
     project_dir.mkdir()
 
@@ -312,13 +312,31 @@ def test_project_threads_validation_requires_projects_config(tmp_path):
             enable_project_threads=True,
             project_threads_chat_id=-1001234567890,
             projects_config_path=None,
+            project_threads_discover=False,
         )
 
-    assert "projects_config_path required" in str(exc_info.value)
+    assert "projects_config_path or project_threads_discover" in str(exc_info.value)
 
 
-def test_project_threads_validation_blank_projects_config_path_fails(tmp_path):
-    """Blank projects_config_path should be treated as missing."""
+def test_project_threads_ok_with_discover_no_config(tmp_path):
+    """Thread mode works with discovery enabled and no YAML config."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        enable_project_threads=True,
+        project_threads_mode="private",
+        projects_config_path=None,
+        project_threads_discover=True,
+    )
+    assert settings.project_threads_discover is True
+
+
+def test_project_threads_validation_blank_config_path_with_no_discover(tmp_path):
+    """Blank projects_config_path with discovery off should fail."""
     project_dir = tmp_path / "projects"
     project_dir.mkdir()
 
@@ -330,9 +348,10 @@ def test_project_threads_validation_blank_projects_config_path_fails(tmp_path):
             enable_project_threads=True,
             project_threads_mode="private",
             projects_config_path="",
+            project_threads_discover=False,
         )
 
-    assert "projects_config_path required" in str(exc_info.value)
+    assert "projects_config_path or project_threads_discover" in str(exc_info.value)
 
 
 def test_project_threads_validation_private_mode_no_chat_id(tmp_path):

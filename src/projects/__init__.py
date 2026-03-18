@@ -1,6 +1,13 @@
 """Project registry and Telegram thread management."""
 
-from .registry import ProjectDefinition, ProjectRegistry, load_project_registry
+from .discovery import discover_active_repos
+from .registry import (
+    ProjectDefinition,
+    ProjectRegistry,
+    build_registry,
+    load_pinned_projects,
+    load_project_registry,
+)
 from .thread_manager import (
     PrivateTopicsUnavailableError,
     ProjectThreadManager,
@@ -9,6 +16,9 @@ from .thread_manager import (
 __all__ = [
     "ProjectDefinition",
     "ProjectRegistry",
+    "build_registry",
+    "discover_active_repos",
+    "load_pinned_projects",
     "load_project_registry",
     "ProjectThreadManager",
     "PrivateTopicsUnavailableError",
