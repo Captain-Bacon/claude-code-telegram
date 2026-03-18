@@ -54,7 +54,8 @@ flowchart TD
     PCM -->|PersistentResponse| DTR
 
     DTR -->|formatted messages| Telegram
-    DTR -->|"turn done"| DQ
+
+    AT -->|"after delivery"| DQ
     DQ -->|queued messages exist| TS
     QUEUE -.->|"stored until\nturn completes"| DQ
 ```
@@ -80,7 +81,7 @@ All three paths create the same objects before calling `send_message`:
 | Object | Purpose | Lifecycle |
 |--------|---------|-----------|
 | Progress message | "Working..." edited during turn, finalised to "Done (Xs)" | Created → edited → finalised |
-| HeartbeatPin | Pinned message showing "⚙️ Read 7" etc. | Created → updated per tool call (5s throttle) → unpinned → deleted |
+| HeartbeatPin | Pinned message showing "⚙️ Read 7" (if `ENABLE_HEARTBEAT_PIN`) | Created → updated per tool call (5s throttle) → edited to "Done" → unpinned → deleted. None if disabled. |
 | StreamSession | Callable stream callback routing SDK events | Created → called per event → flushed → thinking cleaned up |
 | Stall callback | Edits progress message on silence (30s/60s) | Created → called by watchdog → superseded by delivery |
 
@@ -123,14 +124,13 @@ During a turn, the `StreamSession` (callable class, passed as `stream_callback`)
 flowchart LR
     subgraph Events ["SDK stream events"]
         TC[Tool calls]
-        AT[Assistant text]
+        ATXT[Assistant text]
         TH[Thinking blocks]
         SD[Stream deltas]
         IM[MCP image tools]
     end
 
     subgraph StreamSession
-        TL[Tool log]
         TB[Text batch\n1.5s window]
         THB[Thinking batch]
         DS[DraftStreamer]
@@ -146,17 +146,19 @@ flowchart LR
         IMG[Captured images\nfor delivery]
     end
 
-    TC --> TL
-    TL --> PIN
-    TL --> PROG
-    TL --> DS --> DRAFT
-    AT --> TB --> MSG
-    AT --> DS
+    TC --> PIN
+    TC --> PROG
+    TC --> DS
+    ATXT --> TB --> MSG
+    ATXT --> DS
     TH --> THB --> EPH
     TH --> DS
     SD --> DS
+    DS --> DRAFT
     IM --> MCI --> IMG
 ```
+
+Tool calls fan out to three parallel outputs (not a chain): HeartbeatPin update, tool_log for verbose progress, and DraftStreamer for live preview. All three happen in the same for-loop.
 
 **Concurrency control:**
 - `_stream_lock` — protects mutable state (pending lists, batch task). Held briefly during enqueue and flush-collect.
@@ -211,11 +213,9 @@ flowchart TD
 
     DONE --> IMAGES
     FAIL --> IMAGES
-    IMAGES -->|single image + short text| CAPTION
-    IMAGES -->|multiple or long text| SEPARATE
-    IMAGES -->|no images| SEND
-    CAPTION --> CLEAN
-    SEPARATE --> SEND --> CLEAN
+    IMAGES -->|single image + short text| CAPTION --> CLEAN
+    IMAGES -->|multiple or long text| SEND --> SEPARATE --> CLEAN
+    IMAGES -->|no images| SEND --> CLEAN
 ```
 
 Callers provide `error_messages` when the turn threw an exception (CancelledError for `/stop`, general exceptions for failures). When error_messages is present, the normal flush/format path is skipped entirely.
@@ -234,6 +234,8 @@ Callers provide `error_messages` when the turn threw an exception (CancelledErro
 | 10 | Orchestrator | Commands (`/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`, `/stop`) and `agentic_text` catch-all. |
 
 Rejection at any middleware layer raises `ApplicationHandlerStop`, preventing subsequent groups from running.
+
+**SDK-level tool validation** — separate from the middleware chain, `ToolMonitor` (`src/claude/monitor.py`) validates Claude's tool calls against the allowlist/disallowlist via a `can_use_tool` callback set when building SDK options. This runs inside the Claude subprocess, not in the Telegram message pipeline. Bypassable with `DISABLE_TOOL_VALIDATION=true`.
 
 ## Feature flags
 
@@ -262,6 +264,7 @@ Rejection at any middleware layer raises `ApplicationHandlerStop`, preventing su
 | `src/bot/media/` | Processing: voice transcription, image handling |
 | `src/bot/middleware/` | Security, auth, rate limit middleware |
 | `src/claude/persistent.py` | PersistentClientManager, state machine |
+| `src/claude/monitor.py` | ToolMonitor, tool allowlist/disallowlist validation |
 | `src/claude/sdk_integration.py` | SDK options builder, StreamUpdate |
 | `src/config/settings.py` | Pydantic Settings, all env vars |
 | `src/config/features.py` | FeatureFlags computed properties |

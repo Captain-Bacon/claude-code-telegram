@@ -59,7 +59,7 @@ Each client has a `_response_collector` background task that runs for the client
 
 **[VERIFIED]** When Claude is working, the `_response_collector` streams messages to the `StreamSession` callback:
 
-1. **Tool calls** — StreamSession logs them in the tool_log (for the progress message), notifies HeartbeatPin (which updates its pinned message text to "⚙️ ToolName N"), and optionally forwards to a DraftStreamer (live typing preview in private chats, gated by `ENABLE_STREAM_DRAFTS`).
+1. **Tool calls** — three parallel operations in the same for-loop: (a) append to tool_log if verbose ≥ 1 (for progress message), (b) notify HeartbeatPin via `tool_called(name)` (updates pinned text to "⚙️ ToolName N"), (c) forward to DraftStreamer if active. These are independent — tool_log does not feed into HeartbeatPin.
 
 2. **Assistant text** (Claude's intermediate commentary) — batched in `_pending_text` with a 1.5-second window (`_TEXT_BATCH_WINDOW`). A `_schedule_flush` task fires after the window, sending accumulated text as persistent Telegram messages. The `_stream_lock` protects the shared state; the `_send_lock` serialises network I/O so concurrent flushes don't interleave.
 
