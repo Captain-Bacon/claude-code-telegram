@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Delivery pipeline hardened and fully tested (69 tests). Architecture documented with Mermaid diagrams (docs/architecture.md) — 5 cross-check loops found and fixed a real bug (media handlers don't queue when busy, bead dya). README rewritten for personal-tool reality. HeartbeatPin has a feature flag now. Next priorities: the media-busy bug (dya, P2), then the strip-and-restructure epic (kyj, P1). Stale reference docs (6vz) can wait.
+Core bot stable — delivery pipeline hardened (69 tests), architecture documented with Mermaid diagrams (docs/architecture.md), strip-and-restructure epic complete. Media handlers now queue when Claude is busy (same as text). Scheduled jobs support per-job model selection. Remaining work is peripheral: stale docs (6vz), worktree isolation (9l0), SDK injection research (9mb).
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -56,7 +56,6 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Draining state relies on undocumented SDK behaviour with 120s timeout guess
 - **Worktree agent isolation DOES NOT WORK** — agents write to main repo. Do not use `isolation: "worktree"`.
 - **Linter/autoformatter modifies files between Edit reads and writes** — cause unknown, likely IDE
-- **Media handlers don't queue when client busy** — voice/photo/document while Claude is working = silent message loss (bead dya)
 
 <!-- What hasn't been decided -->
 ## Open Questions

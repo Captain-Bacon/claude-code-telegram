@@ -46,7 +46,9 @@ flowchart TD
     BUSY -->|no| TS
     BUSY -->|yes| QUEUE
 
-    MH --> TS
+    MH --> MBUSY{"Client\nbusy?"}
+    MBUSY -->|no| TS
+    MBUSY -->|yes| QUEUE
 
     TS --> PCM --> CLI
     CLI -->|stream events| TS
@@ -68,11 +70,13 @@ The normal path. User sends a message, it passes through middleware, the orchest
 
 Called at the end of `agentic_text` after the turn completes. Queued messages do NOT re-enter middleware — they were already authenticated on arrival. The drain loop: pop the queue, delete placeholders, combine messages with timestamps, send the combined text as a new turn. If more messages arrive during the drain turn, they get queued and drained on the next iteration.
 
+When any queued message carries images (from media handlers), messages are sent individually rather than combined — image content blocks can't be merged into a text-only prompt.
+
 ### Media (`_handle_media_message`)
 
 Voice notes are transcribed (Parakeet MLX locally, or Mistral/OpenAI APIs). Photos are base64-encoded for multimodal input. Documents are processed. The result is text or text+images sent to Claude via `send_message`.
 
-**Known gap:** media handlers do NOT check if the client is busy. If the user sends a voice note while Claude is working, `send_message` injects it (returns None), the progress message is silently deleted, and no response is shown. Text messages avoid this because `agentic_text` checks `get_client_state()` and queues instead.
+Media handlers check `get_client_state()` before sending — same as text. If busy, the processed media (including images) is queued via an `on_busy` callback from the orchestrator. The drain loop handles image-bearing messages individually (no combining) to preserve media content.
 
 ### Turn setup
 
