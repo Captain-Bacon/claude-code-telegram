@@ -435,6 +435,62 @@ class TestProperties:
 
 
 # ---------------------------------------------------------------------------
+# Fallback sends only unsent remainder
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackRemainder:
+    async def test_fallback_sends_only_unsent_messages(
+        self, session, telegram_update
+    ):
+        """When HTML send fails on message 2 of 3, fallback sends only messages 2+3."""
+        session._pending_text = ["chunk one\n\nchunk two\n\nchunk three"]
+
+        call_count = 0
+
+        async def selective_fail(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                # Second formatted message fails as HTML
+                raise Exception("parse error")
+            sent = MagicMock()
+            sent.message_id = call_count
+            return sent
+
+        telegram_update.effective_message.reply_text.side_effect = selective_fail
+
+        with patch(
+            "src.bot.utils.formatting.ResponseFormatter"
+        ) as MockFormatter:
+            mock_fmt = MagicMock()
+            msg1 = MagicMock()
+            msg1.text = "chunk one"
+            msg1.parse_mode = "HTML"
+            msg2 = MagicMock()
+            msg2.text = "chunk two"
+            msg2.parse_mode = "HTML"
+            msg3 = MagicMock()
+            msg3.text = "chunk three"
+            msg3.parse_mode = "HTML"
+            mock_fmt.format_claude_response.return_value = [msg1, msg2, msg3]
+            MockFormatter.return_value = mock_fmt
+
+            await session.flush_pending()
+
+        # Call 1: msg1 (HTML, succeeds)
+        # Call 2: msg2 (HTML, fails)
+        # Call 3: fallback plain text of msg2+msg3
+        assert call_count == 3
+        fallback_call = telegram_update.effective_message.reply_text.call_args_list[2]
+        fallback_text = fallback_call[0][0]
+        assert "chunk two" in fallback_text
+        assert "chunk three" in fallback_text
+        assert "chunk one" not in fallback_text
+        assert session.text_was_sent
+
+
+# ---------------------------------------------------------------------------
 # Progress edit throttle — skips when heartbeat active
 # ---------------------------------------------------------------------------
 

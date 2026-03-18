@@ -9,7 +9,7 @@ import html as html_mod
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import structlog
 
@@ -17,7 +17,6 @@ from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from .utils.draft_streamer import DraftStreamer
 from .utils.heartbeat_pin import HeartbeatPin
-from .utils.html_format import escape_html
 from .utils.image_extractor import ImageAttachment, validate_image_path
 
 logger = structlog.get_logger()
@@ -418,7 +417,7 @@ class StreamSession:
 
         formatter = ResponseFormatter(self._settings)
         formatted = formatter.format_claude_response(combined)
-        for msg in formatted:
+        for i, msg in enumerate(formatted):
             if not msg.text or not msg.text.strip():
                 continue
             try:
@@ -443,11 +442,13 @@ class StreamSession:
                     send_duration_ms=round(send_duration_ms, 1),
                     text_length=len(msg.text),
                 )
-                # Fallback: send entire batch as plain text, then stop
-                # looping — the fallback covers everything remaining.
+                # Fallback: send only the unsent remainder as plain text.
+                remainder = "\n\n".join(
+                    m.text for m in formatted[i:] if m.text and m.text.strip()
+                )
                 try:
                     await self._telegram_update.effective_message.reply_text(
-                        combined,
+                        remainder,
                         reply_markup=None,
                         disable_notification=True,
                         do_quote=False,
