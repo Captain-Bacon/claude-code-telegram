@@ -26,6 +26,8 @@ poetry run mypy src
 
 ## Architecture
 
+Full architecture with diagrams: `docs/architecture.md` — extend it when working in undocumented subsystems.
+
 ### Claude SDK Integration
 
 **`PersistentClientManager`** (`src/claude/persistent.py`) is the only Claude integration path. One long-lived `ClaudeSDKClient` subprocess per Telegram thread, with idle→busy→draining state machine, message injection mid-turn, interrupt support, and per-turn cost deltas.
@@ -107,7 +109,7 @@ Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool na
 
 Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`|`parakeet`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`, `PARAKEET_MODEL`. Parakeet runs locally on Apple Silicon via MLX — no API key needed. Implementation in `src/bot/media/voice_handler.py`.
 
-Feature flags in `src/config/features.py` control: MCP, voice messages, API server, scheduler.
+Feature flags in `src/config/features.py` control: MCP, voice messages, API server, scheduler, heartbeat pin, stream drafts.
 
 ### DateTime Convention
 
