@@ -1,10 +1,11 @@
-"""Stream callback factory for handling Claude SDK streaming updates.
+"""Stream callback for handling Claude SDK streaming updates.
 
-Provides the stream callback implementation for verbose progress tracking,
+Provides the StreamSession class for verbose progress tracking,
 draft streaming, MCP image interception, and real-time message delivery.
 """
 
 import asyncio
+import html as html_mod
 import re
 import time
 from pathlib import Path
@@ -155,6 +156,336 @@ def _summarize_tool_input(tool_name: str, tool_input: Dict[str, Any]) -> str:
     return ""
 
 
+class StreamSession:
+    """Manages streaming state for a single Claude turn.
+
+    Callable — pass directly as ``stream_callback`` to the SDK.
+    Replaces the former closure-based ``make_stream_callback`` factory.
+
+    Handles: verbose progress edits, draft streaming, MCP image
+    interception, real-time text/thinking delivery to Telegram,
+    heartbeat pin coordination, and flush success tracking.
+    """
+
+    _TEXT_BATCH_WINDOW = 1.5  # seconds
+
+    def __init__(
+        self,
+        settings: Settings,
+        verbose_level: int,
+        progress_msg: Any,
+        tool_log: List[Dict[str, Any]],
+        start_time: float,
+        mcp_images: Optional[List[ImageAttachment]] = None,
+        approved_directory: Optional[Path] = None,
+        draft_streamer: Optional[DraftStreamer] = None,
+        telegram_update: Optional[Any] = None,
+        heartbeat_pin: Optional[HeartbeatPin] = None,
+    ) -> None:
+        self._settings = settings
+        self._verbose_level = verbose_level
+        self._progress_msg = progress_msg
+        self._tool_log = tool_log
+        self._start_time = start_time
+        self._mcp_images = mcp_images
+        self._approved_directory = approved_directory
+        self._draft_streamer = draft_streamer
+        self._telegram_update = telegram_update
+        self._heartbeat_pin = heartbeat_pin
+
+        self._need_mcp_intercept = (
+            mcp_images is not None and approved_directory is not None
+        )
+        self._active = not (
+            verbose_level == 0
+            and not self._need_mcp_intercept
+            and draft_streamer is None
+            and telegram_update is None
+            and heartbeat_pin is None
+        )
+
+        # Mutable state
+        self._last_edit_time = 0.0
+        self._pending_text: List[str] = []
+        self._pending_thinking: List[str] = []
+        self._thinking_message_ids: List[int] = []
+        self._text_batch_task: Optional[asyncio.Task[None]] = None
+        self._text_was_sent = False
+        self._flush_succeeded = True
+
+        # Lock protecting mutable state above. Concurrent async operations
+        # (_schedule_flush, _enqueue_text, flush_pending) race on the shared
+        # lists and the cancel-and-recreate pattern for _text_batch_task.
+        self._stream_lock = asyncio.Lock()
+
+        # Serialises Telegram sends so two concurrent flushes don't
+        # interleave messages. Separate from _stream_lock so that
+        # network I/O never blocks _enqueue_text / __call__.
+        self._send_lock = asyncio.Lock()
+
+    # -- Public properties --------------------------------------------------
+
+    @property
+    def text_was_sent(self) -> bool:
+        """Whether assistant text was sent as standalone messages this turn."""
+        return self._text_was_sent
+
+    @property
+    def flush_succeeded(self) -> bool:
+        """Whether all flush attempts completed without lost messages."""
+        return self._flush_succeeded
+
+    # -- Callable interface (SDK stream callback) ---------------------------
+
+    async def __call__(self, update_obj: StreamUpdate) -> None:
+        """Process a streaming update from the Claude SDK."""
+        if not self._active:
+            return
+
+        # Intercept send_image_to_user MCP tool calls.
+        if update_obj.tool_calls and self._need_mcp_intercept:
+            for tc in update_obj.tool_calls:
+                tc_name = tc.get("name", "")
+                if tc_name == "send_image_to_user" or tc_name.endswith(
+                    "__send_image_to_user"
+                ):
+                    tc_input = tc.get("input", {})
+                    file_path = tc_input.get("file_path", "")
+                    caption = tc_input.get("caption", "")
+                    img = validate_image_path(
+                        file_path, self._approved_directory, caption
+                    )
+                    if img:
+                        self._mcp_images.append(img)
+
+        # Capture tool calls
+        if update_obj.tool_calls:
+            for tc in update_obj.tool_calls:
+                name = tc.get("name", "unknown")
+                detail = _summarize_tool_input(name, tc.get("input", {}))
+                if self._verbose_level >= 1:
+                    self._tool_log.append(
+                        {"kind": "tool", "name": name, "detail": detail}
+                    )
+                if self._draft_streamer:
+                    icon = _tool_icon(name)
+                    line = f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
+                    await self._draft_streamer.append_tool(line)
+                if self._heartbeat_pin:
+                    await self._heartbeat_pin.tool_called(name)
+
+        # Send thinking blocks as ephemeral messages (deleted after response)
+        if update_obj.type == "thinking" and update_obj.content:
+            text = update_obj.content.strip()
+            if text and self._telegram_update:
+                await self._enqueue_text(text, is_thinking=True)
+            if self._draft_streamer:
+                first_line = text.split("\n", 1)[0].strip() if text else ""
+                if first_line:
+                    await self._draft_streamer.append_tool(
+                        f"\U0001f914 {first_line[:80]}"
+                    )
+
+        # Capture assistant text (reasoning / commentary)
+        if update_obj.type == "assistant" and update_obj.content:
+            text = update_obj.content.strip()
+            if text:
+                if self._telegram_update:
+                    await self._enqueue_text(text)
+                first_line = text.split("\n", 1)[0].strip()
+                if first_line:
+                    if self._verbose_level >= 1:
+                        self._tool_log.append(
+                            {"kind": "text", "detail": first_line[:120]}
+                        )
+                    if self._draft_streamer:
+                        await self._draft_streamer.append_tool(
+                            f"\U0001f4ac {first_line[:120]}"
+                        )
+
+        # Stream text to user via draft (prefer token deltas;
+        # skip full assistant messages to avoid double-appending)
+        if self._draft_streamer and update_obj.content:
+            if update_obj.type == "stream_delta":
+                await self._draft_streamer.append_text(update_obj.content)
+
+        # Throttle progress message edits to avoid Telegram rate limits.
+        # Skip entirely when heartbeat pin is active — it IS the liveness signal.
+        if not self._draft_streamer and self._verbose_level >= 1:
+            if self._heartbeat_pin and self._heartbeat_pin.has_active_message:
+                pass  # heartbeat pin handles liveness
+            elif (time.time() - self._last_edit_time) >= 8.0 and self._tool_log:
+                self._last_edit_time = time.time()
+                new_text = _format_verbose_progress(
+                    self._tool_log, self._verbose_level, self._start_time
+                )
+                try:
+                    await self._progress_msg.edit_text(new_text)
+                except Exception:
+                    pass
+
+    # -- Public methods -----------------------------------------------------
+
+    async def flush_pending(self) -> None:
+        """Send any accumulated text/thinking as persistent messages.
+
+        Call after streaming completes to ensure buffered intermediate
+        text or thinking blocks are sent before the final response.
+        """
+        # --- Phase 1: collect under _stream_lock ---
+        t0 = time.time()
+        async with self._stream_lock:
+            lock_wait_ms = (time.time() - t0) * 1000
+            if lock_wait_ms > 100:
+                logger.warning(
+                    "stream_lock.slow_acquire",
+                    wait_ms=round(lock_wait_ms, 1),
+                    phase="flush_collect",
+                )
+
+            if not self._telegram_update:
+                return
+
+            thinking_snapshot = list(self._pending_thinking)
+            self._pending_thinking.clear()
+            text_snapshot = list(self._pending_text)
+            self._pending_text.clear()
+
+        if not thinking_snapshot and not text_snapshot:
+            return
+
+        # --- Phase 2: send under _send_lock (network I/O) ---
+        async with self._send_lock:
+            if thinking_snapshot:
+                await self._send_thinking(thinking_snapshot)
+            if text_snapshot:
+                await self._send_text(text_snapshot)
+
+    async def delete_thinking(self) -> None:
+        """Delete all ephemeral thinking messages sent during streaming."""
+        if not self._telegram_update or not self._thinking_message_ids:
+            return
+        chat = self._telegram_update.effective_message.chat
+        for msg_id in self._thinking_message_ids:
+            try:
+                await chat.delete_message(msg_id)
+            except Exception as e:
+                logger.debug(
+                    "Failed to delete thinking message",
+                    message_id=msg_id,
+                    error=str(e),
+                )
+        self._thinking_message_ids.clear()
+
+    # -- Private methods ----------------------------------------------------
+
+    async def _send_thinking(self, thinking_snapshot: List[str]) -> None:
+        """Send accumulated thinking as a single ephemeral message."""
+        from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+
+        thinking_text = "\n\n".join(thinking_snapshot)
+        escaped = html_mod.escape(thinking_text)
+        prefix = "\U0001f9e0 "
+        max_content = TELEGRAM_MAX_MESSAGE_LENGTH - len(prefix)
+        if len(escaped) > max_content:
+            escaped = escaped[: max_content - 1] + "\u2026"
+        thinking_msg = f"{prefix}{escaped}"
+        try:
+            send_t0 = time.time()
+            sent = await self._telegram_update.effective_message.reply_text(
+                thinking_msg,
+                parse_mode="HTML",
+                disable_notification=True,
+            )
+            self._thinking_message_ids.append(sent.message_id)
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            send_duration_ms = (time.time() - send_t0) * 1000
+            logger.warning(
+                "Failed to send thinking message",
+                error=str(e),
+                error_type=type(e).__name__,
+                send_duration_ms=round(send_duration_ms, 1),
+            )
+
+    async def _send_text(self, text_snapshot: List[str]) -> None:
+        """Send accumulated commentary text as persistent messages."""
+        from .utils.formatting import ResponseFormatter
+
+        combined = "\n\n".join(text_snapshot)
+        if not combined.strip():
+            return
+
+        formatter = ResponseFormatter(self._settings)
+        formatted = formatter.format_claude_response(combined)
+        for msg in formatted:
+            if not msg.text or not msg.text.strip():
+                continue
+            try:
+                send_t0 = time.time()
+                await self._telegram_update.effective_message.reply_text(
+                    msg.text,
+                    parse_mode=msg.parse_mode,
+                    reply_markup=None,
+                    disable_notification=True,
+                    do_quote=False,
+                )
+                self._text_was_sent = True
+                if self._heartbeat_pin:
+                    self._heartbeat_pin.reset_throttle()
+                await asyncio.sleep(0.3)
+            except Exception as send_err:
+                send_duration_ms = (time.time() - send_t0) * 1000
+                logger.warning(
+                    "Failed to send intermediate text",
+                    error=str(send_err),
+                    error_type=type(send_err).__name__,
+                    send_duration_ms=round(send_duration_ms, 1),
+                    text_length=len(msg.text),
+                )
+                # Fallback: send entire batch as plain text, then stop
+                # looping — the fallback covers everything remaining.
+                try:
+                    await self._telegram_update.effective_message.reply_text(
+                        combined,
+                        reply_markup=None,
+                        disable_notification=True,
+                        do_quote=False,
+                    )
+                    self._text_was_sent = True
+                except Exception:
+                    self._flush_succeeded = False
+                break
+
+    async def _schedule_flush(self) -> None:
+        """Wait for the batch window then flush."""
+        await asyncio.sleep(self._TEXT_BATCH_WINDOW)
+        await self.flush_pending()
+        self._text_batch_task = None
+
+    async def _enqueue_text(self, text: str, is_thinking: bool = False) -> None:
+        """Add text to the pending batch and schedule a flush."""
+        t0 = time.time()
+        async with self._stream_lock:
+            lock_wait_ms = (time.time() - t0) * 1000
+            if lock_wait_ms > 100:
+                logger.warning(
+                    "stream_lock.slow_acquire",
+                    wait_ms=round(lock_wait_ms, 1),
+                    phase="enqueue",
+                )
+
+            if is_thinking:
+                self._pending_thinking.append(text)
+            else:
+                self._pending_text.append(text)
+
+            # Cancel any existing scheduled flush and restart the timer
+            if self._text_batch_task is not None:
+                self._text_batch_task.cancel()
+            self._text_batch_task = asyncio.create_task(self._schedule_flush())
+
+
 def make_stream_callback(
     settings: Settings,
     verbose_level: int,
@@ -166,320 +497,28 @@ def make_stream_callback(
     draft_streamer: Optional[DraftStreamer] = None,
     telegram_update: Optional[Any] = None,
     heartbeat_pin: Optional[HeartbeatPin] = None,
-) -> Optional[Callable[[StreamUpdate], Any]]:
-    """Create a stream callback for verbose progress updates.
+) -> "StreamSession":
+    """Create a StreamSession for a Claude turn.
 
-    When *mcp_images* is provided, the callback also intercepts
-    ``send_image_to_user`` tool calls and collects validated
-    :class:`ImageAttachment` objects for later Telegram delivery.
-
-    When *draft_streamer* is provided, tool activity and assistant
-    text are streamed to the user in real time via
-    ``sendMessageDraft``.
-
-    When *telegram_update* is provided, Claude's text commentary
-    between tool calls is sent as persistent Telegram messages
-    immediately (not batched until the end).  Thinking blocks are
-    sent as ephemeral messages visible during streaming and deleted
-    once the final response is delivered.
-
-    Returns None when verbose_level is 0 **and** no MCP image
-    collection or draft streaming is requested.
-    Typing indicators are handled by a separate heartbeat task.
+    Returns a callable StreamSession that can be passed directly as
+    ``stream_callback`` to the SDK.
     """
-    import html as html_mod
-
-    need_mcp_intercept = mcp_images is not None and approved_directory is not None
-
-    if (
-        verbose_level == 0
-        and not need_mcp_intercept
-        and draft_streamer is None
-        and telegram_update is None
-        and heartbeat_pin is None
-    ):
-        return None
-
-    last_edit_time = [0.0]  # mutable container for closure
-
-    # Batching state for rapid-fire text blocks (rate-limit safety).
-    # We accumulate text for up to _TEXT_BATCH_WINDOW seconds before
-    # sending a single persistent message.
-    _TEXT_BATCH_WINDOW = 1.5  # seconds
-    _pending_text: List[str] = []
-    _pending_thinking: List[str] = []
-    _thinking_message_ids: List[int] = []
-    _text_batch_task: List[Optional[asyncio.Task]] = [None]
-
-    # Track whether assistant text was sent as standalone messages
-    # during this turn.  If True, the final response is suppressed
-    # (the standalone messages already delivered the content).
-    _text_was_sent = [False]
-
-    # Track whether the final flush completed without losing messages.
-    # If False AND _text_was_sent is True, deliver_turn_result resends
-    # as a safety net (partial duplication > lost response).
-    _flush_succeeded = [True]
-
-    # Lock protecting the mutable closure state above.  Without this,
-    # concurrent async operations (_schedule_flush, _enqueue_text,
-    # the external flush_pending entry-point) race on the shared lists
-    # and the cancel-and-recreate pattern for _text_batch_task.
-    _stream_lock = asyncio.Lock()
-
-    # Serialises Telegram sends so two concurrent flushes don't
-    # interleave messages.  Separate from _stream_lock so that
-    # network I/O never blocks _enqueue_text / _on_stream.
-    _send_lock = asyncio.Lock()
-
-    async def _flush_pending_text() -> None:
-        """Send accumulated text/thinking as persistent messages.
-
-        Collects pending data under _stream_lock (microseconds),
-        then sends to Telegram under _send_lock (network I/O).
-        This prevents slow/failing Telegram sends from blocking
-        the SDK message pipeline.
-        """
-        # --- Phase 1: collect under _stream_lock ---
-        t0 = time.time()
-        async with _stream_lock:
-            lock_wait_ms = (time.time() - t0) * 1000
-            if lock_wait_ms > 100:
-                logger.warning(
-                    "stream_lock.slow_acquire",
-                    wait_ms=round(lock_wait_ms, 1),
-                    phase="flush_collect",
-                )
-
-            if not telegram_update:
-                return
-
-            # Snapshot and clear — releases lock quickly
-            thinking_snapshot = list(_pending_thinking)
-            _pending_thinking.clear()
-            text_snapshot = list(_pending_text)
-            _pending_text.clear()
-
-        # Nothing to send
-        if not thinking_snapshot and not text_snapshot:
-            return
-
-        # --- Phase 2: send under _send_lock (network I/O) ---
-        async with _send_lock:
-            # Send thinking as ephemeral messages
-            if thinking_snapshot:
-                from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
-
-                thinking_text = "\n\n".join(thinking_snapshot)
-                escaped = html_mod.escape(thinking_text)
-                prefix = "\U0001f9e0 "
-                max_content = TELEGRAM_MAX_MESSAGE_LENGTH - len(prefix)
-                if len(escaped) > max_content:
-                    escaped = escaped[: max_content - 1] + "\u2026"
-                thinking_msg = f"{prefix}{escaped}"
-                try:
-                    send_t0 = time.time()
-                    sent = await telegram_update.effective_message.reply_text(
-                        thinking_msg,
-                        parse_mode="HTML",
-                        disable_notification=True,
-                    )
-                    _thinking_message_ids.append(sent.message_id)
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    send_duration_ms = (time.time() - send_t0) * 1000
-                    logger.warning(
-                        "Failed to send thinking message",
-                        error=str(e),
-                        error_type=type(e).__name__,
-                        send_duration_ms=round(send_duration_ms, 1),
-                    )
-
-            # Send commentary text
-            if text_snapshot:
-                combined = "\n\n".join(text_snapshot)
-                if not combined.strip():
-                    return
-
-                from .utils.formatting import ResponseFormatter
-
-                formatter = ResponseFormatter(settings)
-                formatted = formatter.format_claude_response(combined)
-                for msg in formatted:
-                    if not msg.text or not msg.text.strip():
-                        continue
-                    try:
-                        send_t0 = time.time()
-                        await telegram_update.effective_message.reply_text(
-                            msg.text,
-                            parse_mode=msg.parse_mode,
-                            reply_markup=None,
-                            disable_notification=True,
-                            do_quote=False,
-                        )
-                        _text_was_sent[0] = True
-                        # Content just went out — reset heartbeat throttle
-                        # so it doesn't immediately edit redundantly
-                        if heartbeat_pin:
-                            heartbeat_pin.reset_throttle()
-                        await asyncio.sleep(0.3)
-                    except Exception as send_err:
-                        send_duration_ms = (time.time() - send_t0) * 1000
-                        logger.warning(
-                            "Failed to send intermediate text",
-                            error=str(send_err),
-                            error_type=type(send_err).__name__,
-                            send_duration_ms=round(send_duration_ms, 1),
-                            text_length=len(msg.text),
-                        )
-                        # Fallback: send as plain text
-                        try:
-                            await telegram_update.effective_message.reply_text(
-                                combined,
-                                reply_markup=None,
-                                disable_notification=True,
-                                do_quote=False,
-                            )
-                        except Exception:
-                            # Both HTML and plain text failed — mark flush as failed
-                            _flush_succeeded[0] = False
-
-    async def _schedule_flush() -> None:
-        """Wait for the batch window then flush."""
-        await asyncio.sleep(_TEXT_BATCH_WINDOW)
-        await _flush_pending_text()
-        _text_batch_task[0] = None
-
-    async def _enqueue_text(text: str, is_thinking: bool = False) -> None:
-        """Add text to the pending batch and schedule a flush."""
-        t0 = time.time()
-        async with _stream_lock:
-            lock_wait_ms = (time.time() - t0) * 1000
-            if lock_wait_ms > 100:
-                logger.warning(
-                    "stream_lock.slow_acquire",
-                    wait_ms=round(lock_wait_ms, 1),
-                    phase="enqueue",
-                )
-
-            if is_thinking:
-                _pending_thinking.append(text)
-            else:
-                _pending_text.append(text)
-
-            # Cancel any existing scheduled flush and restart the timer
-            if _text_batch_task[0] is not None:
-                _text_batch_task[0].cancel()
-            _text_batch_task[0] = asyncio.create_task(_schedule_flush())
-
-    async def _on_stream(update_obj: StreamUpdate) -> None:
-        # Intercept send_image_to_user MCP tool calls.
-        # The SDK namespaces MCP tools as "mcp__<server>__<tool>",
-        # so match both the bare name and the namespaced variant.
-        if update_obj.tool_calls and need_mcp_intercept:
-            for tc in update_obj.tool_calls:
-                tc_name = tc.get("name", "")
-                if tc_name == "send_image_to_user" or tc_name.endswith(
-                    "__send_image_to_user"
-                ):
-                    tc_input = tc.get("input", {})
-                    file_path = tc_input.get("file_path", "")
-                    caption = tc_input.get("caption", "")
-                    img = validate_image_path(file_path, approved_directory, caption)
-                    if img:
-                        mcp_images.append(img)
-
-        # Capture tool calls
-        if update_obj.tool_calls:
-            for tc in update_obj.tool_calls:
-                name = tc.get("name", "unknown")
-                detail = _summarize_tool_input(name, tc.get("input", {}))
-                if verbose_level >= 1:
-                    tool_log.append({"kind": "tool", "name": name, "detail": detail})
-                if draft_streamer:
-                    icon = _tool_icon(name)
-                    line = f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
-                    await draft_streamer.append_tool(line)
-                if heartbeat_pin:
-                    await heartbeat_pin.tool_called(name)
-
-        # Send thinking blocks as ephemeral messages (deleted after response)
-        if update_obj.type == "thinking" and update_obj.content:
-            text = update_obj.content.strip()
-            if text and telegram_update:
-                await _enqueue_text(text, is_thinking=True)
-            if draft_streamer:
-                first_line = text.split("\n", 1)[0].strip() if text else ""
-                if first_line:
-                    await draft_streamer.append_tool(f"\U0001f914 {first_line[:80]}")
-
-        # Capture assistant text (reasoning / commentary)
-        if update_obj.type == "assistant" and update_obj.content:
-            text = update_obj.content.strip()
-            if text:
-                # Send every assistant text as a persistent standalone
-                # message.  The _text_was_sent flag is set when the
-                # flush actually delivers to Telegram — the final
-                # response path checks this and skips the main text
-                # to avoid duplication.
-                if telegram_update:
-                    await _enqueue_text(text)
-
-                first_line = text.split("\n", 1)[0].strip()
-                if first_line:
-                    if verbose_level >= 1:
-                        tool_log.append({"kind": "text", "detail": first_line[:120]})
-                    if draft_streamer:
-                        await draft_streamer.append_tool(
-                            f"\U0001f4ac {first_line[:120]}"
-                        )
-
-        # Stream text to user via draft (prefer token deltas;
-        # skip full assistant messages to avoid double-appending)
-        if draft_streamer and update_obj.content:
-            if update_obj.type == "stream_delta":
-                await draft_streamer.append_text(update_obj.content)
-
-        # Throttle progress message edits to avoid Telegram rate limits.
-        # Skip entirely when heartbeat pin is active — it IS the liveness signal.
-        if not draft_streamer and verbose_level >= 1:
-            if heartbeat_pin and heartbeat_pin.has_active_message:
-                pass  # heartbeat pin handles liveness
-            elif (time.time() - last_edit_time[0]) >= 8.0 and tool_log:
-                last_edit_time[0] = time.time()
-                new_text = _format_verbose_progress(tool_log, verbose_level, start_time)
-                try:
-                    await progress_msg.edit_text(new_text)
-                except Exception:
-                    pass
-
-    async def _delete_thinking_messages() -> None:
-        """Delete all ephemeral thinking messages sent during streaming."""
-        if not telegram_update or not _thinking_message_ids:
-            return
-        chat = telegram_update.effective_message.chat
-        for msg_id in _thinking_message_ids:
-            try:
-                await chat.delete_message(msg_id)
-            except Exception as e:
-                logger.debug(
-                    "Failed to delete thinking message",
-                    message_id=msg_id,
-                    error=str(e),
-                )
-        _thinking_message_ids.clear()
-
-    # Attach helpers so callers can drain pending text and check state
-    _on_stream.flush_pending = _flush_pending_text  # type: ignore[attr-defined]
-    _on_stream.delete_thinking = _delete_thinking_messages  # type: ignore[attr-defined]
-    _on_stream.text_was_sent = _text_was_sent  # type: ignore[attr-defined]
-    _on_stream.flush_succeeded = _flush_succeeded  # type: ignore[attr-defined]
-
-    return _on_stream
+    return StreamSession(
+        settings=settings,
+        verbose_level=verbose_level,
+        progress_msg=progress_msg,
+        tool_log=tool_log,
+        start_time=start_time,
+        mcp_images=mcp_images,
+        approved_directory=approved_directory,
+        draft_streamer=draft_streamer,
+        telegram_update=telegram_update,
+        heartbeat_pin=heartbeat_pin,
+    )
 
 
 async def flush_stream_callback(
-    on_stream: Optional[Callable],
+    on_stream: Optional[Any],
 ) -> None:
     """Flush any pending batched text from the stream callback.
 
@@ -495,7 +534,7 @@ async def flush_stream_callback(
 
 
 async def cleanup_thinking_messages(
-    on_stream: Optional[Callable],
+    on_stream: Optional[Any],
 ) -> None:
     """Delete ephemeral thinking messages after the final response is sent."""
     if on_stream and hasattr(on_stream, "delete_thinking"):

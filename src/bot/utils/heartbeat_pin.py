@@ -62,9 +62,24 @@ class HeartbeatPin:
         self._pending_text = None
 
     async def cleanup(self) -> None:
-        """Unpin and delete the heartbeat message."""
+        """Unpin and delete the heartbeat message.
+
+        Edits to a benign final state first so that if deletion fails
+        (no admin rights in groups), the remnant is informative rather
+        than a cryptic tool count.
+        """
         if not self._message_id:
             return
+
+        # Best-effort edit to final state before deletion
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self._message_id,
+                text="\u2705 Done",
+            )
+        except Exception:
+            pass
 
         if self._pinned:
             try:

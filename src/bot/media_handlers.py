@@ -21,7 +21,8 @@ from telegram.ext import ContextTypes
 from ..claude.persistent import PersistentClientManager, derive_state_key
 from ..config.features import FeatureFlags
 from ..config.settings import Settings
-from .delivery import deliver_turn_result, start_typing_heartbeat
+from .delivery import deliver_turn_result
+from .utils.heartbeat_pin import HeartbeatPin
 from .stream_handler import flush_stream_callback, make_stream_callback
 from .utils.error_format import (
     _format_error_message,
@@ -33,9 +34,7 @@ from .utils.image_extractor import ImageAttachment
 logger = structlog.get_logger()
 
 
-def _get_verbose_level(
-    settings: Settings, context: ContextTypes.DEFAULT_TYPE
-) -> int:
+def _get_verbose_level(settings: Settings, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Return effective verbose level: per-user override or global default.
 
     Shared — imported by orchestrator.py for agentic_text and _drain_queue.
@@ -129,7 +128,10 @@ async def agentic_document(
         import base64
 
         b64 = base64.b64encode(file_bytes).decode("utf-8")
-        caption = update.message.caption or f"The user is sharing a file: {document.file_name}"
+        caption = (
+            update.message.caption
+            or f"The user is sharing a file: {document.file_name}"
+        )
         block_type = "document" if ext in _NATIVE_DOC_TYPES else "image"
 
         await _handle_media_message(
@@ -157,8 +159,7 @@ async def agentic_document(
             content = content[:50000] + "\n... (truncated)"
         caption = update.message.caption or "Please review this file:"
         prompt = (
-            f"{caption}\n\n**File:** `{document.file_name}`\n\n"
-            f"```\n{content}\n```"
+            f"{caption}\n\n**File:** `{document.file_name}`\n\n" f"```\n{content}\n```"
         )
     except UnicodeDecodeError:
         await progress_msg.edit_text(
@@ -223,9 +224,7 @@ async def agentic_photo(
 
     except Exception as e:
         await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
-        logger.error(
-            "Claude photo processing failed", error=str(e), user_id=user_id
-        )
+        logger.error("Claude photo processing failed", error=str(e), user_id=user_id)
 
 
 async def agentic_voice(
@@ -274,9 +273,7 @@ async def agentic_voice(
 
     except Exception as e:
         await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
-        logger.error(
-            "Claude voice processing failed", error=str(e), user_id=user_id
-        )
+        logger.error("Claude voice processing failed", error=str(e), user_id=user_id)
 
 
 async def _handle_media_message(
@@ -314,6 +311,13 @@ async def _handle_media_message(
     tool_log: List[Dict[str, Any]] = []
     start_time = time.time()
     mcp_images_media: List[ImageAttachment] = []
+
+    heartbeat_pin = HeartbeatPin(
+        bot=context.bot,
+        chat_id=chat.id,
+        message_thread_id=getattr(update.message, "message_thread_id", None),
+    )
+
     on_stream = make_stream_callback(
         settings,
         verbose_level,
@@ -323,9 +327,27 @@ async def _handle_media_message(
         mcp_images=mcp_images_media,
         approved_directory=settings.approved_directory,
         telegram_update=update,
+        heartbeat_pin=heartbeat_pin,
     )
 
-    heartbeat = start_typing_heartbeat(chat)
+    # Stall callback — edits progress message when watchdog detects silence
+    async def on_stall(
+        silence_seconds: float,
+        total_elapsed_seconds: float,
+        cli_alive: bool,
+        is_dead: bool,
+    ) -> None:
+        if is_dead:
+            text = "\u26a0 Claude process died \u2014 try sending your message again"
+        else:
+            text = (
+                f"\u26a0 No activity for {int(silence_seconds)}s "
+                f"(elapsed {int(total_elapsed_seconds)}s) \u2014 still checking\u2026"
+            )
+        try:
+            await progress_msg.edit_text(text)
+        except Exception:
+            pass
 
     error_messages = None
     claude_response = None
@@ -336,13 +358,18 @@ async def _handle_media_message(
             prompt=prompt,
             working_directory=current_dir,
             stream_callback=on_stream,
+            stall_callback=on_stall,
             model=context.user_data.get("claude_model"),
             force_new=force_new,
             images=images,
         )
 
         if claude_response is None:
-            heartbeat.cancel()
+            if heartbeat_pin:
+                try:
+                    await heartbeat_pin.cleanup()
+                except Exception:
+                    pass
             try:
                 await progress_msg.delete()
             except Exception:
@@ -366,16 +393,16 @@ async def _handle_media_message(
         error_messages = [FormattedMessage("Stopped.", parse_mode=None)]
     except Exception as e:
         success = False
-        logger.error(
-            "Claude media processing failed", error=str(e), user_id=user_id
-        )
+        logger.error("Claude media processing failed", error=str(e), user_id=user_id)
         from .utils.formatting import FormattedMessage
 
-        error_messages = [
-            FormattedMessage(_format_error_message(e), parse_mode="HTML")
-        ]
+        error_messages = [FormattedMessage(_format_error_message(e), parse_mode="HTML")]
     finally:
-        heartbeat.cancel()
+        if heartbeat_pin:
+            try:
+                await heartbeat_pin.cleanup()
+            except Exception:
+                pass
         try:
             await flush_stream_callback(on_stream)
         except Exception:

@@ -21,12 +21,18 @@ def tmp_dir():
 
 @pytest.fixture
 def agentic_settings(tmp_dir):
-    return create_test_config(approved_directory=str(tmp_dir), agentic_mode=True, enable_project_threads=False)
+    return create_test_config(
+        approved_directory=str(tmp_dir), agentic_mode=True, enable_project_threads=False
+    )
 
 
 @pytest.fixture
 def classic_settings(tmp_dir):
-    return create_test_config(approved_directory=str(tmp_dir), agentic_mode=False, enable_project_threads=False)
+    return create_test_config(
+        approved_directory=str(tmp_dir),
+        agentic_mode=False,
+        enable_project_threads=False,
+    )
 
 
 @pytest.fixture
@@ -111,7 +117,6 @@ def test_agentic_registers_8_commands(agentic_settings, deps):
     assert frozenset({"stop"}) in commands
 
 
-
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
     """Agentic mode registers text, document, photo, and voice message handlers."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
@@ -146,8 +151,16 @@ async def test_agentic_bot_commands(agentic_settings, deps):
 
     assert len(commands) == 8
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "model", "restart", "stop"]
-
+    assert cmd_names == [
+        "start",
+        "new",
+        "status",
+        "verbose",
+        "repo",
+        "model",
+        "restart",
+        "stop",
+    ]
 
 
 async def test_restart_command_sends_sigterm(deps):
@@ -398,7 +411,9 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
         "persistent_manager": persistent_manager,
     }
 
-    with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
+    with patch(
+        "src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler
+    ):
         await _agentic_voice(agentic_settings, update, context)
 
     mock_voice_handler.process_voice_message.assert_awaited_once_with(
@@ -471,7 +486,9 @@ async def test_agentic_voice_transcription_failure_surfaces_user_error(
         "persistent_manager": persistent_manager,
     }
 
-    with patch("src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler):
+    with patch(
+        "src.bot.media.voice_handler.VoiceHandler", return_value=mock_voice_handler
+    ):
         await _agentic_voice(agentic_settings, update, context)
 
     progress_msg.edit_text.assert_awaited_once()
@@ -614,9 +631,7 @@ class TestRedactSecrets:
 
     def test_summarize_tool_input_non_bash_unchanged(self, agentic_settings, deps):
         """Non-Bash tools don't go through redaction."""
-        result = _summarize_tool_input(
-            "Read", {"file_path": "/home/user/.env"}
-        )
+        result = _summarize_tool_input("Read", {"file_path": "/home/user/.env"})
         assert result == ".env"
 
 
@@ -624,73 +639,10 @@ class TestRedactSecrets:
 
 
 class TestTypingHeartbeat:
-    """Verify typing indicator stays alive independently of stream events."""
-
-    async def test_heartbeat_sends_typing_action(self, agentic_settings, deps):
-        """Heartbeat sends typing actions at the configured interval."""
-        from src.bot.delivery import start_typing_heartbeat
-
-        chat = AsyncMock()
-        chat.send_action = AsyncMock()
-
-        heartbeat = start_typing_heartbeat(chat, interval=0.05)
-
-        # Let the heartbeat fire a few times
-        await asyncio.sleep(0.2)
-        heartbeat.cancel()
-        try:
-            await heartbeat
-        except asyncio.CancelledError:
-            pass
-
-        # Should have been called multiple times
-        assert chat.send_action.call_count >= 2
-        chat.send_action.assert_called_with("typing")
-
-    async def test_heartbeat_cancels_cleanly(self, agentic_settings, deps):
-        """Cancelling the heartbeat task does not raise."""
-        from src.bot.delivery import start_typing_heartbeat
-
-        chat = AsyncMock()
-        heartbeat = start_typing_heartbeat(chat, interval=0.05)
-
-        heartbeat.cancel()
-        # Should not raise
-        try:
-            await heartbeat
-        except asyncio.CancelledError:
-            pass
-
-        assert heartbeat.cancelled() or heartbeat.done()
-
-    async def test_heartbeat_survives_send_action_errors(self, agentic_settings, deps):
-        """Heartbeat keeps running even if send_action raises."""
-        chat = AsyncMock()
-        call_count = [0]
-
-        async def flaky_send_action(action: str) -> None:
-            call_count[0] += 1
-            if call_count[0] <= 2:
-                raise Exception("Network error")
-
-        chat.send_action = flaky_send_action
-
-        from src.bot.delivery import start_typing_heartbeat
-
-        heartbeat = start_typing_heartbeat(chat, interval=0.05)
-
-        await asyncio.sleep(0.3)
-        heartbeat.cancel()
-        try:
-            await heartbeat
-        except asyncio.CancelledError:
-            pass
-
-        # Should have called send_action more than 2 times (survived errors)
-        assert call_count[0] >= 3
+    """Verify stream callback does not handle typing indicators."""
 
     async def test_stream_callback_independent_of_typing(self, agentic_settings, deps):
-        """Stream callback no longer sends typing — that's the heartbeat's job."""
+        """Stream callback does not accept a chat parameter for typing."""
         from src.bot.stream_handler import make_stream_callback
 
         progress_msg = AsyncMock()

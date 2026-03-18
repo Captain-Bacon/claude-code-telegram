@@ -83,31 +83,6 @@ def abnormal_stop_notice(response: Any) -> Optional[Any]:
     )
 
 
-def start_typing_heartbeat(
-    chat: Any,
-    interval: float = 2.0,
-) -> "asyncio.Task[None]":
-    """Start a background typing indicator task.
-
-    Sends typing every *interval* seconds, independently of
-    stream events. Cancel the returned task in a ``finally``
-    block.
-    """
-
-    async def _heartbeat() -> None:
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                try:
-                    await chat.send_action("typing")
-                except Exception:
-                    pass
-        except asyncio.CancelledError:
-            pass
-
-    return asyncio.create_task(_heartbeat())
-
-
 async def send_images(
     update: Update,
     images: List[ImageAttachment],
@@ -223,9 +198,9 @@ async def deliver_turn_result(
         text_already_sent = (
             on_stream
             and hasattr(on_stream, "text_was_sent")
-            and on_stream.text_was_sent[0]
+            and on_stream.text_was_sent
             and hasattr(on_stream, "flush_succeeded")
-            and on_stream.flush_succeeded[0]
+            and on_stream.flush_succeeded
         )
 
         if text_already_sent:

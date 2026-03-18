@@ -827,6 +827,29 @@ class MessageOrchestrator:
                 heartbeat_pin=heartbeat_pin,
             )
 
+            # Stall callback — same as agentic_text
+            async def on_stall(
+                silence_seconds: float,
+                total_elapsed_seconds: float,
+                cli_alive: bool,
+                is_dead: bool,
+            ) -> None:
+                if is_dead:
+                    text = (
+                        "\u26a0 Claude process died"
+                        " \u2014 try sending your message again"
+                    )
+                else:
+                    text = (
+                        f"\u26a0 No activity for {int(silence_seconds)}s "
+                        f"(elapsed {int(total_elapsed_seconds)}s)"
+                        " \u2014 still checking\u2026"
+                    )
+                try:
+                    await progress_msg.edit_text(text)
+                except Exception:
+                    pass
+
             error_messages = None
             claude_response = None
             success = True
@@ -839,6 +862,7 @@ class MessageOrchestrator:
                     prompt=combined,
                     working_directory=current_dir,
                     stream_callback=on_stream,
+                    stall_callback=on_stall,
                     model=context.user_data.get("claude_model"),
                 )
 
