@@ -70,11 +70,12 @@ context.bot_data["security_validator"]
 
 - `src/config/` -- Pydantic Settings v2 config, feature flags (`features.py`), YAML project loader (`loader.py`)
 - `src/bot/orchestrator.py` -- MessageOrchestrator: handler registration, commands, agentic_text, message queuing, thread routing
-- `src/bot/delivery.py` -- Response delivery: turn result formatting, image sending, context warnings, typing heartbeat
+- `src/bot/delivery.py` -- Response delivery: turn result formatting, image sending, context warnings, stall callback factory
 - `src/bot/media_handlers.py` -- Telegram-facing document/photo/voice handlers (routes to media/ for processing)
 - `src/bot/media/` -- Voice transcription (Parakeet MLX), image processing
 - `src/bot/middleware/` -- Auth, rate limit, security input validation
-- `src/bot/utils/` -- Formatting (HTML escape, message chunking), error formatting
+- `src/bot/stream_handler.py` -- `StreamSession` class: callable stream callback with `text_was_sent`, `flush_succeeded` properties and `flush_pending()`, `delete_thinking()` methods. `make_stream_callback()` returns `StreamSession` (not `Optional[Callable]`). All three turn paths (agentic_text, _drain_queue, _handle_media_message) share the same pattern.
+- `src/bot/utils/` -- Formatting (HTML escape, message chunking), error formatting, `HeartbeatPin` (pinned liveness message during turns)
 - `src/claude/` -- PersistentClientManager, SDK options builder, session management, tool monitoring
 - `src/projects/` -- Multi-project support: `registry.py` (YAML pins + merge), `discovery.py` (git activity scan), `thread_manager.py` (Telegram topic sync)
 - `src/storage/` -- SQLite via aiosqlite, repository pattern
@@ -102,7 +103,7 @@ Security relaxation (trusted environments only): `DISABLE_SECURITY_PATTERNS` (de
 
 Multi-project topics: `ENABLE_PROJECT_THREADS` (default false), `PROJECT_THREADS_MODE` (`private`|`group`), `PROJECT_THREADS_CHAT_ID` (required for group mode), `PROJECTS_CONFIG_PATH` (optional YAML pin list), `PROJECT_THREADS_DISCOVER` (default true, auto-discovers git repos by activity), `PROJECT_THREADS_DISCOVER_LIMIT` (default 10), `PROJECT_THREADS_DISCOVER_DAYS` (default 30), `PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS` (default `1.1`, set `0` to disable pacing). Either `PROJECTS_CONFIG_PATH` or `PROJECT_THREADS_DISCOVER` required.
 
-Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool names + reasoning, 2 = detailed. Users override via `/verbose 0|1|2`. Typing indicator refreshes every ~2 seconds at all levels.
+Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool names + reasoning, 2 = detailed. Users override via `/verbose 0|1|2`.
 
 Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`|`parakeet`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`, `PARAKEET_MODEL`. Parakeet runs locally on Apple Silicon via MLX — no API key needed. Implementation in `src/bot/media/voice_handler.py`.
 

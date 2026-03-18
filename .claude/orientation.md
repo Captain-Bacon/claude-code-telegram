@@ -1,19 +1,20 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Epic kyj (strip and restructure) merged to main. Structural work complete. Scheduler subsystem is fully built but disabled (needs ENABLE_API_SERVER, ENABLE_SCHEDULER, WEBHOOK_API_SECRET in .env). New HeartbeatPin feature added — pinned message showing live tool activity counter during turns — untested in production, no feature flag yet (bead ei8). User wants to enable the scheduler and discuss what recurring jobs to create. The bot is a personal executive dysfunction tool, not developer tooling.
+Delivery pipeline just got a significant hardening pass — typing heartbeat removed (was consuming entire group-chat rate budget), HeartbeatPin enabled for all chat types, StreamSession class replaces closure-based stream callback. Three turn paths (agentic_text, _drain_queue, _handle_media_message) now have parity: heartbeat pin, stall callback, stream session. Test coverage for the new code is the main gap — bead b4p. Scheduler subsystem is fully built but disabled. The bot is a personal executive dysfunction tool.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
 
 ```
 Telegram -> PTB middleware (security -> auth -> rate limit)
-  -> MessageOrchestrator (src/bot/orchestrator.py, ~1,242 lines)
+  -> MessageOrchestrator (src/bot/orchestrator.py)
     -> Commands, handler registration, agentic_text, message queuing, thread routing
-    -> src/bot/delivery.py (~327 lines): turn result formatting, image sending, typing heartbeat
-    -> src/bot/media_handlers.py (~333 lines): document/photo/voice handlers
+    -> src/bot/delivery.py: turn result formatting, image sending, make_stall_callback
+    -> src/bot/media_handlers.py: document/photo/voice handlers
     -> PersistentClientManager -> ClaudeSDKClient (long-lived subprocess per thread)
-    -> Stream callbacks: src/bot/stream_handler.py (make_stream_callback, flush, cleanup)
+    -> StreamSession class: src/bot/stream_handler.py (callable, flush, cleanup, state)
+    -> HeartbeatPin: src/bot/utils/heartbeat_pin.py (pinned liveness message during turns)
 
 Scheduler -> HTTP endpoints on FastAPI server -> Claude creates/lists/removes cron jobs via WebFetch
   -> APScheduler fires -> ScheduledEvent -> EventBus -> AgentHandler -> Claude -> NotificationService
@@ -30,22 +31,20 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 <!-- Key couplings: change X -> must update Y -->
 ## Key Couplings
 
-- `ClaudeSDKManager.build_options()` -> used by persistent client. Contains scheduler API prompt (conditional on API+scheduler+secret).
+- Three turn paths must stay in sync: `agentic_text`, `_drain_queue`, `_handle_media_message`. All three create HeartbeatPin, StreamSession, stall callback. If adding something to one, add to all three.
+- `make_stream_callback` returns `StreamSession` (callable class with properties), NOT `Optional[Callable]`. `deliver_turn_result` accesses `.text_was_sent` and `.flush_succeeded` as bool properties.
+- `make_stall_callback(progress_msg)` in delivery.py is the single source for stall callbacks. Don't inline.
 - `derive_state_key()` in persistent.py must match usage in orchestrator `_state_key()`.
 - main.py initialization order: scheduler -> API server, persistent_manager depends on sdk_manager.
-- Heartbeat loop in main.py calls `persistent_manager.cleanup_idle_clients()` every 5 min.
 - AgentHandler uses PersistentClientManager with synthetic state keys (`webhook:{provider}:{id}`, `scheduled:{job_id}`).
-- `src/bot/stream_handler.py` is the single source for stream callback logic. Orchestrator imports and calls `make_stream_callback(settings, ...)`.
-- Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from orchestrator's agentic_text, _drain_queue, and media_handlers). To change how responses are formatted or sent — edit delivery.py, not callers.
-- Media handler registration in orchestrator uses inline wrappers to bind settings — adding a new media handler requires a wrapper in `_register_agentic_handlers`.
-- Voice provider availability: `FeatureFlags.voice_messages_enabled` is the single source of truth. `media_handlers.agentic_voice` calls it. Adding a new provider: update FeatureFlags only.
+- Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from all three turn paths). To change how responses are formatted or sent — edit delivery.py, not callers.
 
 <!-- Verify before trusting: claims that could be stale -->
 ## Verify Before Trusting
 
+- HeartbeatPin in group chats — compiles and passes tests but pin/unpin/delete permissions not tested against live Telegram groups
 - AgentHandler rewire to PersistentClientManager tested via mocks only, not integration tested
 - Scheduler API endpoints tested but not integration tested with running bot
-- HeartbeatPin (src/bot/utils/heartbeat_pin.py) compiles and passes type checks but has never run against Telegram — pin behaviour in private chat topics may be chat-wide not thread-scoped
 
 <!-- Active risks -->
 ## Active Risks
@@ -53,6 +52,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Draining state relies on undocumented SDK behaviour with 120s timeout guess
 - **Worktree agent isolation DOES NOT WORK** — agents write to main repo. Do not use `isolation: "worktree"`.
 - **Linter/autoformatter modifies files between Edit reads and writes** — cause unknown, likely IDE
+- StreamSession, HeartbeatPin changes, flush_succeeded safety net have zero unit tests (bead b4p)
 
 <!-- What hasn't been decided -->
 ## Open Questions
@@ -69,13 +69,13 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 | How are SDK options built? | src/claude/sdk_integration.py — build_options() |
 | Where are deps wired up? | src/main.py — initialization sequence |
 | Where are scheduler endpoints? | src/api/scheduler_routes.py |
-| What work is tracked? | bd ready / bd show claude-code-telegram-kyj (epic) |
-| Where are stream callback functions? | src/bot/stream_handler.py (sole location) |
+| What work is tracked? | bd ready / bd list --status=open |
+| Stream callback class? | src/bot/stream_handler.py — StreamSession |
 | Where are voice/image handlers? | src/bot/media_handlers.py (Telegram-facing), src/bot/media/ (processing) |
-| Where is message queuing? | src/bot/orchestrator.py — _enqueue_message, _drain_queue, _combine_queued_messages |
-| Where is response delivery? | src/bot/delivery.py — deliver_turn_result (shared by all message types) |
-| Where is heartbeat pin? | src/bot/utils/heartbeat_pin.py — created in orchestrator, fed by stream_handler |
-| Where are scheduler docs? | docs/scheduler.md — full reference for enabling and using the scheduler |
+| Where is message queuing? | src/bot/orchestrator.py — _enqueue_message, _drain_queue |
+| Where is response delivery? | src/bot/delivery.py — deliver_turn_result (shared by all turn paths) |
+| Where is heartbeat pin? | src/bot/utils/heartbeat_pin.py — created in all three turn paths |
+| Where are scheduler docs? | docs/scheduler.md |
 
 <!-- Gotchas -->
 ## Gotchas
@@ -86,3 +86,4 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Voice transcription uses Parakeet MLX locally, not cloud providers
 - Scheduler jobs without target_chat_ids fall back to NOTIFICATION_CHAT_IDS (bead lcs)
 - **Worktree isolation doesn't work** — agents modify main repo directly
+- HeartbeatPin cleanup edits message to "Done" before deleting — if delete fails (no admin rights in groups), remnant says "Done" not a cryptic tool count
