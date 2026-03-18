@@ -69,7 +69,9 @@ Called at the end of `agentic_text` after the turn completes. Queued messages do
 
 ### Media (`_handle_media_message`)
 
-Voice notes are transcribed (Parakeet MLX locally, or Mistral/OpenAI APIs). Photos are base64-encoded for multimodal input. Documents are processed. The result is text or text+images sent to Claude like a normal message.
+Voice notes are transcribed (Parakeet MLX locally, or Mistral/OpenAI APIs). Photos are base64-encoded for multimodal input. Documents are processed. The result is text or text+images sent to Claude via `send_message`.
+
+**Known gap:** media handlers do NOT check if the client is busy. If the user sends a voice note while Claude is working, `send_message` injects it (returns None), the progress message is silently deleted, and no response is shown. Text messages avoid this because `agentic_text` checks `get_client_state()` and queues instead.
 
 ### Turn setup
 
@@ -128,7 +130,7 @@ flowchart LR
     end
 
     subgraph StreamSession
-        TL[Tool log + HeartbeatPin]
+        TL[Tool log]
         TB[Text batch\n1.5s window]
         THB[Thinking batch]
         DS[DraftStreamer]
@@ -137,16 +139,22 @@ flowchart LR
 
     subgraph Output
         PIN[Pinned heartbeat\n⚙️ Read 7]
+        PROG[Progress message\nverbose tool list]
+        DRAFT[Live typing preview\nprivate chats only]
         MSG[Telegram messages\npersistent]
         EPH[Ephemeral thinking\ndeleted after turn]
-        DRF[Live typing preview\nprivate chats only]
         IMG[Captured images\nfor delivery]
     end
 
-    TC --> TL --> PIN
+    TC --> TL
+    TL --> PIN
+    TL --> PROG
+    TL --> DS --> DRAFT
     AT --> TB --> MSG
+    AT --> DS
     TH --> THB --> EPH
-    SD --> DS --> DRF
+    TH --> DS
+    SD --> DS
     IM --> MCI --> IMG
 ```
 
@@ -164,6 +172,9 @@ flowchart LR
 
 ```mermaid
 flowchart TD
+    ENTRY{"error_messages\nprovided?"}
+    ERRS["Use pre-built\nerror messages"]
+
     FLUSH["Flush remaining StreamSession text"]
     CHECK{"text_was_sent AND\nflush_succeeded?"}
     SKIP["Skip re-sending\n(already delivered)"]
@@ -182,6 +193,9 @@ flowchart TD
 
     SEND["Send messages to Telegram\n(HTML → plain text fallback)"]
     CLEAN["Delete thinking messages"]
+
+    ENTRY -->|yes, error| ERRS --> PROG
+    ENTRY -->|no, success| FLUSH
 
     FLUSH --> CHECK
     CHECK -->|yes| SKIP
@@ -203,6 +217,8 @@ flowchart TD
     CAPTION --> CLEAN
     SEPARATE --> SEND --> CLEAN
 ```
+
+Callers provide `error_messages` when the turn threw an exception (CancelledError for `/stop`, general exceptions for failures). When error_messages is present, the normal flush/format path is skipped entirely.
 
 **Context warnings** — threshold-based (70%, 60%, 50%... down to 5%), deduplicated via `user_data` so the same threshold isn't warned twice.
 

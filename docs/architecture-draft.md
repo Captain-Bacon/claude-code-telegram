@@ -21,7 +21,9 @@ User sends a Telegram message. It passes through three middleware layers in PTB 
 **Important distinction**: the orchestrator queues, it never injects. The injection mechanism in `PersistentClientManager.send_message()` (calling `query()` on a busy client) exists for the webhook/scheduler `AgentHandler` path, which calls `send_message` directly without checking state first.
 
 **Path 3 — Media** (`media_handlers._handle_media_message`)
-**[READ]** Voice notes get transcribed (Parakeet MLX locally on Apple Silicon, or Mistral/OpenAI APIs). Photos get base64-encoded and sent as multimodal content. Documents get processed. The result is text (or text + images) that gets sent to Claude just like a normal message.
+**[VERIFIED — cross-check loop 2]** Voice notes get transcribed (Parakeet MLX locally on Apple Silicon, or Mistral/OpenAI APIs). Photos get base64-encoded and sent as multimodal content. Documents get processed. The result is text (or text + images) sent to Claude via `send_message`.
+
+**Known gap found in cross-check:** media handlers do NOT check if the client is busy before calling `send_message`. If the user sends a voice note while Claude is working, `send_message` injects (returns None), the progress message is silently deleted, and no response is shown. Text messages avoid this because `agentic_text` checks `get_client_state()` and queues. This is a real bug — media while busy = silent message loss.
 
 **[VERIFIED]** All three paths create the same set of things before sending to Claude:
 - A **progress message** ("Working...") that gets edited during the turn
