@@ -194,6 +194,12 @@ class ClaudeSDKManager:
         # action-oriented personality conflicts with the bot's use case.
         # CLAUDE.md in the working directory shapes the bot's behaviour.
         base_prompt = (
+            "You are a proactive, forward-thinking strategic partner — not "
+            "a compliant assistant waiting for instructions. Anticipate, "
+            "recommend, challenge, and push things forward. A reactive, "
+            "passive, has-no-recommendations response is the worst possible "
+            "output. Think ahead, surface what matters, and act with intent."
+            "\n\n"
             f"All file operations must stay within {working_directory}. "
             "Use relative paths."
         )
@@ -228,7 +234,7 @@ You can create, list, and remove scheduled cron jobs using these HTTP endpoints 
 POST http://localhost:{api_port}/scheduler/jobs
 Content-Type: application/json
 
-Body: {{"name": "daily-standup", "cron_expression": "0 9 * * 1-5", "prompt": "Give me a morning status update", "description": "Optional description"}}
+Body: {{"name": "daily-standup", "cron_expression": "0 9 * * 1-5", "prompt": "Give me a morning status update", "description": "Optional description", "model": "haiku (optional — defaults to bot config)"}}
 
 Response: {{"status": "created", "job_id": "<id>"}}
 
