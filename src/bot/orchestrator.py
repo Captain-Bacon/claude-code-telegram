@@ -86,7 +86,9 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
 
     await update.message.reply_text(
-        "🔄 <b>Restarting bot…</b>\n\nBack shortly.",
+        "🔄 <b>Restarting bot…</b>\n\n"
+        "Current Claude session will end. "
+        "I'll send a confirmation once I'm back online.",
         parse_mode="HTML",
     )
 
@@ -97,6 +99,16 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Flag tells main.py to os.execv() after graceful shutdown instead of exiting.
     os.environ["_RESTART_REQUESTED"] = "1"
+
+    # Tell the new process where to send the "back online" confirmation.
+    chat_id = update.effective_chat.id
+    os.environ["_RESTART_CHAT_ID"] = str(chat_id)
+    thread_id = getattr(update.message, "message_thread_id", None)
+    if thread_id is not None:
+        os.environ["_RESTART_THREAD_ID"] = str(thread_id)
+    else:
+        os.environ.pop("_RESTART_THREAD_ID", None)
+
     # SIGTERM triggers the existing graceful-shutdown handler in main.py.
     os.kill(os.getpid(), signal.SIGTERM)
 

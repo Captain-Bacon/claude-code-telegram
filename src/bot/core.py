@@ -8,6 +8,7 @@ Features:
 """
 
 import asyncio
+import os
 from typing import Any, Callable, Dict, Optional
 
 import structlog
@@ -208,6 +209,9 @@ class ClaudeCodeBot:
                     drop_pending_updates=True,
                 )
 
+                # If we came back from a /restart, confirm to the user.
+                await self._send_restart_confirmation()
+
                 # Keep running until manually stopped
                 while self.is_running:
                     await asyncio.sleep(1)
@@ -241,6 +245,26 @@ class ClaudeCodeBot:
         except Exception as e:
             logger.error("Error stopping bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to stop bot: {str(e)}") from e
+
+    async def _send_restart_confirmation(self) -> None:
+        """Send a 'back online' message if this process was spawned by /restart."""
+        chat_id = os.environ.pop("_RESTART_CHAT_ID", None)
+        if not chat_id:
+            return
+        thread_id = os.environ.pop("_RESTART_THREAD_ID", None)
+
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "text": "✅ <b>Restarted.</b> New Claude session — ready to go.",
+            "parse_mode": "HTML",
+        }
+        if thread_id is not None:
+            kwargs["message_thread_id"] = int(thread_id)
+
+        try:
+            await self.app.bot.send_message(**kwargs)
+        except Exception as exc:
+            logger.warning("Failed to send restart confirmation", error=str(exc))
 
     async def _error_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
