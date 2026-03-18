@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Epic kyj (strip and restructure) merged to main. All structural work complete. Orchestrator split done — delivery.py and media_handlers.py extracted. Dead code cleaned (session resume, _active_tasks, voice duplication consolidated). Remaining open items are investigations (worktree isolation, linter interference, SDK injection research) and a lower-priority feature (scheduler target_chat_ids). The bot is a personal executive dysfunction tool, not developer tooling.
+Epic kyj (strip and restructure) merged to main. Structural work complete. Scheduler subsystem is fully built but disabled (needs ENABLE_API_SERVER, ENABLE_SCHEDULER, WEBHOOK_API_SECRET in .env). New HeartbeatPin feature added — pinned message showing live tool activity counter during turns — untested in production, no feature flag yet (bead ei8). User wants to enable the scheduler and discuss what recurring jobs to create. The bot is a personal executive dysfunction tool, not developer tooling.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -45,6 +45,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 
 - AgentHandler rewire to PersistentClientManager tested via mocks only, not integration tested
 - Scheduler API endpoints tested but not integration tested with running bot
+- HeartbeatPin (src/bot/utils/heartbeat_pin.py) compiles and passes type checks but has never run against Telegram — pin behaviour in private chat topics may be chat-wide not thread-scoped
 
 <!-- Active risks -->
 ## Active Risks
@@ -73,6 +74,8 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 | Where are voice/image handlers? | src/bot/media_handlers.py (Telegram-facing), src/bot/media/ (processing) |
 | Where is message queuing? | src/bot/orchestrator.py — _enqueue_message, _drain_queue, _combine_queued_messages |
 | Where is response delivery? | src/bot/delivery.py — deliver_turn_result (shared by all message types) |
+| Where is heartbeat pin? | src/bot/utils/heartbeat_pin.py — created in orchestrator, fed by stream_handler |
+| Where are scheduler docs? | docs/scheduler.md — full reference for enabling and using the scheduler |
 
 <!-- Gotchas -->
 ## Gotchas

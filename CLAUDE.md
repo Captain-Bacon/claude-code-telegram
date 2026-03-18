@@ -131,4 +131,4 @@ Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`
 
 ## Git Workflow
 
-Working on `main`. Feature branches `cleanup/phase1-strip` and `feature/persistent-client-v2` have been merged. Pre-commit hook: beads auto-flushes issues.jsonl on commit. No other pre-commit framework in use.
+Fork of `RichardAtCT/claude-code-telegram`. Push to `origin` (Captain-Bacon), NOT `upstream`. Working on `main`. Pre-commit hook: beads auto-flushes issues.jsonl on commit. No other pre-commit framework in use.
