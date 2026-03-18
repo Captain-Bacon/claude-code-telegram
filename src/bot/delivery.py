@@ -1,7 +1,7 @@
 """Response delivery — getting Claude's output to Telegram.
 
 Handles turn result formatting, image sending, context warnings,
-abnormal stop notices, and typing indicator heartbeat.
+abnormal stop notices, and stall callback factory.
 
 deliver_turn_result is the shared pipeline called from three places:
 orchestrator.agentic_text, orchestrator._drain_queue, and
@@ -11,7 +11,7 @@ response paths.
 
 import asyncio
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 import structlog
 from telegram import InputMediaPhoto, Update
@@ -81,6 +81,37 @@ def abnormal_stop_notice(response: Any) -> Optional[Any]:
         f"\n⚠️ Claude was cut short ({label}). " f"Send a follow-up to continue.",
         parse_mode=None,
     )
+
+
+def make_stall_callback(
+    progress_msg: Any,
+) -> Callable[..., Coroutine[Any, Any, None]]:
+    """Create a stall callback that edits the progress message.
+
+    Used by agentic_text, _drain_queue, and _handle_media_message
+    to show a warning when the Claude CLI goes silent.
+    """
+
+    async def on_stall(
+        silence_seconds: float,
+        total_elapsed_seconds: float,
+        cli_alive: bool,
+        is_dead: bool,
+    ) -> None:
+        if is_dead:
+            text = "\u26a0 Claude process died \u2014 try sending your message again"
+        else:
+            text = (
+                f"\u26a0 No activity for {int(silence_seconds)}s "
+                f"(elapsed {int(total_elapsed_seconds)}s)"
+                " \u2014 still checking\u2026"
+            )
+        try:
+            await progress_msg.edit_text(text)
+        except Exception:
+            pass
+
+    return on_stall
 
 
 async def send_images(
