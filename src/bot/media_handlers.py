@@ -160,6 +160,12 @@ async def agentic_photo(
             progress_msg=progress_msg,
             user_id=user_id,
             chat=chat,
+            images=[
+                {
+                    "base64_data": processed_image.base64_data,
+                    "media_type": processed_image.media_type,
+                }
+            ],
         )
 
     except Exception as e:
@@ -229,6 +235,7 @@ async def _handle_media_message(
     progress_msg: Any,
     user_id: int,
     chat: Any,
+    images: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Run a media-derived prompt through Claude and send responses."""
     persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
@@ -278,6 +285,7 @@ async def _handle_media_message(
             stream_callback=on_stream,
             model=context.user_data.get("claude_model"),
             force_new=force_new,
+            images=images,
         )
 
         if claude_response is None:

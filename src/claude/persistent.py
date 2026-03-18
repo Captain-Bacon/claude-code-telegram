@@ -138,6 +138,38 @@ class PersistentClientManager:
         self._sdk_manager = sdk_manager
         self._config = config
 
+    @staticmethod
+    def _build_query_input(
+        prompt: str,
+        images: Optional[List[Dict[str, str]]],
+    ) -> Any:
+        """Build query input: plain string or multimodal async iterable."""
+        if not images:
+            return prompt
+
+        # Multimodal: build content blocks with text + images
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for img in images:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img["media_type"],
+                        "data": img["base64_data"],
+                    },
+                }
+            )
+
+        async def _yield_message() -> Any:
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": content},
+                "parent_tool_use_id": None,
+            }
+
+        return _yield_message()
+
     async def send_message(
         self,
         state_key: str,
@@ -147,6 +179,7 @@ class PersistentClientManager:
         stall_callback: Optional[Callable[..., Any]] = None,
         model: Optional[str] = None,
         force_new: bool = False,
+        images: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[PersistentResponse]:
         """Send a message to Claude via persistent client.
 
@@ -157,8 +190,13 @@ class PersistentClientManager:
             no separate ResultMessage is produced, so there is nothing
             to await.
 
+        images: optional list of {"base64_data": ..., "media_type": ...} dicts.
+            When present, sends multimodal content (text + image blocks).
+
         Returns PersistentResponse for normal turns, None for injections.
         """
+        query_input = self._build_query_input(prompt, images)
+
         entry = self._clients.get(state_key)
 
         # Force new: disconnect existing client first
@@ -184,7 +222,7 @@ class PersistentClientManager:
                 # injected messages as a second internal turn with its
                 # own ResultMessage.  We track injections so
                 # _handle_result_message enters/stays in "draining".
-                await entry.client.query(prompt)
+                await entry.client.query(query_input)
                 entry._injection_count += 1
                 logger.info(
                     "turn.injected",
@@ -218,7 +256,7 @@ class PersistentClientManager:
             )
             entry.pending_turns += 1
 
-            await entry.client.query(prompt)
+            await entry.client.query(query_input)
 
             logger.info(
                 "turn.started",
