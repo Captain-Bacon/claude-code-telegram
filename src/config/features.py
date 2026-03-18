@@ -68,6 +68,11 @@ class FeatureFlags:
         return self.settings.mistral_api_key is not None
 
     @property
+    def heartbeat_pin_enabled(self) -> bool:
+        """Check if the pinned heartbeat message is enabled."""
+        return self.settings.enable_heartbeat_pin
+
+    @property
     def stream_drafts_enabled(self) -> bool:
         """Check if streaming drafts via sendMessageDraft is enabled."""
         return self.settings.enable_stream_drafts
@@ -84,6 +89,7 @@ class FeatureFlags:
             "scheduler": self.scheduler_enabled,
             "agentic_mode": self.agentic_mode_enabled,
             "voice_messages": self.voice_messages_enabled,
+            "heartbeat_pin": self.heartbeat_pin_enabled,
             "stream_drafts": self.stream_drafts_enabled,
         }
         return feature_map.get(feature_name, False)
@@ -107,6 +113,8 @@ class FeatureFlags:
             features.append("scheduler")
         if self.voice_messages_enabled:
             features.append("voice_messages")
+        if self.heartbeat_pin_enabled:
+            features.append("heartbeat_pin")
         if self.stream_drafts_enabled:
             features.append("stream_drafts")
         return features

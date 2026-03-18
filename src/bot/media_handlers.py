@@ -316,7 +316,7 @@ async def _handle_media_message(
         bot=context.bot,
         chat_id=chat.id,
         message_thread_id=getattr(update.message, "message_thread_id", None),
-    )
+    ) if settings.enable_heartbeat_pin else None
 
     on_stream = make_stream_callback(
         settings,

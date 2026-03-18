@@ -812,7 +812,7 @@ class MessageOrchestrator:
                 message_thread_id=(
                     update.message.message_thread_id if update.message else None
                 ),
-            )
+            ) if self.settings.enable_heartbeat_pin else None
 
             on_stream = make_stream_callback(
                 self.settings,
@@ -971,7 +971,7 @@ class MessageOrchestrator:
             bot=context.bot,
             chat_id=chat.id,
             message_thread_id=update.message.message_thread_id,
-        )
+        ) if self.settings.enable_heartbeat_pin else None
 
         on_stream = make_stream_callback(
             self.settings,

@@ -236,6 +236,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Heartbeat pin (pinned liveness message during turns)
+    enable_heartbeat_pin: bool = Field(
+        True,
+        description=(
+            "Show a pinned message with live tool activity during Claude turns. "
+            "Disable if pin behaviour is undesirable (e.g. topic chats where "
+            "pins are chat-wide)."
+        ),
+    )
+
     # Output verbosity (0=quiet, 1=normal, 2=detailed)
     verbose_level: int = Field(
         1,
