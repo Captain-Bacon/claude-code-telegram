@@ -216,6 +216,11 @@ def make_stream_callback(
     # (the standalone messages already delivered the content).
     _text_was_sent = [False]
 
+    # Track whether the final flush completed without losing messages.
+    # If False AND _text_was_sent is True, deliver_turn_result resends
+    # as a safety net (partial duplication > lost response).
+    _flush_succeeded = [True]
+
     # Lock protecting the mutable closure state above.  Without this,
     # concurrent async operations (_schedule_flush, _enqueue_text,
     # the external flush_pending entry-point) race on the shared lists
@@ -313,6 +318,10 @@ def make_stream_callback(
                             do_quote=False,
                         )
                         _text_was_sent[0] = True
+                        # Content just went out — reset heartbeat throttle
+                        # so it doesn't immediately edit redundantly
+                        if heartbeat_pin:
+                            heartbeat_pin.reset_throttle()
                         await asyncio.sleep(0.3)
                     except Exception as send_err:
                         send_duration_ms = (time.time() - send_t0) * 1000
@@ -332,7 +341,8 @@ def make_stream_callback(
                                 do_quote=False,
                             )
                         except Exception:
-                            pass
+                            # Both HTML and plain text failed — mark flush as failed
+                            _flush_succeeded[0] = False
 
     async def _schedule_flush() -> None:
         """Wait for the batch window then flush."""
@@ -375,9 +385,7 @@ def make_stream_callback(
                     tc_input = tc.get("input", {})
                     file_path = tc_input.get("file_path", "")
                     caption = tc_input.get("caption", "")
-                    img = validate_image_path(
-                        file_path, approved_directory, caption
-                    )
+                    img = validate_image_path(file_path, approved_directory, caption)
                     if img:
                         mcp_images.append(img)
 
@@ -387,14 +395,10 @@ def make_stream_callback(
                 name = tc.get("name", "unknown")
                 detail = _summarize_tool_input(name, tc.get("input", {}))
                 if verbose_level >= 1:
-                    tool_log.append(
-                        {"kind": "tool", "name": name, "detail": detail}
-                    )
+                    tool_log.append({"kind": "tool", "name": name, "detail": detail})
                 if draft_streamer:
                     icon = _tool_icon(name)
-                    line = (
-                        f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
-                    )
+                    line = f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
                     await draft_streamer.append_tool(line)
                 if heartbeat_pin:
                     await heartbeat_pin.tool_called(name)
@@ -407,9 +411,7 @@ def make_stream_callback(
             if draft_streamer:
                 first_line = text.split("\n", 1)[0].strip() if text else ""
                 if first_line:
-                    await draft_streamer.append_tool(
-                        f"\U0001f914 {first_line[:80]}"
-                    )
+                    await draft_streamer.append_tool(f"\U0001f914 {first_line[:80]}")
 
         # Capture assistant text (reasoning / commentary)
         if update_obj.type == "assistant" and update_obj.content:
@@ -426,9 +428,7 @@ def make_stream_callback(
                 first_line = text.split("\n", 1)[0].strip()
                 if first_line:
                     if verbose_level >= 1:
-                        tool_log.append(
-                            {"kind": "text", "detail": first_line[:120]}
-                        )
+                        tool_log.append({"kind": "text", "detail": first_line[:120]})
                     if draft_streamer:
                         await draft_streamer.append_tool(
                             f"\U0001f4ac {first_line[:120]}"
@@ -440,14 +440,14 @@ def make_stream_callback(
             if update_obj.type == "stream_delta":
                 await draft_streamer.append_text(update_obj.content)
 
-        # Throttle progress message edits to avoid Telegram rate limits
+        # Throttle progress message edits to avoid Telegram rate limits.
+        # Skip entirely when heartbeat pin is active — it IS the liveness signal.
         if not draft_streamer and verbose_level >= 1:
-            now = time.time()
-            if (now - last_edit_time[0]) >= 2.0 and tool_log:
-                last_edit_time[0] = now
-                new_text = _format_verbose_progress(
-                    tool_log, verbose_level, start_time
-                )
+            if heartbeat_pin and heartbeat_pin.has_active_message:
+                pass  # heartbeat pin handles liveness
+            elif (time.time() - last_edit_time[0]) >= 8.0 and tool_log:
+                last_edit_time[0] = time.time()
+                new_text = _format_verbose_progress(tool_log, verbose_level, start_time)
                 try:
                     await progress_msg.edit_text(new_text)
                 except Exception:
@@ -473,6 +473,7 @@ def make_stream_callback(
     _on_stream.flush_pending = _flush_pending_text  # type: ignore[attr-defined]
     _on_stream.delete_thinking = _delete_thinking_messages  # type: ignore[attr-defined]
     _on_stream.text_was_sent = _text_was_sent  # type: ignore[attr-defined]
+    _on_stream.flush_succeeded = _flush_succeeded  # type: ignore[attr-defined]
 
     return _on_stream
 

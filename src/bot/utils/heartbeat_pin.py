@@ -25,7 +25,7 @@ class HeartbeatPin:
         bot: telegram.Bot,
         chat_id: int,
         message_thread_id: Optional[int] = None,
-        throttle_interval: float = 0.5,
+        throttle_interval: float = 5.0,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
@@ -36,6 +36,7 @@ class HeartbeatPin:
         self._call_count = 0
         self._last_update_time = 0.0
         self._enabled = True
+        self._pinned = False
         self._pending_text: Optional[str] = None
 
     async def tool_called(self, tool_name: str) -> None:
@@ -65,17 +66,18 @@ class HeartbeatPin:
         if not self._message_id:
             return
 
-        try:
-            await self.bot.unpin_chat_message(
-                chat_id=self.chat_id,
-                message_id=self._message_id,
-            )
-        except Exception:
-            logger.debug(
-                "Failed to unpin heartbeat",
-                chat_id=self.chat_id,
-                message_id=self._message_id,
-            )
+        if self._pinned:
+            try:
+                await self.bot.unpin_chat_message(
+                    chat_id=self.chat_id,
+                    message_id=self._message_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to unpin heartbeat",
+                    chat_id=self.chat_id,
+                    message_id=self._message_id,
+                )
 
         try:
             await self.bot.delete_message(
@@ -91,11 +93,20 @@ class HeartbeatPin:
 
         self._message_id = None
 
+    @property
+    def has_active_message(self) -> bool:
+        """Whether the heartbeat has a live message in Telegram."""
+        return self._enabled and self._message_id is not None
+
+    def reset_throttle(self) -> None:
+        """Reset the edit timer — call after sending content to avoid redundant edits."""
+        self._last_update_time = time.time()
+
     async def _update(self, text: str) -> None:
         """Create or edit the pinned heartbeat message."""
-        try:
-            if self._message_id is None:
-                # First call — send and pin
+        if self._message_id is None:
+            # First call — send message, then try to pin (pin failure is OK)
+            try:
                 msg = await self.bot.send_message(
                     chat_id=self.chat_id,
                     text=text,
@@ -103,23 +114,41 @@ class HeartbeatPin:
                     message_thread_id=self.message_thread_id,
                 )
                 self._message_id = msg.message_id
+            except Exception:
+                logger.debug(
+                    "Heartbeat send failed, disabling",
+                    chat_id=self.chat_id,
+                )
+                self._enabled = False
+                return
+
+            try:
                 await self.bot.pin_chat_message(
                     chat_id=self.chat_id,
                     message_id=self._message_id,
                     disable_notification=True,
                 )
-            else:
-                # Subsequent calls — edit in place
+                self._pinned = True
+            except Exception:
+                logger.debug(
+                    "Pin failed (no admin rights?), continuing unpinned",
+                    chat_id=self.chat_id,
+                )
+        else:
+            # Subsequent calls — edit in place
+            try:
                 await self.bot.edit_message_text(
                     chat_id=self.chat_id,
                     message_id=self._message_id,
                     text=text,
                 )
-            self._last_update_time = time.time()
-            self._pending_text = None
-        except Exception:
-            logger.debug(
-                "Heartbeat update failed, disabling",
-                chat_id=self.chat_id,
-            )
-            self._enabled = False
+            except Exception:
+                logger.debug(
+                    "Heartbeat edit failed, disabling",
+                    chat_id=self.chat_id,
+                )
+                self._enabled = False
+                return
+
+        self._last_update_time = time.time()
+        self._pending_text = None

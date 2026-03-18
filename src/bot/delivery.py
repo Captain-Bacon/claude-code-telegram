@@ -78,8 +78,7 @@ def abnormal_stop_notice(response: Any) -> Optional[Any]:
         return None
     label = _STOP_REASON_LABELS.get(stop_reason, stop_reason)
     return FormattedMessage(
-        f"\n⚠️ Claude was cut short ({label}). "
-        f"Send a follow-up to continue.",
+        f"\n⚠️ Claude was cut short ({label}). " f"Send a follow-up to continue.",
         parse_mode=None,
     )
 
@@ -132,9 +131,7 @@ async def send_images(
             documents.append(img)
 
     # Telegram caption limit
-    use_caption = bool(
-        caption and len(caption) <= 1024 and photos and not documents
-    )
+    use_caption = bool(caption and len(caption) <= 1024 and photos and not documents)
     caption_sent = False
 
     # Send raster photos as a single album (Telegram groups 2-10 items)
@@ -160,9 +157,7 @@ async def send_images(
                             media=fh,
                             caption=caption if use_caption and idx == 0 else None,
                             parse_mode=(
-                                caption_parse_mode
-                                if use_caption and idx == 0
-                                else None
+                                caption_parse_mode if use_caption and idx == 0 else None
                             ),
                         )
                     )
@@ -229,6 +224,8 @@ async def deliver_turn_result(
             on_stream
             and hasattr(on_stream, "text_was_sent")
             and on_stream.text_was_sent[0]
+            and hasattr(on_stream, "flush_succeeded")
+            and on_stream.flush_succeeded[0]
         )
 
         if text_already_sent:
@@ -258,9 +255,7 @@ async def deliver_turn_result(
             if formatted_messages:
                 formatted_messages[-1].text += ctx_warn
             else:
-                formatted_messages.append(
-                    FormattedMessage(ctx_warn, parse_mode="HTML")
-                )
+                formatted_messages.append(FormattedMessage(ctx_warn, parse_mode="HTML"))
 
     # Finalize progress message — always edit to final state
     elapsed = int(time.time() - start_time)
@@ -311,7 +306,8 @@ async def deliver_turn_result(
                 )
                 try:
                     await update.message.reply_text(
-                        message.text, reply_markup=None,
+                        message.text,
+                        reply_markup=None,
                     )
                 except Exception as plain_err:
                     await update.message.reply_text(

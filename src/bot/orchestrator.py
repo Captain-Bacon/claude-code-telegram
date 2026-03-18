@@ -36,7 +36,7 @@ from ..claude.persistent import PersistentClientManager, derive_state_key
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError, load_project_registry
 from ..security.audit import AuditLogger
-from .delivery import deliver_turn_result, start_typing_heartbeat
+from .delivery import deliver_turn_result
 from .media_handlers import (
     _get_verbose_level,
     agentic_document,
@@ -49,7 +49,10 @@ from .stream_handler import (
 )
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.heartbeat_pin import HeartbeatPin
-from .utils.error_format import _format_error_message, _update_working_directory_from_claude_response
+from .utils.error_format import (
+    _format_error_message,
+    _update_working_directory_from_claude_response,
+)
 from .utils.html_format import escape_html
 from .utils.image_extractor import ImageAttachment
 
@@ -71,9 +74,7 @@ def _is_private_chat(update: Update) -> bool:
     return bool(chat and getattr(chat, "type", "") == "private")
 
 
-async def restart_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /restart command - gracefully restart the bot process.
 
     Sets a restart flag then triggers SIGTERM. main.py performs ordered
@@ -99,9 +100,7 @@ async def restart_command(
     os.kill(os.getpid(), signal.SIGTERM)
 
 
-async def sync_threads(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def sync_threads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Synchronize project topics in the configured forum chat."""
     settings: Settings = context.bot_data["settings"]
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
@@ -433,9 +432,7 @@ class MessageOrchestrator:
             await agentic_document(self.settings, update, context)
 
         app.add_handler(
-            MessageHandler(
-                filters.Document.ALL, self._inject_deps(_document_handler)
-            ),
+            MessageHandler(filters.Document.ALL, self._inject_deps(_document_handler)),
             group=10,
         )
 
@@ -446,9 +443,7 @@ class MessageOrchestrator:
             await agentic_photo(self.settings, update, context)
 
         app.add_handler(
-            MessageHandler(
-                filters.PHOTO, self._inject_deps(_photo_handler)
-            ),
+            MessageHandler(filters.PHOTO, self._inject_deps(_photo_handler)),
             group=10,
         )
 
@@ -459,9 +454,7 @@ class MessageOrchestrator:
             await agentic_voice(self.settings, update, context)
 
         app.add_handler(
-            MessageHandler(
-                filters.VOICE, self._inject_deps(_voice_handler)
-            ),
+            MessageHandler(filters.VOICE, self._inject_deps(_voice_handler)),
             group=10,
         )
 
@@ -813,6 +806,14 @@ class MessageOrchestrator:
             start_time = time.time()
             mcp_images: List[ImageAttachment] = []
 
+            heartbeat_pin = HeartbeatPin(
+                bot=context.bot,
+                chat_id=chat.id,
+                message_thread_id=(
+                    update.message.message_thread_id if update.message else None
+                ),
+            )
+
             on_stream = make_stream_callback(
                 self.settings,
                 verbose_level,
@@ -823,9 +824,8 @@ class MessageOrchestrator:
                 approved_directory=self.settings.approved_directory,
                 draft_streamer=None,
                 telegram_update=update,
+                heartbeat_pin=heartbeat_pin,
             )
-
-            heartbeat = start_typing_heartbeat(chat)
 
             error_messages = None
             claude_response = None
@@ -852,23 +852,21 @@ class MessageOrchestrator:
                 success = False
                 from .utils.formatting import FormattedMessage
 
-                error_messages = [
-                    FormattedMessage("Stopped.", parse_mode=None)
-                ]
+                error_messages = [FormattedMessage("Stopped.", parse_mode=None)]
             except Exception as e:
                 success = False
-                logger.error(
-                    "Queue drain failed", error=str(e), state_key=state_key
-                )
+                logger.error("Queue drain failed", error=str(e), state_key=state_key)
                 from .utils.formatting import FormattedMessage
 
                 error_messages = [
-                    FormattedMessage(
-                        _format_error_message(e), parse_mode="HTML"
-                    )
+                    FormattedMessage(_format_error_message(e), parse_mode="HTML")
                 ]
             finally:
-                heartbeat.cancel()
+                if heartbeat_pin:
+                    try:
+                        await heartbeat_pin.cleanup()
+                    except Exception:
+                        pass
                 try:
                     await flush_stream_callback(on_stream)
                 except Exception:
@@ -962,13 +960,11 @@ class MessageOrchestrator:
             )
 
         # Pinned heartbeat showing live tool activity
-        heartbeat_pin: Optional[HeartbeatPin] = None
-        if chat.type == "private":
-            heartbeat_pin = HeartbeatPin(
-                bot=context.bot,
-                chat_id=chat.id,
-                message_thread_id=update.message.message_thread_id,
-            )
+        heartbeat_pin = HeartbeatPin(
+            bot=context.bot,
+            chat_id=chat.id,
+            message_thread_id=update.message.message_thread_id,
+        )
 
         on_stream = make_stream_callback(
             self.settings,
@@ -983,9 +979,6 @@ class MessageOrchestrator:
             heartbeat_pin=heartbeat_pin,
         )
 
-        # Independent typing heartbeat — stays alive even with no stream events
-        heartbeat = start_typing_heartbeat(chat)
-
         # Stall callback — edits progress message when watchdog detects silence
         async def on_stall(
             silence_seconds: float,
@@ -994,7 +987,9 @@ class MessageOrchestrator:
             is_dead: bool,
         ) -> None:
             if is_dead:
-                text = "\u26a0 Claude process died \u2014 try sending your message again"
+                text = (
+                    "\u26a0 Claude process died \u2014 try sending your message again"
+                )
             else:
                 text = (
                     f"\u26a0 No activity for {int(silence_seconds)}s "
@@ -1021,7 +1016,11 @@ class MessageOrchestrator:
 
             # None means race: another handler claimed the turn
             if claude_response is None:
-                heartbeat.cancel()
+                if heartbeat_pin:
+                    try:
+                        await heartbeat_pin.cleanup()
+                    except Exception:
+                        pass
                 try:
                     await update.message.set_reaction("\U0001f440")  # 👀
                 except Exception:
@@ -1069,7 +1068,6 @@ class MessageOrchestrator:
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
         finally:
-            heartbeat.cancel()
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
@@ -1140,8 +1138,7 @@ class MessageOrchestrator:
             git_badge = " (git)" if is_git else ""
 
             await update.message.reply_text(
-                f"Switched to <code>{escape_html(target_name)}/</code>"
-                f"{git_badge}",
+                f"Switched to <code>{escape_html(target_name)}/</code>" f"{git_badge}",
                 parse_mode="HTML",
             )
             return
@@ -1221,8 +1218,7 @@ class MessageOrchestrator:
         git_badge = " (git)" if is_git else ""
 
         await query.edit_message_text(
-            f"Switched to <code>{escape_html(project_name)}/</code>"
-            f"{git_badge}",
+            f"Switched to <code>{escape_html(project_name)}/</code>" f"{git_badge}",
             parse_mode="HTML",
         )
 
