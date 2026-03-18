@@ -268,3 +268,15 @@ Rejection at any middleware layer raises `ApplicationHandlerStop`, preventing su
 | `src/claude/sdk_integration.py` | SDK options builder, StreamUpdate |
 | `src/config/settings.py` | Pydantic Settings, all env vars |
 | `src/config/features.py` | FeatureFlags computed properties |
+
+## What's not documented yet
+
+This doc covers the core message loop. The following subsystems are built and working but not yet diagrammed. **If you're working in one of these areas, extend this doc** — add a section with prose and a diagram following the same pattern as above. The draft-then-formalise-then-cross-check loop is in `docs/architecture-draft.md`.
+
+| Area | Where it lives | When to document |
+|------|---------------|-----------------|
+| Webhook/scheduler/notification flow | `src/events/`, `src/api/`, `src/scheduler/`, `src/notifications/` | When working on event-driven features or AgentHandler |
+| Storage layer | `src/storage/` | When changing persistence, migrations, or repository pattern |
+| Multi-project thread management | `src/projects/` | When working on topic routing or project discovery |
+| Voice transcription pipeline | `src/bot/media/voice_handler.py` | When changing transcription providers or adding new media types |
+| Classic mode | `src/bot/orchestrator.py` (classic handlers) | Probably never — upstream legacy, not used by this fork |

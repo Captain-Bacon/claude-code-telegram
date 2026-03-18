@@ -1,10 +1,12 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Delivery pipeline just got a significant hardening pass — typing heartbeat removed (was consuming entire group-chat rate budget), HeartbeatPin enabled for all chat types, StreamSession class replaces closure-based stream callback. Three turn paths (agentic_text, _drain_queue, _handle_media_message) now have parity: heartbeat pin, stall callback, stream session. Test coverage for the new code is the main gap — bead b4p. Scheduler subsystem is fully built but disabled. The bot is a personal executive dysfunction tool.
+Delivery pipeline hardened and fully tested (69 tests). Architecture documented with Mermaid diagrams (docs/architecture.md) — 5 cross-check loops found and fixed a real bug (media handlers don't queue when busy, bead dya). README rewritten for personal-tool reality. HeartbeatPin has a feature flag now. Next priorities: the media-busy bug (dya, P2), then the strip-and-restructure epic (kyj, P1). Stale reference docs (6vz) can wait.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
+
+Full architecture with diagrams: **docs/architecture.md**
 
 ```
 Telegram -> PTB middleware (security -> auth -> rate limit)
@@ -20,7 +22,7 @@ Scheduler -> HTTP endpoints on FastAPI server -> Claude creates/lists/removes cr
   -> APScheduler fires -> ScheduledEvent -> EventBus -> AgentHandler -> Claude -> NotificationService
 ```
 
-One persistent client per Telegram thread (keyed by chat_id:thread_id or chat_id:user_id). State machine: idle -> busy -> draining (if injections occurred) -> idle.
+One persistent client per Telegram thread (keyed by chat_id:thread_id or chat_id:user_id). State machine: idle -> busy -> draining (if injections occurred) -> idle. Orchestrator queues messages when busy — injection only used by AgentHandler (webhook/scheduler path).
 
 External triggers: EventBus -> AgentHandler -> PersistentClientManager.
 
@@ -31,13 +33,14 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 <!-- Key couplings: change X -> must update Y -->
 ## Key Couplings
 
-- Three turn paths must stay in sync: `agentic_text`, `_drain_queue`, `_handle_media_message`. All three create HeartbeatPin, StreamSession, stall callback. If adding something to one, add to all three.
+- Three turn paths must stay in sync: `agentic_text`, `_drain_queue`, `_handle_media_message`. All three create HeartbeatPin (if enabled), StreamSession, stall callback. If adding something to one, add to all three.
 - `make_stream_callback` returns `StreamSession` (callable class with properties), NOT `Optional[Callable]`. `deliver_turn_result` accesses `.text_was_sent` and `.flush_succeeded` as bool properties.
 - `make_stall_callback(progress_msg)` in delivery.py is the single source for stall callbacks. Don't inline.
 - `derive_state_key()` in persistent.py must match usage in orchestrator `_state_key()`.
 - main.py initialization order: scheduler -> API server, persistent_manager depends on sdk_manager.
 - AgentHandler uses PersistentClientManager with synthetic state keys (`webhook:{provider}:{id}`, `scheduled:{job_id}`).
 - Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from all three turn paths). To change how responses are formatted or sent — edit delivery.py, not callers.
+- HeartbeatPin creation gated by `settings.enable_heartbeat_pin` in all three turn paths. Downstream code handles `heartbeat_pin=None`.
 
 <!-- Verify before trusting: claims that could be stale -->
 ## Verify Before Trusting
@@ -45,6 +48,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - HeartbeatPin in group chats — compiles and passes tests but pin/unpin/delete permissions not tested against live Telegram groups
 - AgentHandler rewire to PersistentClientManager tested via mocks only, not integration tested
 - Scheduler API endpoints tested but not integration tested with running bot
+- Architecture doc diagrams haven't been rendered with mmdc — valid Mermaid syntax but not visually verified
 
 <!-- Active risks -->
 ## Active Risks
@@ -52,7 +56,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Draining state relies on undocumented SDK behaviour with 120s timeout guess
 - **Worktree agent isolation DOES NOT WORK** — agents write to main repo. Do not use `isolation: "worktree"`.
 - **Linter/autoformatter modifies files between Edit reads and writes** — cause unknown, likely IDE
-- StreamSession, HeartbeatPin changes, flush_succeeded safety net have zero unit tests (bead b4p)
+- **Media handlers don't queue when client busy** — voice/photo/document while Claude is working = silent message loss (bead dya)
 
 <!-- What hasn't been decided -->
 ## Open Questions
@@ -64,6 +68,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 
 | Question | Where to look |
 |----------|--------------|
+| Full architecture with diagrams | docs/architecture.md — **extend this when working in undocumented subsystems** (see "What's not documented yet" section at bottom) |
 | How are messages routed? | src/bot/orchestrator.py — agentic_text() |
 | How does persistent client work? | src/claude/persistent.py — PersistentClientManager |
 | How are SDK options built? | src/claude/sdk_integration.py — build_options() |
@@ -87,3 +92,4 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - Scheduler jobs without target_chat_ids fall back to NOTIFICATION_CHAT_IDS (bead lcs)
 - **Worktree isolation doesn't work** — agents modify main repo directly
 - HeartbeatPin cleanup edits message to "Done" before deleting — if delete fails (no admin rights in groups), remnant says "Done" not a cryptic tool count
+- task-done script fails when files are pre-staged via `git rm` — git add on deleted path errors
