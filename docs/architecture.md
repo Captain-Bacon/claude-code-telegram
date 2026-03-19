@@ -273,6 +273,68 @@ Rejection at any middleware layer raises `ApplicationHandlerStop`, preventing su
 | `src/config/settings.py` | Pydantic Settings, all env vars |
 | `src/config/features.py` | FeatureFlags computed properties |
 
+## Prompt architecture — how Claude gets its personality
+
+The bot doesn't build Claude's system prompt from scratch. It uses Claude Code's **preset+append** mechanism, which means CC's own prompt-building machinery runs first (output styles, CLAUDE.md chain, memory, coding guidelines, hooks), and the bot appends only dynamic content that CC can't know about.
+
+```mermaid
+flowchart TD
+    subgraph CC ["Claude Code machinery (via preset)"]
+        OS["Output style\n(telegram-strategic)"]
+        CMD["CLAUDE.md chain\n(workspace + user)"]
+        MEM["Memory system"]
+        CG["Coding guidelines\n+ environment context"]
+        HOOKS["Hooks infrastructure"]
+    end
+
+    subgraph BOT ["Bot append (dynamic content)"]
+        DIR["Directory constraint\n(working_directory)"]
+        SCHED["Scheduler API docs\n(if enabled)"]
+    end
+
+    subgraph LOCAL ["settings.local.json (via setting_sources)"]
+        STYLE["outputStyle: telegram-strategic"]
+        MCP["enabledMcpjsonServers:\nreddit-saver, workspace-mcp"]
+        HK["PostToolUse hooks"]
+    end
+
+    CC --> PROMPT["Final system prompt"]
+    BOT --> PROMPT
+    LOCAL --> CC
+```
+
+### What goes where
+
+| Content | Source | Mechanism |
+|---------|--------|-----------|
+| Personality, ADHD adaptations, communication style | `.claude/output-styles/telegram-strategic.md` in workspace | CC auto-discovers via `setting_sources`, activated by `outputStyle` key in `settings.local.json` |
+| Workspace rules, pipeline operations, behavioural rules | `CLAUDE.md` in workspace | CC loads via `setting_sources: ["project"]` |
+| User-level coding guidelines, global config | `~/.claude/CLAUDE.md` | CC loads via `setting_sources: ["user"]` |
+| MCP servers, hooks | `.claude/settings.local.json` in workspace | CC reads via `setting_sources: ["local"]` |
+| Directory boundary | Bot's `build_options()` append | Injected per-session based on `working_directory` |
+| Scheduler API docs | Bot's `build_options()` append | Injected when `ENABLE_API_SERVER` + `ENABLE_SCHEDULER` + `WEBHOOK_API_SECRET` all set |
+
+### Previous architecture (before preset+append)
+
+The bot replaced CC's entire system prompt with a raw string: a 3-sentence "strategic partner" personality + manual CLAUDE.md loading + scheduler API docs. This bypassed all of CC's prompt-building machinery — no output styles, no memory, no hooks, no coding guidelines. The bot's Claude felt markedly different from terminal CC in the same workspace.
+
+### Connection to the feedback loop
+
+The workspace's feedback loop system (`workshop/feedback-loop/system-design.md`) discovers behavioural patterns and builds enforcement. Output styles are now an enforcement layer within that system: confirmed behavioural patterns can be encoded in `telegram-strategic.md` rather than relying solely on CLAUDE.md rules (L1) or hooks (L2). The style is the most direct path to shaping communication behaviour — it's injected into the system prompt by CC's machinery before any CLAUDE.md content.
+
+### Key code
+
+`src/claude/sdk_integration.py`, `build_options()` method. The `system_prompt` parameter is a dict:
+
+```python
+system_prompt={
+    "type": "preset",
+    "preset": "claude_code",
+    "append": "\n\n".join(append_parts),
+}
+setting_sources=["project", "user", "local"]
+```
+
 ## What's not documented yet
 
 This doc covers the core message loop. The following subsystems are built and working but not yet diagrammed. **If you're working in one of these areas, extend this doc** — add a section with prose and a diagram following the same pattern as above. The draft-then-formalise-then-cross-check loop is in `docs/architecture-draft.md`.
