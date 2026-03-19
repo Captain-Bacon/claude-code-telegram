@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy, scheduler supports per-job model selection. Major active initiative: prompt architecture overhaul (anchor bead `zpg`) — switching from raw string system prompt to CC's preset+append to get output styles, CLAUDE.md chain, and hooks working through the bot. Entry point is bead `0ci` (SDK verification). All mypy errors in bot layer resolved.
+Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy. Two active fronts: (1) prompt architecture overhaul (anchor bead `zpg`) — switching to CC's preset+append for output styles, CLAUDE.md chain, hooks; (2) topic model just decoupled from repos — topics are now flexible conversations, not rigid 1:1 repo mappings. `/sync_topics` refreshes registry from disk. Validation bead `lr2` pending.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -38,6 +38,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - `make_stall_callback(progress_msg)` in delivery.py is the single source for stall callbacks. Don't inline.
 - `derive_state_key()` in persistent.py must match usage in orchestrator `_state_key()`.
 - main.py initialization order: scheduler -> API server, persistent_manager depends on sdk_manager.
+- `/repo` in thread mode updates the topic's DB mapping via `adopt_topic()` AND mutates `_thread_context` dict. If adding a new command that switches directories in thread mode, follow the same pattern (orchestrator.py `agentic_repo`).
 - AgentHandler uses PersistentClientManager with synthetic state keys (`webhook:{provider}:{id}`, `scheduled:{job_id}`).
 - Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from all three turn paths). To change how responses are formatted or sent — edit delivery.py, not callers.
 - HeartbeatPin creation gated by `settings.enable_heartbeat_pin` in all three turn paths. Downstream code handles `heartbeat_pin=None`.
@@ -49,6 +50,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - AgentHandler rewire to PersistentClientManager tested via mocks only, not integration tested
 - Scheduler API endpoints tested but not integration tested with running bot
 - Architecture doc diagrams haven't been rendered with mmdc — valid Mermaid syntax but not visually verified
+- Topic decoupling (migration v6, thread_manager, orchestrator routing) — tests pass but not integration tested against live bot. Validation bead `lr2`.
 
 <!-- Active risks -->
 ## Active Risks

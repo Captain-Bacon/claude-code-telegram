@@ -105,6 +105,8 @@ Security relaxation (trusted environments only): `DISABLE_SECURITY_PATTERNS` (de
 
 Multi-project topics: `ENABLE_PROJECT_THREADS` (default false), `PROJECT_THREADS_MODE` (`private`|`group`), `PROJECT_THREADS_CHAT_ID` (required for group mode), `PROJECTS_CONFIG_PATH` (optional YAML pin list), `PROJECT_THREADS_DISCOVER` (default true, auto-discovers git repos by activity), `PROJECT_THREADS_DISCOVER_LIMIT` (default 10), `PROJECT_THREADS_DISCOVER_DAYS` (default 30), `PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS` (default `1.1`, set `0` to disable pacing). Either `PROJECTS_CONFIG_PATH` or `PROJECT_THREADS_DISCOVER` required.
 
+**Topic model**: Topics are NOT 1:1 with repos. `project_slug` is nullable (scratchpad topics), multiple topics can map to the same repo, and unmapped topics auto-adopt on first message. `managed_by_sync` column distinguishes sync-created from user-adopted topics — stale detection only closes sync-managed topics. Repository methods key on `(chat_id, message_thread_id)`, not slug. The old `UNIQUE(chat_id, project_slug)` constraint is gone.
+
 Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool names + reasoning, 2 = detailed. Users override via `/verbose 0|1|2`.
 
 Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`|`parakeet`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`, `PARAKEET_MODEL`. Parakeet runs locally on Apple Silicon via MLX — no API key needed. Implementation in `src/bot/media/voice_handler.py`.
