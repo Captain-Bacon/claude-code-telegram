@@ -32,7 +32,7 @@ Full architecture with diagrams: `docs/architecture.md` — extend it when worki
 
 **`PersistentClientManager`** (`src/claude/persistent.py`) is the only Claude integration path. One long-lived `ClaudeSDKClient` subprocess per Telegram thread, with idle→busy→draining state machine, message injection mid-turn, interrupt support, and per-turn cost deltas.
 
-`ClaudeSDKManager.build_options()` (`src/claude/sdk_integration.py`) builds SDK configuration (system prompt, allowed tools, MCP config). **Do NOT modify `build_options()` system prompt handling without reading bead `claude-code-telegram-zpg`** — active overhaul planned with dependencies.
+`ClaudeSDKManager.build_options()` (`src/claude/sdk_integration.py`) builds SDK configuration. Uses **preset+append** system prompt: `{type: preset, preset: claude_code, append: ...}`. CC's machinery loads output styles, CLAUDE.md chain, memory, hooks, and coding guidelines. The append carries ONLY directory constraint + scheduler API docs. `setting_sources=["project", "user", "local"]` — "local" is required for `settings.local.json` (output style activation, workspace MCP servers, hooks). See `docs/architecture.md` "Prompt architecture" section for full data flow. Anchor bead `claude-code-telegram-zpg` tracks remaining work (verification, CLAUDE.md thinning).
 
 **SDK injection is undocumented behaviour.** Calling `query()` on a busy client works because the CLI reads stdin continuously — not by design. The draining state handles the ambiguity of whether the CLI produces a continuation ResultMessage. The 120s drain timeout is a guess. See bead 9mb notes for full research.
 
