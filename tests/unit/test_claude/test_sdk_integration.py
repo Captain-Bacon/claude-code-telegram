@@ -1093,8 +1093,8 @@ class TestPresetSystemPrompt:
         opts = captured[0]
         assert "# Project Rules" not in opts.system_prompt["append"]
 
-    async def test_setting_sources_includes_project(self, sdk_manager, tmp_path):
-        """setting_sources=['project'] is passed to ClaudeAgentOptions."""
+    async def test_setting_sources_includes_local(self, sdk_manager, tmp_path):
+        """setting_sources includes project, user, and local."""
         captured: list = []
         mock_factory = _mock_client_factory(
             _make_assistant_message("ok"),
@@ -1108,4 +1108,4 @@ class TestPresetSystemPrompt:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
-        assert opts.setting_sources == ["project", "user"]
+        assert opts.setting_sources == ["project", "user", "local"]

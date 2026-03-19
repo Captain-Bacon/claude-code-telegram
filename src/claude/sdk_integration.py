@@ -263,7 +263,7 @@ Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every
                 "preset": "claude_code",
                 "append": "\n\n".join(append_parts),
             },
-            setting_sources=["project", "user"],
+            setting_sources=["project", "user", "local"],
             stderr=stderr_callback,
         )
 
