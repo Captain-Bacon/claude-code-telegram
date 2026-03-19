@@ -318,34 +318,6 @@ class ProjectThreadRepository:
                 raise RuntimeError("Failed to upsert project thread mapping")
             return ProjectThreadModel.from_row(row)
 
-    async def deactivate_missing_projects(
-        self, chat_id: int, active_project_slugs: List[str]
-    ) -> int:
-        """Deactivate mappings for projects no longer enabled/present."""
-        async with self.db.get_connection() as conn:
-            if active_project_slugs:
-                placeholders = ",".join("?" for _ in active_project_slugs)
-                query = f"""
-                    UPDATE project_threads
-                    SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
-                    WHERE chat_id = ?
-                      AND project_slug NOT IN ({placeholders})
-                      AND is_active = TRUE
-                """
-                params = [chat_id] + active_project_slugs
-                cursor = await conn.execute(query, params)
-            else:
-                cursor = await conn.execute(
-                    """
-                    UPDATE project_threads
-                    SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
-                    WHERE chat_id = ? AND is_active = TRUE
-                """,
-                    (chat_id,),
-                )
-            await conn.commit()
-            return cursor.rowcount
-
     async def list_stale_active_mappings(
         self, chat_id: int, active_project_slugs: List[str]
     ) -> List[ProjectThreadModel]:

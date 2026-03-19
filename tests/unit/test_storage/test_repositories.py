@@ -325,33 +325,6 @@ class TestProjectThreadRepository:
         assert lookup is not None
         assert lookup.project_slug == "app1"
 
-    async def test_deactivate_missing_projects(self, project_thread_repo):
-        """Mappings not in active set are deactivated."""
-        await project_thread_repo.upsert_mapping(
-            project_slug="app1",
-            chat_id=-1001234567890,
-            message_thread_id=111,
-            topic_name="App 1",
-        )
-        await project_thread_repo.upsert_mapping(
-            project_slug="app2",
-            chat_id=-1001234567890,
-            message_thread_id=222,
-            topic_name="App 2",
-        )
-
-        changed = await project_thread_repo.deactivate_missing_projects(
-            chat_id=-1001234567890,
-            active_project_slugs=["app1"],
-        )
-
-        assert changed == 1
-        inactive_mapping = await project_thread_repo.get_by_chat_project(
-            -1001234567890, "app2"
-        )
-        assert inactive_mapping is not None
-        assert inactive_mapping.is_active is False
-
     async def test_list_stale_active_mappings(self, project_thread_repo):
         """Returns only active mappings not in enabled project set."""
         await project_thread_repo.upsert_mapping(
