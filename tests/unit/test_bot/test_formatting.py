@@ -321,6 +321,39 @@ class TestMarkdownToTelegramHtml:
         assert "<code>code</code>" in result
         assert "<i>italic</i>" in result
 
+    def test_table_rendered_as_pre(self):
+        table = "| Name | Age |\n| --- | --- |\n| Alice | 30 |"
+        result = markdown_to_telegram_html(table)
+        assert "<pre>" in result
+        assert "| Name | Age |" in result
+        assert "| Alice | 30 |" in result
+
+    def test_table_html_escaped(self):
+        table = "| Col |\n| --- |\n| <script> |"
+        result = markdown_to_telegram_html(table)
+        assert "&lt;script&gt;" in result
+        assert "<script>" not in result
+
+    def test_table_markdown_not_processed(self):
+        table = "| **bold** | *italic* |\n| --- | --- |\n| data | data |"
+        result = markdown_to_telegram_html(table)
+        # Inside <pre>, markdown should stay as literal text
+        assert "<b>" not in result
+        assert "<i>" not in result
+
+    def test_table_with_surrounding_text(self):
+        text = "Here is a table:\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\nAnd more text."
+        result = markdown_to_telegram_html(text)
+        assert "<pre>" in result
+        assert "Here is a table:" in result
+        assert "And more text." in result
+
+    def test_pipe_in_regular_text_not_table(self):
+        text = "Use cmd | grep to filter output"
+        result = markdown_to_telegram_html(text)
+        assert "<pre>" not in result
+        assert "|" in result
+
 
 class TestProgressIndicator:
     """Test ProgressIndicator utility functions."""
