@@ -82,7 +82,11 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     shutdown, then os.execv() replaces the process with a fresh instance.
     Works regardless of how the bot was launched (Toolbox, tmux, direct).
     """
-    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    assert update.message is not None
+    assert update.effective_user is not None
+    assert update.effective_chat is not None
+
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")  # type: ignore[assignment]
     user_id = update.effective_user.id
 
     await update.message.reply_text(
@@ -115,8 +119,12 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def sync_threads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Synchronize project topics in the configured forum chat."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    assert update.effective_chat is not None
+
     settings: Settings = context.bot_data["settings"]
-    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")  # type: ignore[assignment]
     user_id = update.effective_user.id
 
     if not settings.enable_project_threads:
@@ -225,6 +233,10 @@ class MessageOrchestrator:
     @staticmethod
     def _state_key(update: Update) -> str:
         """Derive a persistent client state key from a Telegram update."""
+        assert update.effective_chat is not None
+        assert update.message is not None
+        assert update.effective_user is not None
+
         chat_id = update.effective_chat.id
         thread_id = getattr(update.message, "message_thread_id", None)
         user_id = update.effective_user.id
@@ -235,9 +247,9 @@ class MessageOrchestrator:
 
         async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             for key, value in self.deps.items():
-                context.bot_data[key] = value
-            context.bot_data["settings"] = self.settings
-            context.user_data.pop("_thread_context", None)
+                context.bot_data[key] = value  # type: ignore[index]
+            context.bot_data["settings"] = self.settings  # type: ignore[index]
+            context.user_data.pop("_thread_context", None)  # type: ignore[union-attr]
 
             is_sync_bypass = handler.__name__ == "sync_threads"
             is_start_bypass = handler.__name__ in {"start_command", "agentic_start"}
@@ -315,7 +327,7 @@ class MessageOrchestrator:
             return False
 
         state_key = f"{chat.id}:{message_thread_id}"
-        thread_states = context.user_data.setdefault("thread_state", {})
+        thread_states = context.user_data.setdefault("thread_state", {})  # type: ignore[union-attr]
         state = thread_states.get(state_key, {})
 
         project_root = project.absolute_path
@@ -326,9 +338,9 @@ class MessageOrchestrator:
         if not self._is_within(current_dir, project_root) or not current_dir.is_dir():
             current_dir = project_root
 
-        context.user_data["current_directory"] = current_dir
-        context.user_data["claude_session_id"] = state.get("claude_session_id")
-        context.user_data["_thread_context"] = {
+        context.user_data["current_directory"] = current_dir  # type: ignore[index]
+        context.user_data["claude_session_id"] = state.get("claude_session_id")  # type: ignore[index]
+        context.user_data["_thread_context"] = {  # type: ignore[index]
             "chat_id": chat.id,
             "message_thread_id": message_thread_id,
             "state_key": state_key,
@@ -340,22 +352,22 @@ class MessageOrchestrator:
 
     def _persist_thread_state(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Persist compatibility keys back into per-thread state."""
-        thread_context = context.user_data.get("_thread_context")
+        thread_context = context.user_data.get("_thread_context")  # type: ignore[union-attr]
         if not thread_context:
             return
 
         project_root = Path(thread_context["project_root"])
-        current_dir = context.user_data.get("current_directory", project_root)
+        current_dir = context.user_data.get("current_directory", project_root)  # type: ignore[union-attr]
         if not isinstance(current_dir, Path):
             current_dir = Path(str(current_dir))
         current_dir = current_dir.resolve()
         if not self._is_within(current_dir, project_root) or not current_dir.is_dir():
             current_dir = project_root
 
-        thread_states = context.user_data.setdefault("thread_state", {})
+        thread_states = context.user_data.setdefault("thread_state", {})  # type: ignore[union-attr]
         thread_states[thread_context["state_key"]] = {
             "current_directory": str(current_dir),
-            "claude_session_id": context.user_data.get("claude_session_id"),
+            "claude_session_id": context.user_data.get("claude_session_id"),  # type: ignore[union-attr]
             "project_slug": thread_context["project_slug"],
         }
 
@@ -397,7 +409,7 @@ class MessageOrchestrator:
             except Exception:
                 pass
             if query.message:
-                await query.message.reply_text(message, parse_mode="HTML")
+                await query.message.reply_text(message, parse_mode="HTML")  # type: ignore[attr-defined]
             return
 
         if update.effective_message:
@@ -507,6 +519,9 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Brief welcome, no buttons."""
+        assert update.message is not None
+        assert update.effective_user is not None
+
         user = update.effective_user
         sync_line = ""
         if (
@@ -523,11 +538,11 @@ class MessageOrchestrator:
                     parse_mode="HTML",
                 )
                 return
-            manager = context.bot_data.get("project_threads_manager")
+            manager = context.bot_data.get("project_threads_manager")  # type: ignore[union-attr]
             if manager:
                 try:
                     result = await manager.sync_topics(
-                        context.bot,
+                        context.bot,  # type: ignore[union-attr]
                         chat_id=update.effective_chat.id,
                     )
                     sync_line = (
@@ -542,7 +557,7 @@ class MessageOrchestrator:
                     return
                 except Exception:
                     sync_line = "\n\n🧵 Topic sync failed. Run /sync_threads to retry."
-        current_dir = context.user_data.get(
+        current_dir = context.user_data.get(  # type: ignore[union-attr]
             "current_directory", self.settings.approved_directory
         )
         dir_display = f"<code>{current_dir}/</code>"
@@ -561,17 +576,19 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Reset session — disconnect persistent client, clear state."""
-        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+        assert update.message is not None
+
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(  # type: ignore[union-attr]
             "persistent_manager"
         )
         if persistent_manager:
             state_key = self._state_key(update)
             await persistent_manager.disconnect_client(state_key)
 
-        context.user_data["claude_session_id"] = None
-        context.user_data["session_started"] = True
-        context.user_data["force_new_session"] = True
-        context.user_data.pop("_context_last_warned", None)
+        context.user_data["claude_session_id"] = None  # type: ignore[index]
+        context.user_data["session_started"] = True  # type: ignore[index]
+        context.user_data["force_new_session"] = True  # type: ignore[index]
+        context.user_data.pop("_context_last_warned", None)  # type: ignore[union-attr]
 
         await update.message.reply_text("Session reset. What's next?")
 
@@ -579,6 +596,8 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Switch Claude model at runtime."""
+        assert update.message is not None
+
         aliases = {
             "opus": "claude-opus-4-6",
             "sonnet": "claude-sonnet-4-6",
@@ -586,7 +605,7 @@ class MessageOrchestrator:
         }
         args = update.message.text.split()[1:] if update.message.text else []
         if not args:
-            current = context.user_data.get("claude_model")
+            current = context.user_data.get("claude_model")  # type: ignore[union-attr]
             display = current or "default (CLI decides)"
             await update.message.reply_text(
                 f"Model: <b>{escape_html(display)}</b>\n\n"
@@ -596,14 +615,14 @@ class MessageOrchestrator:
             return
         choice = args[0].lower()
         if choice == "default":
-            context.user_data.pop("claude_model", None)
+            context.user_data.pop("claude_model", None)  # type: ignore[union-attr]
             await update.message.reply_text(
                 "Model reset to <b>default</b> (CLI decides)",
                 parse_mode="HTML",
             )
             return
         model_id = aliases.get(choice, choice)
-        context.user_data["claude_model"] = model_id
+        context.user_data["claude_model"] = model_id  # type: ignore[index]
         await update.message.reply_text(
             f"Model set to <b>{escape_html(model_id)}</b>",
             parse_mode="HTML",
@@ -613,19 +632,22 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Compact one-line status, no buttons."""
+        assert update.message is not None
+        assert update.effective_user is not None
+
         from src import get_build_info
 
-        current_dir = context.user_data.get(
+        current_dir = context.user_data.get(  # type: ignore[union-attr]
             "current_directory", self.settings.approved_directory
         )
         dir_display = str(current_dir)
 
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.user_data.get("claude_session_id")  # type: ignore[union-attr]
         session_status = "active" if session_id else "none"
 
         # Cost info
         cost_str = ""
-        rate_limiter = context.bot_data.get("rate_limiter")
+        rate_limiter = context.bot_data.get("rate_limiter")  # type: ignore[union-attr]
         if rate_limiter:
             try:
                 user_status = rate_limiter.get_user_status(update.effective_user.id)
@@ -636,7 +658,7 @@ class MessageOrchestrator:
                 pass
 
         model_str = ""
-        current_model = context.user_data.get("claude_model")
+        current_model = context.user_data.get("claude_model")  # type: ignore[union-attr]
         if current_model:
             model_str = f" · Model: {current_model}"
 
@@ -652,6 +674,8 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Set output verbosity: /verbose [0|1|2]."""
+        assert update.message is not None
+
         args = update.message.text.split()[1:] if update.message.text else []
         if not args:
             current = _get_verbose_level(self.settings, context)
@@ -676,7 +700,7 @@ class MessageOrchestrator:
             )
             return
 
-        context.user_data["verbose_level"] = level
+        context.user_data["verbose_level"] = level  # type: ignore[index]
         labels = {0: "quiet", 1: "normal", 2: "detailed"}
         await update.message.reply_text(
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
@@ -687,7 +711,10 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Stop the active Claude work for this thread."""
-        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+        assert update.message is not None
+        assert update.effective_user is not None
+
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(  # type: ignore[union-attr]
             "persistent_manager"
         )
         if not persistent_manager:
@@ -767,6 +794,8 @@ class MessageOrchestrator:
         existing_placeholder_id: Optional[int] = None,
     ) -> None:
         """Queue a message for delivery after the current Claude turn finishes."""
+        assert update.message is not None
+
         if existing_placeholder_id:
             placeholder_id = existing_placeholder_id
         else:
@@ -819,6 +848,9 @@ class MessageOrchestrator:
         while the drain turn is running, they get queued and drained next
         iteration.
         """
+        assert update.message is not None
+        assert update.effective_chat is not None
+
         while True:
             queued = self._message_queues.pop(state_key, [])
             if not queued:
@@ -860,7 +892,7 @@ class MessageOrchestrator:
             )
 
             persistent_manager: Optional[PersistentClientManager] = (
-                context.bot_data.get("persistent_manager")
+                context.bot_data.get("persistent_manager")  # type: ignore[union-attr]
             )
             if not persistent_manager:
                 return
@@ -872,7 +904,7 @@ class MessageOrchestrator:
             mcp_images: List[ImageAttachment] = []
 
             heartbeat_pin = HeartbeatPin(
-                bot=context.bot,
+                bot=context.bot,  # type: ignore[union-attr]
                 chat_id=chat.id,
                 message_thread_id=(
                     update.message.message_thread_id if update.message else None
@@ -898,7 +930,7 @@ class MessageOrchestrator:
             claude_response = None
             success = True
             try:
-                current_dir = context.user_data.get(
+                current_dir = context.user_data.get(  # type: ignore[union-attr]
                     "current_directory", self.settings.approved_directory
                 )
                 claude_response = await persistent_manager.send_message(
@@ -907,7 +939,7 @@ class MessageOrchestrator:
                     working_directory=current_dir,
                     stream_callback=on_stream,
                     stall_callback=on_stall,
-                    model=context.user_data.get("claude_model"),
+                    model=context.user_data.get("claude_model"),  # type: ignore[union-attr]
                     images=drain_images,
                 )
 
@@ -927,7 +959,7 @@ class MessageOrchestrator:
                 success = False
                 from .utils.formatting import FormattedMessage
 
-                error_messages = [FormattedMessage("Stopped.", parse_mode=None)]
+                error_messages = [FormattedMessage("Stopped.", parse_mode="HTML")]
             except Exception as e:
                 success = False
                 logger.error("Queue drain failed", error=str(e), state_key=state_key)
@@ -965,8 +997,12 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Direct Claude passthrough. Simple progress. No suggestions."""
+        assert update.message is not None
+        assert update.effective_user is not None
+
         user_id = update.effective_user.id
         message_text = update.message.text
+        assert message_text is not None
 
         logger.info(
             "Agentic text message",
@@ -975,7 +1011,7 @@ class MessageOrchestrator:
         )
 
         # Rate limit check
-        rate_limiter = context.bot_data.get("rate_limiter")
+        rate_limiter = context.bot_data.get("rate_limiter")  # type: ignore[union-attr]
         if rate_limiter:
             allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
             if not allowed:
@@ -985,7 +1021,7 @@ class MessageOrchestrator:
         chat = update.message.chat
         await chat.send_action("typing")
 
-        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(  # type: ignore[union-attr]
             "persistent_manager"
         )
         if not persistent_manager:
@@ -1011,12 +1047,12 @@ class MessageOrchestrator:
         verbose_level = _get_verbose_level(self.settings, context)
         progress_msg = await update.message.reply_text("Working...")
 
-        current_dir = context.user_data.get(
+        current_dir = context.user_data.get(  # type: ignore[union-attr]
             "current_directory", self.settings.approved_directory
         )
 
         # Check if /new was used — skip auto-resume for this first message.
-        force_new = bool(context.user_data.get("force_new_session"))
+        force_new = bool(context.user_data.get("force_new_session"))  # type: ignore[union-attr]
 
         # --- Verbose progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []
@@ -1066,7 +1102,7 @@ class MessageOrchestrator:
                 working_directory=current_dir,
                 stream_callback=on_stream,
                 stall_callback=on_stall,
-                model=context.user_data.get("claude_model"),
+                model=context.user_data.get("claude_model"),  # type: ignore[union-attr]
                 force_new=force_new,
             )
 
@@ -1088,9 +1124,9 @@ class MessageOrchestrator:
                 return
 
             if force_new:
-                context.user_data["force_new_session"] = False
+                context.user_data["force_new_session"] = False  # type: ignore[index]
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            context.user_data["claude_session_id"] = claude_response.session_id  # type: ignore[index]
 
             _update_working_directory_from_claude_response(
                 claude_response, context, self.settings, user_id
@@ -1114,7 +1150,7 @@ class MessageOrchestrator:
             logger.info("Claude request cancelled", user_id=user_id)
             from .utils.formatting import FormattedMessage
 
-            error_messages = [FormattedMessage("Stopped.", parse_mode=None)]
+            error_messages = [FormattedMessage("Stopped.", parse_mode="HTML")]
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
@@ -1173,9 +1209,11 @@ class MessageOrchestrator:
         /repo          — list subdirectories with git indicators
         /repo <name>   — switch to that directory, resume session if available
         """
+        assert update.message is not None
+
         args = update.message.text.split()[1:] if update.message.text else []
         base = self.settings.approved_directory
-        current_dir = context.user_data.get("current_directory", base)
+        current_dir = context.user_data.get("current_directory", base)  # type: ignore[union-attr]
 
         if args:
             # Switch to named repo
@@ -1188,7 +1226,7 @@ class MessageOrchestrator:
                 )
                 return
 
-            context.user_data["current_directory"] = target_path
+            context.user_data["current_directory"] = target_path  # type: ignore[index]
 
             is_git = (target_path / ".git").is_dir()
             git_badge = " (git)" if is_git else ""
@@ -1252,10 +1290,14 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Handle cd: callbacks — switch directory and resume session if available."""
+        assert update.callback_query is not None
+
         query = update.callback_query
         await query.answer()
 
         data = query.data
+        assert data is not None
+
         _, project_name = data.split(":", 1)
 
         base = self.settings.approved_directory
@@ -1268,7 +1310,7 @@ class MessageOrchestrator:
             )
             return
 
-        context.user_data["current_directory"] = new_path
+        context.user_data["current_directory"] = new_path  # type: ignore[index]
 
         is_git = (new_path / ".git").is_dir()
         git_badge = " (git)" if is_git else ""
@@ -1279,7 +1321,7 @@ class MessageOrchestrator:
         )
 
         # Audit log
-        audit_logger = context.bot_data.get("audit_logger")
+        audit_logger = context.bot_data.get("audit_logger")  # type: ignore[union-attr]
         if audit_logger:
             await audit_logger.log_command(
                 user_id=query.from_user.id,

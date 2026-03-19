@@ -20,6 +20,7 @@ from ...claude.exceptions import (
 from .html_format import escape_html
 
 if TYPE_CHECKING:
+    from ...claude.persistent import PersistentResponse
     from ...claude.sdk_integration import ClaudeResponse
     from ...config.settings import Settings
 
@@ -224,7 +225,7 @@ def _format_error_message(error: Exception | str) -> str:
 
 
 def _update_working_directory_from_claude_response(
-    claude_response: "ClaudeResponse",
+    claude_response: "ClaudeResponse | PersistentResponse",
     context: ContextTypes.DEFAULT_TYPE,
     settings: "Settings",
     user_id: int,
@@ -240,7 +241,7 @@ def _update_working_directory_from_claude_response(
     ]
 
     content = claude_response.content.lower()
-    current_dir = context.user_data.get(
+    current_dir = context.user_data.get(  # type: ignore[union-attr]
         "current_directory", settings.approved_directory
     )
 
@@ -266,7 +267,7 @@ def _update_working_directory_from_claude_response(
                     new_path.is_relative_to(settings.approved_directory)
                     and new_path.exists()
                 ):
-                    context.user_data["current_directory"] = new_path
+                    context.user_data["current_directory"] = new_path  # type: ignore[index]
                     logger.info(
                         "Updated working directory from Claude response",
                         old_dir=str(current_dir),

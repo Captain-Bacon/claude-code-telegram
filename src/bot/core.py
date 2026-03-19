@@ -81,22 +81,28 @@ class ClaudeCodeBot:
         self._add_middleware()
 
         # Set error handler
-        self.app.add_error_handler(self._error_handler)
+        self.app.add_error_handler(self._error_handler)  # type: ignore[arg-type]
 
         logger.info("Bot initialization complete")
 
     async def _set_bot_commands(self) -> None:
         """Set bot command menu via orchestrator."""
+        assert self.app is not None
+
         commands = await self.orchestrator.get_bot_commands()
         await self.app.bot.set_my_commands(commands)
         logger.info("Bot commands set", commands=[cmd.command for cmd in commands])
 
     def _register_handlers(self) -> None:
         """Register handlers via orchestrator (mode-aware)."""
+        assert self.app is not None
+
         self.orchestrator.register_handlers(self.app)
 
     def _add_middleware(self) -> None:
         """Add middleware to application."""
+        assert self.app is not None
+
         from .middleware.auth import auth_middleware
         from .middleware.rate_limit import rate_limit_middleware
         from .middleware.security import security_middleware
@@ -182,6 +188,7 @@ class ClaudeCodeBot:
             return
 
         await self.initialize()
+        assert self.app is not None
 
         logger.info(
             "Starting bot", mode="webhook" if self.settings.webhook_url else "polling"
@@ -192,7 +199,7 @@ class ClaudeCodeBot:
 
             if self.settings.webhook_url:
                 # Webhook mode
-                await self.app.run_webhook(
+                await self.app.run_webhook(  # type: ignore[func-returns-value]
                     listen="0.0.0.0",
                     port=self.settings.webhook_port,
                     url_path=self.settings.webhook_path,
@@ -204,6 +211,8 @@ class ClaudeCodeBot:
                 # Polling mode - initialize and start polling manually
                 await self.app.initialize()
                 await self.app.start()
+                assert self.app.updater is not None
+
                 await self.app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
@@ -232,9 +241,9 @@ class ClaudeCodeBot:
         try:
             self.is_running = False  # Stop the main loop first
 
-            if self.app:
+            if self.app is not None:
                 # Stop the updater if it's running
-                if self.app.updater.running:
+                if self.app.updater is not None and self.app.updater.running:
                     await self.app.updater.stop()
 
                 # Stop the application
@@ -248,6 +257,8 @@ class ClaudeCodeBot:
 
     async def _send_restart_confirmation(self) -> None:
         """Send a 'back online' message if this process was spawned by /restart."""
+        assert self.app is not None
+
         chat_id = os.environ.pop("_RESTART_CHAT_ID", None)
         if not chat_id:
             return
@@ -339,7 +350,7 @@ class ClaudeCodeBot:
         # Log to audit system if available
         from ..security.audit import AuditLogger
 
-        audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+        audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")  # type: ignore[union-attr]
         if audit_logger and update and update.effective_user:
             try:
                 await audit_logger.log_security_violation(
