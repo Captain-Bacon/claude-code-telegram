@@ -43,7 +43,7 @@ def discover_active_repos(
         if not git_dir.exists():
             continue
 
-        slug = _slugify(child.name)
+        slug = slugify(child.name)
         if slug in exclude:
             continue
 
@@ -105,7 +105,7 @@ def _latest_commit_timestamp(repo_path: Path) -> Optional[int]:
         return None
 
 
-def _slugify(name: str) -> str:
+def slugify(name: str) -> str:
     """Convert directory name to a URL-safe slug."""
     slug = name.lower().strip()
     # Replace spaces and underscores with hyphens

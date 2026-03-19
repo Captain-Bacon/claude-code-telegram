@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from src.projects.discovery import _slugify, discover_active_repos
+from src.projects.discovery import slugify, discover_active_repos
 
 
 def _make_git_repo(path: Path, commit_message: str = "init") -> None:
@@ -81,8 +81,8 @@ def test_discover_paths_are_correct(tmp_path: Path) -> None:
     assert p.enabled is True
 
 
-def test_slugify_handles_spaces_and_underscores() -> None:
-    assert _slugify("Meal Planner - Django") == "meal-planner-django"
-    assert _slugify("claude_strategic_workspaces") == "claude-strategic-workspaces"
-    assert _slugify("ACE-Step-1.5") == "ace-step-15"
-    assert _slugify("  leading  spaces  ") == "leading-spaces"
+def testslugify_handles_spaces_and_underscores() -> None:
+    assert slugify("Meal Planner - Django") == "meal-planner-django"
+    assert slugify("claude_strategic_workspaces") == "claude-strategic-workspaces"
+    assert slugify("ACE-Step-1.5") == "ace-step-15"
+    assert slugify("  leading  spaces  ") == "leading-spaces"

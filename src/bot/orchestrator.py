@@ -1277,9 +1277,9 @@ class MessageOrchestrator:
             if thread_context:
                 manager = context.bot_data.get("project_threads_manager")
                 if manager:
-                    from ..projects.discovery import _slugify
+                    from ..projects.discovery import slugify
 
-                    slug = _slugify(target_name)
+                    slug = slugify(target_name)
                     await manager.adopt_topic(
                         chat_id=thread_context["chat_id"],
                         message_thread_id=thread_context["message_thread_id"],
@@ -1380,9 +1380,9 @@ class MessageOrchestrator:
         if thread_context:
             manager = context.bot_data.get("project_threads_manager")
             if manager:
-                from ..projects.discovery import _slugify
+                from ..projects.discovery import slugify
 
-                slug = _slugify(project_name)
+                slug = slugify(project_name)
                 await manager.adopt_topic(
                     chat_id=thread_context["chat_id"],
                     message_thread_id=thread_context["message_thread_id"],

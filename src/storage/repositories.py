@@ -270,21 +270,6 @@ class ProjectThreadRepository:
             row = await cursor.fetchone()
             return ProjectThreadModel.from_row(row) if row else None
 
-    async def has_active_topic_for_project(
-        self, chat_id: int, project_slug: str
-    ) -> bool:
-        """Check if at least one active topic exists for a project."""
-        async with self.db.get_connection() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT 1 FROM project_threads
-                WHERE chat_id = ? AND project_slug = ? AND is_active = TRUE
-                LIMIT 1
-            """,
-                (chat_id, project_slug),
-            )
-            return await cursor.fetchone() is not None
-
     async def upsert_mapping(
         self,
         chat_id: int,
