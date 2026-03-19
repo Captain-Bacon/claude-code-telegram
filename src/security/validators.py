@@ -76,8 +76,6 @@ class SecurityValidator:
         ".zsh",
         ".fish",
         ".ps1",
-        ".bat",
-        ".cmd",
         ".r",
         ".scala",
         ".clj",

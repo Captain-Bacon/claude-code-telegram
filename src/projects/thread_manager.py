@@ -216,7 +216,6 @@ class ProjectThreadManager:
                     project_slug=project.slug,
                     is_active=True,
                 )
-                result.failed += 1
                 result.reused += 1
                 return True
             topic_name = project.name

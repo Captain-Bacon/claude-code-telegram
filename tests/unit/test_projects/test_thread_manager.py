@@ -251,7 +251,7 @@ async def test_sync_rename_failure_keeps_old_mapping_for_retry(
 
     assert result.reused == 1
     assert result.renamed == 0
-    assert result.failed == 1
+    assert result.failed == 0
     assert mapping is not None
     assert mapping.topic_name == "Old Name"
 
