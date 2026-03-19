@@ -681,6 +681,7 @@ class TestClaudeSandboxSettings:
             telegram_bot_username="testbot",
             approved_directory=tmp_path,
             claude_timeout_seconds=2,
+            claude_model=None,
         )
         manager = ClaudeSDKManager(config)
 
