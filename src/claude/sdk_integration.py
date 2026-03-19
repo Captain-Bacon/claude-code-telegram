@@ -189,27 +189,14 @@ class ClaudeSDKManager:
         PersistentClientManager. Handles system prompt loading, MCP config,
         tool validation, sandbox settings, and session resumption.
         """
-        # Build system prompt as a plain string (replaces the default Claude
-        # Code SWE prompt). This is intentional — the SWE prompt's
-        # action-oriented personality conflicts with the bot's use case.
-        # CLAUDE.md in the working directory shapes the bot's behaviour.
-        base_prompt = (
-            "You are a proactive, forward-thinking strategic partner — not "
-            "a compliant assistant waiting for instructions. Anticipate, "
-            "recommend, challenge, and push things forward. A reactive, "
-            "passive, has-no-recommendations response is the worst possible "
-            "output. Think ahead, surface what matters, and act with intent."
-            "\n\n"
+        # Build the append-only portion for the preset system prompt.
+        # CC's machinery handles output style, CLAUDE.md chain, coding
+        # guidelines, memory, and hooks via setting_sources. The append
+        # carries ONLY bot-specific dynamic content.
+        append_parts = [
             f"All file operations must stay within {working_directory}. "
             "Use relative paths."
-        )
-        claude_md_path = Path(working_directory) / "CLAUDE.md"
-        if claude_md_path.exists():
-            base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
-            logger.info(
-                "Loaded CLAUDE.md into system prompt",
-                path=str(claude_md_path),
-            )
+        ]
 
         # Add scheduler API instructions if both API server and scheduler
         # are enabled, so Claude can create/list/remove cron jobs.
@@ -220,9 +207,7 @@ class ClaudeSDKManager:
         ):
             api_port = self.config.api_server_port
             api_secret = self.config.webhook_api_secret
-            base_prompt += f"""
-
-## Scheduler API
+            append_parts.append(f"""## Scheduler API
 
 You can create, list, and remove scheduled cron jobs using these HTTP endpoints on the local API server. Use WebFetch to call them.
 
@@ -249,7 +234,7 @@ DELETE http://localhost:{api_port}/scheduler/jobs/<job_id>
 Response: {{"status": "deleted", "job_id": "<id>"}}
 
 Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every 30 min), "0 0 * * 0" (weekly Sunday midnight).
-"""
+""")
 
         # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
         # tools so the SDK does not restrict tool usage (e.g. MCP tools).
@@ -273,7 +258,11 @@ Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every
                 "autoAllowBashIfSandboxed": True,
                 "excludedCommands": self.config.sandbox_excluded_commands or [],
             },
-            system_prompt=base_prompt,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": "\n\n".join(append_parts),
+            },
             setting_sources=["project", "user"],
             stderr=stderr_callback,
         )

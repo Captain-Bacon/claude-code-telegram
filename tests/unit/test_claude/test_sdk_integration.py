@@ -458,10 +458,12 @@ class TestClaudeSandboxSettings:
 
         assert len(captured_options) == 1
         opts = captured_options[0]
-        # system_prompt is a plain string (replaces default SWE prompt)
-        assert isinstance(opts.system_prompt, str)
-        assert str(tmp_path) in opts.system_prompt
-        assert "relative paths" in opts.system_prompt.lower()
+        # system_prompt is a preset dict (CC's machinery loads CLAUDE.md, styles, etc.)
+        assert isinstance(opts.system_prompt, dict)
+        assert opts.system_prompt["type"] == "preset"
+        assert opts.system_prompt["preset"] == "claude_code"
+        assert str(tmp_path) in opts.system_prompt["append"]
+        assert "relative paths" in opts.system_prompt["append"].lower()
 
     async def test_disallowed_tools_passed_to_options(self, tmp_path):
         """Test that disallowed_tools from config are passed to ClaudeAgentOptions."""
@@ -1035,8 +1037,8 @@ class TestSessionIdFallback:
         assert response.session_id == "input-session-id"
 
 
-class TestClaudeMdLoading:
-    """Tests for CLAUDE.md loading from working directory."""
+class TestPresetSystemPrompt:
+    """Tests for preset system prompt with append-only dynamic content."""
 
     @pytest.fixture
     def config(self, tmp_path):
@@ -1050,8 +1052,29 @@ class TestClaudeMdLoading:
     def sdk_manager(self, config):
         return ClaudeSDKManager(config)
 
-    async def test_claude_md_appended_to_system_prompt(self, sdk_manager, tmp_path):
-        """CLAUDE.md content is appended to system prompt when present."""
+    async def test_system_prompt_is_preset_dict(self, sdk_manager, tmp_path):
+        """system_prompt uses preset form — CC loads CLAUDE.md via setting_sources."""
+        captured: list = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
+
+        opts = captured[0]
+        assert isinstance(opts.system_prompt, dict)
+        assert opts.system_prompt["type"] == "preset"
+        assert opts.system_prompt["preset"] == "claude_code"
+        assert str(tmp_path) in opts.system_prompt["append"]
+        assert "relative paths" in opts.system_prompt["append"].lower()
+
+    async def test_claude_md_not_manually_loaded(self, sdk_manager, tmp_path):
+        """CLAUDE.md in working directory does NOT appear in append — CC loads it."""
         claude_md = tmp_path / "CLAUDE.md"
         claude_md.write_text("# Project Rules\nAlways use type hints.")
 
@@ -1068,30 +1091,7 @@ class TestClaudeMdLoading:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
-        assert isinstance(opts.system_prompt, str)
-        assert "# Project Rules" in opts.system_prompt
-        assert "Always use type hints." in opts.system_prompt
-
-    async def test_system_prompt_unchanged_without_claude_md(
-        self, sdk_manager, tmp_path
-    ):
-        """System prompt is just the base when no CLAUDE.md exists."""
-        captured: list = []
-        mock_factory = _mock_client_factory(
-            _make_assistant_message("ok"),
-            _make_result_message(),
-            capture_options=captured,
-        )
-
-        with patch(
-            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
-        ):
-            await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
-
-        opts = captured[0]
-        assert isinstance(opts.system_prompt, str)
-        assert "Use relative paths." in opts.system_prompt
-        assert "# Project Rules" not in opts.system_prompt
+        assert "# Project Rules" not in opts.system_prompt["append"]
 
     async def test_setting_sources_includes_project(self, sdk_manager, tmp_path):
         """setting_sources=['project'] is passed to ClaudeAgentOptions."""
