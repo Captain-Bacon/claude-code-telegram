@@ -32,7 +32,7 @@ Full architecture with diagrams: `docs/architecture.md` — extend it when worki
 
 **`PersistentClientManager`** (`src/claude/persistent.py`) is the only Claude integration path. One long-lived `ClaudeSDKClient` subprocess per Telegram thread, with idle→busy→draining state machine, message injection mid-turn, interrupt support, and per-turn cost deltas.
 
-`ClaudeSDKManager.build_options()` (`src/claude/sdk_integration.py`) builds SDK configuration (system prompt, allowed tools, MCP config).
+`ClaudeSDKManager.build_options()` (`src/claude/sdk_integration.py`) builds SDK configuration (system prompt, allowed tools, MCP config). **Do NOT modify `build_options()` system prompt handling without reading bead `claude-code-telegram-zpg`** — active overhaul planned with dependencies.
 
 **SDK injection is undocumented behaviour.** Calling `query()` on a busy client works because the CLI reads stdin continuously — not by design. The draining state handles the ambiguity of whether the CLI produces a continuation ResultMessage. The 120s drain timeout is a guess. See bead 9mb notes for full research.
 
@@ -122,6 +122,7 @@ All datetimes use timezone-aware UTC: `datetime.now(UTC)` (not `datetime.utcnow(
 - structlog for all logging (JSON in prod, console in dev)
 - Type hints required on all functions (`disallow_untyped_defs = true`)
 - Use `datetime.now(UTC)` not `datetime.utcnow()` (deprecated)
+- Tests constructing `Settings()` pick up `.env` values via Pydantic Settings — explicitly set any field under test to avoid hidden dependencies
 
 ## Adding a New Bot Command
 

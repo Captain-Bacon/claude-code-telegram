@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Core bot stable — delivery pipeline hardened (69 tests), architecture documented with Mermaid diagrams (docs/architecture.md), strip-and-restructure epic complete. Media handlers now queue when Claude is busy (same as text). Scheduled jobs support per-job model selection. Remaining work is peripheral: stale docs (6vz), worktree isolation (9l0), SDK injection research (9mb).
+Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy, scheduler supports per-job model selection. Major active initiative: prompt architecture overhaul (anchor bead `zpg`) — switching from raw string system prompt to CC's preset+append to get output styles, CLAUDE.md chain, and hooks working through the bot. Entry point is bead `0ci` (SDK verification). All mypy errors in bot layer resolved.
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -60,7 +60,8 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 <!-- What hasn't been decided -->
 ## Open Questions
 
-- None currently open
+- How does the SDK activate output styles — auto-discovery from setting_sources, or explicit activation in settings.local.json? (bead `0ci`)
+- Does the installed claude-agent-sdk support dict form of system_prompt? (bead `0ci`)
 
 <!-- Quick lookups -->
 ## Quick Lookups
