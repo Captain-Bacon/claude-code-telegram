@@ -68,6 +68,9 @@ class ProjectThreadManager:
                 )
 
                 if existing:
+                    if not existing.managed_by_sync:
+                        # User-adopted topic — don't reclaim ownership
+                        continue
                     handled = await self._sync_existing_mapping(
                         bot=bot,
                         project=project,
@@ -188,13 +191,13 @@ class ProjectThreadManager:
                 result.failed += 1
                 return True
             result.reopened += 1
-
-        usable_status = await self._ensure_topic_usable(bot, mapping)
-        if usable_status == "unusable":
-            return False
-        if usable_status == "failed":
-            result.failed += 1
-            return True
+        else:
+            usable_status = await self._ensure_topic_usable(bot, mapping)
+            if usable_status == "unusable":
+                return False
+            if usable_status == "failed":
+                result.failed += 1
+                return True
 
         topic_name = mapping.topic_name
         if mapping.topic_name != project.name:
