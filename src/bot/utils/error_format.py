@@ -1,9 +1,13 @@
 """Error formatting and working-directory helpers extracted from handlers."""
 
+from __future__ import annotations
+
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
+from telegram.ext import ContextTypes
 
 from ...claude.exceptions import (
     ClaudeError,
@@ -14,6 +18,10 @@ from ...claude.exceptions import (
     ClaudeTimeoutError,
 )
 from .html_format import escape_html
+
+if TYPE_CHECKING:
+    from ...claude.sdk_integration import ClaudeResponse
+    from ...config.settings import Settings
 
 logger = structlog.get_logger()
 
@@ -216,8 +224,11 @@ def _format_error_message(error: Exception | str) -> str:
 
 
 def _update_working_directory_from_claude_response(
-    claude_response, context, settings, user_id
-):  # type: ignore[no-untyped-def]
+    claude_response: "ClaudeResponse",
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: "Settings",
+    user_id: int,
+) -> None:
     """Update the working directory based on Claude's response content."""
     # Look for directory changes in Claude's response
     # This searches for common patterns that indicate directory changes
