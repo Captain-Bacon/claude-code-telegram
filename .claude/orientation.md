@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy. Two active fronts: (1) prompt architecture overhaul (anchor bead `zpg`) — switching to CC's preset+append for output styles, CLAUDE.md chain, hooks; (2) topic model just decoupled from repos — topics are now flexible conversations, not rigid 1:1 repo mappings. `/sync_topics` refreshes registry from disk. Validation bead `lr2` pending.
+Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy. Prompt architecture switched to preset+append (anchor bead `zpg` tracks remaining verification + CLAUDE.md thinning — blocked on `j73` user testing). Topic model decoupled from repos — topics are flexible conversations, not rigid 1:1 repo mappings. Code reviewed and bug-fixed (sync reclaim, redundant API calls). Markdown table rendering added to HTML formatter. Test coverage for new topic paths is thin (bead `tlw`).
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -50,7 +50,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - AgentHandler rewire to PersistentClientManager tested via mocks only, not integration tested
 - Scheduler API endpoints tested but not integration tested with running bot
 - Architecture doc diagrams haven't been rendered with mmdc — valid Mermaid syntax but not visually verified
-- Topic decoupling (migration v6, thread_manager, orchestrator routing) — tests pass but not integration tested against live bot. Validation bead `lr2`.
+- Topic decoupling (migration v6, thread_manager, orchestrator routing) — code reviewed and bugs fixed, but new paths (auto-adopt, /repo thread mode, managed_by_sync stale exclusion) have zero test coverage (bead `tlw`). Not integration tested against live bot.
 
 <!-- Active risks -->
 ## Active Risks
@@ -62,8 +62,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 <!-- What hasn't been decided -->
 ## Open Questions
 
-- How does the SDK activate output styles — auto-discovery from setting_sources, or explicit activation in settings.local.json? (bead `0ci`)
-- Does the installed claude-agent-sdk support dict form of system_prompt? (bead `0ci`)
+- Preset+append prompt architecture: does the bot Claude actually match terminal Claude? User needs to test via Telegram (bead `j73`). Until confirmed, the output style and CLAUDE.md chain delivery is assumed-working.
 
 <!-- Quick lookups -->
 ## Quick Lookups
