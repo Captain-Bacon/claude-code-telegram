@@ -317,6 +317,48 @@ class DatabaseManager:
                 ALTER TABLE scheduled_jobs ADD COLUMN model TEXT DEFAULT NULL;
                 """,
             ),
+            (
+                6,
+                """
+                -- Decouple topics from repos: allow multiple topics per repo,
+                -- nullable slug for scratchpad topics, managed_by_sync flag.
+                --
+                -- SQLite cannot DROP constraints, so recreate the table.
+
+                ALTER TABLE project_threads RENAME TO _project_threads_old;
+
+                CREATE TABLE project_threads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug TEXT,
+                    chat_id INTEGER NOT NULL,
+                    message_thread_id INTEGER NOT NULL,
+                    topic_name TEXT NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    managed_by_sync BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, message_thread_id)
+                );
+
+                INSERT INTO project_threads (
+                    id, project_slug, chat_id, message_thread_id,
+                    topic_name, is_active, managed_by_sync,
+                    created_at, updated_at
+                )
+                SELECT
+                    id, project_slug, chat_id, message_thread_id,
+                    topic_name, is_active, TRUE,
+                    created_at, updated_at
+                FROM _project_threads_old;
+
+                DROP TABLE _project_threads_old;
+
+                CREATE INDEX IF NOT EXISTS idx_project_threads_chat_active
+                    ON project_threads(chat_id, is_active);
+                CREATE INDEX IF NOT EXISTS idx_project_threads_slug
+                    ON project_threads(project_slug);
+                """,
+            ),
         ]
 
     async def _init_pool(self):

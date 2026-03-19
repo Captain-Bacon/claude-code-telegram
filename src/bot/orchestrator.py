@@ -34,7 +34,12 @@ from telegram.ext import (
 
 from ..claude.persistent import PersistentClientManager, derive_state_key
 from ..config.settings import Settings
-from ..projects import PrivateTopicsUnavailableError, load_project_registry
+from ..projects import (
+    PrivateTopicsUnavailableError,
+    build_registry,
+    discover_active_repos,
+    load_pinned_projects,
+)
 from ..security.audit import AuditLogger
 from .delivery import deliver_turn_result, make_stall_callback
 from .media_handlers import (
@@ -117,8 +122,8 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     os.kill(os.getpid(), signal.SIGTERM)
 
 
-async def sync_threads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Synchronize project topics in the configured forum chat."""
+async def sync_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Synchronize project topics — refreshes registry from disk then reconciles."""
     assert update.message is not None
     assert update.effective_user is not None
     assert update.effective_chat is not None
@@ -129,26 +134,26 @@ async def sync_threads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not settings.enable_project_threads:
         await update.message.reply_text(
-            "ℹ️ <b>Project thread mode is disabled.</b>", parse_mode="HTML"
+            "ℹ\ufe0f <b>Project thread mode is disabled.</b>", parse_mode="HTML"
         )
         return
 
     manager = context.bot_data.get("project_threads_manager")
     if not manager:
         await update.message.reply_text(
-            "❌ <b>Project thread manager not initialized.</b>", parse_mode="HTML"
+            "\u274c <b>Project thread manager not initialized.</b>", parse_mode="HTML"
         )
         return
 
     status_msg = await update.message.reply_text(
-        "🔄 <b>Syncing project topics...</b>", parse_mode="HTML"
+        "\U0001f504 <b>Syncing project topics...</b>", parse_mode="HTML"
     )
 
     if settings.project_threads_mode == "private":
         if not _is_private_chat(update):
             await status_msg.edit_text(
-                "❌ <b>Private Thread Mode</b>\n\n"
-                "Run <code>/sync_threads</code> in your private chat with the bot.",
+                "\u274c <b>Private Thread Mode</b>\n\n"
+                "Run <code>/sync_topics</code> in your private chat with the bot.",
                 parse_mode="HTML",
             )
             return
@@ -156,7 +161,7 @@ async def sync_threads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         if settings.project_threads_chat_id is None:
             await status_msg.edit_text(
-                "❌ <b>Group Thread Mode Misconfigured</b>\n\n"
+                "\u274c <b>Group Thread Mode Misconfigured</b>\n\n"
                 "Set <code>PROJECT_THREADS_CHAT_ID</code> first.",
                 parse_mode="HTML",
             )
@@ -166,59 +171,76 @@ async def sync_threads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             or update.effective_chat.id != settings.project_threads_chat_id
         ):
             await status_msg.edit_text(
-                "❌ <b>Group Thread Mode</b>\n\n"
-                "Run <code>/sync_threads</code> in the configured project threads group.",
+                "\u274c <b>Group Thread Mode</b>\n\n"
+                "Run <code>/sync_topics</code> in the configured project threads group.",
                 parse_mode="HTML",
             )
             return
         target_chat_id = settings.project_threads_chat_id
 
     try:
-        if not settings.projects_config_path:
+        # Refresh registry: pinned from YAML + discovery from filesystem
+        pinned = []
+        if settings.projects_config_path:
+            pinned = load_pinned_projects(
+                config_path=settings.projects_config_path,
+                approved_directory=settings.approved_directory,
+            )
+
+        discovered = []
+        if settings.project_threads_discover:
+            pinned_slugs = {p.slug for p in pinned}
+            discovered = discover_active_repos(
+                base_directory=settings.approved_directory,
+                max_results=settings.project_threads_discover_limit,
+                max_days=settings.project_threads_discover_days,
+                exclude_slugs=pinned_slugs,
+            )
+
+        all_projects = pinned + discovered
+        if not all_projects:
             await status_msg.edit_text(
-                "❌ <b>Project thread mode is misconfigured</b>\n\n"
-                "Set <code>PROJECTS_CONFIG_PATH</code> to a valid YAML file.",
+                "\u274c <b>No projects found</b>\n\n"
+                "Check projects config or ensure git repos exist "
+                "in the approved directory.",
                 parse_mode="HTML",
             )
             if audit_logger:
-                await audit_logger.log_command(user_id, "sync_threads", [], False)
+                await audit_logger.log_command(user_id, "sync_topics", [], False)
             return
 
-        registry = load_project_registry(
-            config_path=settings.projects_config_path,
-            approved_directory=settings.approved_directory,
-        )
+        registry = build_registry(pinned=pinned, discovered=discovered)
         manager.registry = registry
         context.bot_data["project_registry"] = registry
 
         result = await manager.sync_topics(context.bot, chat_id=target_chat_id)
         await status_msg.edit_text(
-            "✅ <b>Project topic sync complete</b>\n\n"
-            f"• Created: <b>{result.created}</b>\n"
-            f"• Reused: <b>{result.reused}</b>\n"
-            f"• Renamed: <b>{result.renamed}</b>\n"
-            f"• Reopened: <b>{result.reopened}</b>\n"
-            f"• Closed: <b>{result.closed}</b>\n"
-            f"• Deactivated: <b>{result.deactivated}</b>\n"
-            f"• Failed: <b>{result.failed}</b>",
+            "\u2705 <b>Project topic sync complete</b>\n\n"
+            f"\u2022 Created: <b>{result.created}</b>\n"
+            f"\u2022 Reused: <b>{result.reused}</b>\n"
+            f"\u2022 Renamed: <b>{result.renamed}</b>\n"
+            f"\u2022 Reopened: <b>{result.reopened}</b>\n"
+            f"\u2022 Closed: <b>{result.closed}</b>\n"
+            f"\u2022 Deactivated: <b>{result.deactivated}</b>\n"
+            f"\u2022 Failed: <b>{result.failed}</b>",
             parse_mode="HTML",
         )
         if audit_logger:
-            await audit_logger.log_command(user_id, "sync_threads", [], True)
+            await audit_logger.log_command(user_id, "sync_topics", [], True)
     except PrivateTopicsUnavailableError:
         await status_msg.edit_text(
             manager.private_topics_unavailable_message(),
             parse_mode="HTML",
         )
         if audit_logger:
-            await audit_logger.log_command(user_id, "sync_threads", [], False)
+            await audit_logger.log_command(user_id, "sync_topics", [], False)
     except Exception as e:
         await status_msg.edit_text(
-            f"❌ <b>Project topic sync failed</b>\n\n{escape_html(str(e))}",
+            f"\u274c <b>Project topic sync failed</b>\n\n{escape_html(str(e))}",
             parse_mode="HTML",
         )
         if audit_logger:
-            await audit_logger.log_command(user_id, "sync_threads", [], False)
+            await audit_logger.log_command(user_id, "sync_topics", [], False)
 
 
 class MessageOrchestrator:
@@ -251,7 +273,7 @@ class MessageOrchestrator:
             context.bot_data["settings"] = self.settings  # type: ignore[index]
             context.user_data.pop("_thread_context", None)  # type: ignore[union-attr]
 
-            is_sync_bypass = handler.__name__ == "sync_threads"
+            is_sync_bypass = handler.__name__ == "sync_topics"
             is_start_bypass = handler.__name__ in {"start_command", "agentic_start"}
             message_thread_id = self._extract_message_thread_id(update)
             should_enforce = self.settings.enable_project_threads
@@ -319,18 +341,40 @@ class MessageOrchestrator:
             return False
 
         project = await manager.resolve_project(chat.id, message_thread_id)
-        if not project:
-            await self._reject_for_thread_mode(
-                update,
-                manager.guidance_message(mode=self.settings.project_threads_mode),
+        mapping = await manager.get_mapping(chat.id, message_thread_id)
+
+        # Determine project root and metadata
+        if project:
+            # Mapped to a known, enabled project
+            project_root = project.absolute_path
+            project_slug = project.slug
+            project_name = project.name
+        elif mapping:
+            # Mapping exists but no active project (scratchpad or stale)
+            project_root = self.settings.approved_directory
+            project_slug = mapping.project_slug
+            project_name = mapping.topic_name
+        else:
+            # Unmapped topic — auto-adopt as scratchpad so /repo can aim it
+            topic_name = "Untitled"
+            if update.effective_message:
+                # Try to get the topic name from the message
+                topic = getattr(update.effective_message, "forum_topic_created", None)
+                if topic and hasattr(topic, "name"):
+                    topic_name = topic.name
+            await manager.adopt_topic(
+                chat_id=chat.id,
+                message_thread_id=message_thread_id,
+                topic_name=topic_name,
             )
-            return False
+            project_root = self.settings.approved_directory
+            project_slug = None
+            project_name = topic_name
 
         state_key = f"{chat.id}:{message_thread_id}"
         thread_states = context.user_data.setdefault("thread_state", {})  # type: ignore[union-attr]
         state = thread_states.get(state_key, {})
 
-        project_root = project.absolute_path
         current_dir_raw = state.get("current_directory")
         current_dir = (
             Path(current_dir_raw).resolve() if current_dir_raw else project_root
@@ -344,9 +388,9 @@ class MessageOrchestrator:
             "chat_id": chat.id,
             "message_thread_id": message_thread_id,
             "state_key": state_key,
-            "project_slug": project.slug,
+            "project_slug": project_slug,
             "project_root": str(project_root),
-            "project_name": project.name,
+            "project_name": project_name,
         }
         return True
 
@@ -433,7 +477,7 @@ class MessageOrchestrator:
             ("stop", self.agentic_stop),
         ]
         if self.settings.enable_project_threads:
-            handlers.append(("sync_threads", sync_threads))
+            handlers.append(("sync_topics", sync_topics))
 
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
@@ -510,7 +554,7 @@ class MessageOrchestrator:
             BotCommand("stop", "Cancel the current Claude request"),
         ]
         if self.settings.enable_project_threads:
-            commands.append(BotCommand("sync_threads", "Sync project topics"))
+            commands.append(BotCommand("sync_topics", "Sync project topics"))
         return commands
 
     # --- Agentic handlers ---
@@ -556,7 +600,7 @@ class MessageOrchestrator:
                     )
                     return
                 except Exception:
-                    sync_line = "\n\n🧵 Topic sync failed. Run /sync_threads to retry."
+                    sync_line = "\n\n🧵 Topic sync failed. Run /sync_topics to retry."
         current_dir = context.user_data.get(  # type: ignore[union-attr]
             "current_directory", self.settings.approved_directory
         )
@@ -1228,6 +1272,25 @@ class MessageOrchestrator:
 
             context.user_data["current_directory"] = target_path  # type: ignore[index]
 
+            # In thread mode, update the topic mapping to point at this repo
+            thread_context = context.user_data.get("_thread_context")  # type: ignore[union-attr]
+            if thread_context:
+                manager = context.bot_data.get("project_threads_manager")
+                if manager:
+                    from ..projects.discovery import _slugify
+
+                    slug = _slugify(target_name)
+                    await manager.adopt_topic(
+                        chat_id=thread_context["chat_id"],
+                        message_thread_id=thread_context["message_thread_id"],
+                        topic_name=target_name,
+                        project_slug=slug,
+                    )
+                    # Update thread context for persist
+                    thread_context["project_slug"] = slug
+                    thread_context["project_root"] = str(target_path)
+                    thread_context["project_name"] = target_name
+
             is_git = (target_path / ".git").is_dir()
             git_badge = " (git)" if is_git else ""
 
@@ -1311,6 +1374,24 @@ class MessageOrchestrator:
             return
 
         context.user_data["current_directory"] = new_path  # type: ignore[index]
+
+        # In thread mode, update the topic mapping to point at this repo
+        thread_context = context.user_data.get("_thread_context")  # type: ignore[union-attr]
+        if thread_context:
+            manager = context.bot_data.get("project_threads_manager")
+            if manager:
+                from ..projects.discovery import _slugify
+
+                slug = _slugify(project_name)
+                await manager.adopt_topic(
+                    chat_id=thread_context["chat_id"],
+                    message_thread_id=thread_context["message_thread_id"],
+                    topic_name=project_name,
+                    project_slug=slug,
+                )
+                thread_context["project_slug"] = slug
+                thread_context["project_root"] = str(new_path)
+                thread_context["project_name"] = project_name
 
         is_git = (new_path / ".git").is_dir()
         git_badge = " (git)" if is_git else ""

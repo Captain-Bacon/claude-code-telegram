@@ -192,7 +192,7 @@ projects:
 
 When `ENABLE_PROJECT_THREADS=true`:
 - `PROJECT_THREADS_MODE=private`:
-  - `/start` and `/sync_threads` are allowed outside topics in private chat.
+  - `/start` and `/sync_topics` are allowed outside topics in private chat.
   - all other updates must be inside mapped project topics.
 - `PROJECT_THREADS_MODE=group`:
   - behavior remains forum-topic based using `PROJECT_THREADS_CHAT_ID`.

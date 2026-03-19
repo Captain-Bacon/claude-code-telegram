@@ -107,11 +107,12 @@ class SessionModel:
 class ProjectThreadModel:
     """Project-thread mapping data model."""
 
-    project_slug: str
     chat_id: int
     message_thread_id: int
     topic_name: str
+    project_slug: Optional[str] = None
     is_active: bool = True
+    managed_by_sync: bool = True
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     id: Optional[int] = None
@@ -134,6 +135,7 @@ class ProjectThreadModel:
             if val and isinstance(val, str):
                 data[field] = datetime.fromisoformat(val)
         data["is_active"] = bool(data.get("is_active", True))
+        data["managed_by_sync"] = bool(data.get("managed_by_sync", True))
 
         return cls(**data)
 

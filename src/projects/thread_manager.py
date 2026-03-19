@@ -61,6 +61,7 @@ class ProjectThreadManager:
 
         for project in enabled:
             try:
+                # Find any existing mapping (active or inactive) for this project
                 existing = await self.repository.get_by_chat_project(
                     chat_id,
                     project.slug,
@@ -75,6 +76,12 @@ class ProjectThreadManager:
                     )
                     if handled:
                         continue
+                    # Existing topic unusable — deactivate before recreating
+                    await self.repository.set_active_by_thread(
+                        chat_id=chat_id,
+                        message_thread_id=existing.message_thread_id,
+                        is_active=False,
+                    )
 
                 await self._create_and_map_topic(
                     bot=bot,
@@ -131,9 +138,9 @@ class ProjectThreadManager:
                     error=str(e),
                 )
             finally:
-                await self.repository.set_active(
+                await self.repository.set_active_by_thread(
                     chat_id=stale.chat_id,
-                    project_slug=stale.project_slug,
+                    message_thread_id=stale.message_thread_id,
                     is_active=False,
                 )
                 result.deactivated += 1
@@ -200,10 +207,10 @@ class ProjectThreadManager:
                 return False
             if rename_status == "failed":
                 await self.repository.upsert_mapping(
-                    project_slug=project.slug,
                     chat_id=chat_id,
                     message_thread_id=mapping.message_thread_id,
                     topic_name=mapping.topic_name,
+                    project_slug=project.slug,
                     is_active=True,
                 )
                 result.failed += 1
@@ -213,10 +220,10 @@ class ProjectThreadManager:
             result.renamed += 1
 
         await self.repository.upsert_mapping(
-            project_slug=project.slug,
             chat_id=chat_id,
             message_thread_id=mapping.message_thread_id,
             topic_name=topic_name,
+            project_slug=project.slug,
             is_active=True,
         )
         result.reused += 1
@@ -238,10 +245,10 @@ class ProjectThreadManager:
         )
 
         await self.repository.upsert_mapping(
-            project_slug=project.slug,
             chat_id=chat_id,
             message_thread_id=topic.message_thread_id,
             topic_name=project.name,
+            project_slug=project.slug,
             is_active=True,
         )
         await self._send_topic_bootstrap_message(
@@ -305,9 +312,18 @@ class ProjectThreadManager:
     async def resolve_project(
         self, chat_id: int, message_thread_id: int
     ) -> Optional[ProjectDefinition]:
-        """Resolve mapped project for chat+thread."""
+        """Resolve mapped project for chat+thread.
+
+        Returns the ProjectDefinition if the topic is mapped to a known project.
+        Returns None if unmapped — caller decides whether to allow (scratchpad)
+        or reject.
+        """
         mapping = await self.repository.get_by_chat_thread(chat_id, message_thread_id)
         if not mapping:
+            return None
+
+        if not mapping.project_slug:
+            # Scratchpad topic — mapped but no project
             return None
 
         project = self.registry.get_by_slug(mapping.project_slug)
@@ -315,6 +331,29 @@ class ProjectThreadManager:
             return None
 
         return project
+
+    async def get_mapping(
+        self, chat_id: int, message_thread_id: int
+    ) -> Optional[ProjectThreadModel]:
+        """Get raw mapping for a topic, regardless of project status."""
+        return await self.repository.get_by_chat_thread(chat_id, message_thread_id)
+
+    async def adopt_topic(
+        self,
+        chat_id: int,
+        message_thread_id: int,
+        topic_name: str,
+        project_slug: Optional[str] = None,
+    ) -> ProjectThreadModel:
+        """Adopt a manually-created topic into the mapping table."""
+        return await self.repository.upsert_mapping(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            topic_name=topic_name,
+            project_slug=project_slug,
+            is_active=True,
+            managed_by_sync=False,
+        )
 
     @staticmethod
     def guidance_message(mode: str = "group") -> str:
@@ -328,7 +367,7 @@ class ProjectThreadManager:
             "🚫 <b>Project Thread Required</b>\n\n"
             "This bot is configured for strict project threads.\n"
             f"Please send commands in a {context_label}.\n\n"
-            "If topics are missing or stale, run <code>/sync_threads</code>."
+            "If topics are missing or stale, run <code>/sync_topics</code>."
         )
 
     @staticmethod
@@ -339,7 +378,7 @@ class ProjectThreadManager:
             "This bot requires topics in private chat, "
             "but topics are not available.\n\n"
             "Enable topics for this bot chat in Telegram, then run "
-            "<code>/sync_threads</code>."
+            "<code>/sync_topics</code>."
         )
 
     @staticmethod

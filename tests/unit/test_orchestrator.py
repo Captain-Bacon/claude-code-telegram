@@ -707,6 +707,8 @@ async def test_thread_mode_loads_and_persists_thread_state(group_thread_settings
 
     project_threads_manager = MagicMock()
     project_threads_manager.resolve_project = AsyncMock(return_value=project)
+    project_threads_manager.get_mapping = AsyncMock(return_value=None)
+    project_threads_manager.adopt_topic = AsyncMock()
     project_threads_manager.guidance_message.return_value = "Use project thread"
     deps["project_threads_manager"] = project_threads_manager
 
@@ -741,20 +743,20 @@ async def test_thread_mode_loads_and_persists_thread_state(group_thread_settings
     )
 
 
-async def test_sync_threads_bypasses_thread_gate(group_thread_settings, deps):
-    """sync_threads command bypasses strict thread routing gate."""
+async def test_sync_topics_bypasses_thread_gate(group_thread_settings, deps):
+    """sync_topics command bypasses strict thread routing gate."""
     orchestrator = MessageOrchestrator(group_thread_settings, deps)
 
     called = {"value": False}
 
-    async def sync_threads(update, context):
+    async def sync_topics(update, context):
         called["value"] = True
 
     project_threads_manager = MagicMock()
     project_threads_manager.guidance_message.return_value = "Use project thread"
     deps["project_threads_manager"] = project_threads_manager
 
-    wrapped = orchestrator._inject_deps(sync_threads)
+    wrapped = orchestrator._inject_deps(sync_topics)
 
     update = MagicMock()
     update.effective_chat.id = -1002222222
@@ -814,6 +816,8 @@ async def test_private_mode_start_inside_topic_uses_thread_context(
     )
     project_threads_manager = MagicMock()
     project_threads_manager.resolve_project = AsyncMock(return_value=project)
+    project_threads_manager.get_mapping = AsyncMock(return_value=None)
+    project_threads_manager.adopt_topic = AsyncMock()
     project_threads_manager.guidance_message.return_value = "Use project topic"
     deps["project_threads_manager"] = project_threads_manager
 

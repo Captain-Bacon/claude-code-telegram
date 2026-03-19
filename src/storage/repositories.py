@@ -253,49 +253,85 @@ class ProjectThreadRepository:
     async def get_by_chat_project(
         self, chat_id: int, project_slug: str
     ) -> Optional[ProjectThreadModel]:
-        """Find mapping by chat+project slug."""
+        """Find first mapping by chat+project slug (active or inactive).
+
+        Returns inactive mappings too so sync can attempt to reopen them.
+        """
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
                 """
                 SELECT * FROM project_threads
                 WHERE chat_id = ? AND project_slug = ?
+                ORDER BY is_active DESC
+                LIMIT 1
             """,
                 (chat_id, project_slug),
             )
             row = await cursor.fetchone()
             return ProjectThreadModel.from_row(row) if row else None
 
+    async def has_active_topic_for_project(
+        self, chat_id: int, project_slug: str
+    ) -> bool:
+        """Check if at least one active topic exists for a project."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT 1 FROM project_threads
+                WHERE chat_id = ? AND project_slug = ? AND is_active = TRUE
+                LIMIT 1
+            """,
+                (chat_id, project_slug),
+            )
+            return await cursor.fetchone() is not None
+
     async def upsert_mapping(
         self,
-        project_slug: str,
         chat_id: int,
         message_thread_id: int,
         topic_name: str,
+        project_slug: Optional[str] = None,
         is_active: bool = True,
+        managed_by_sync: bool = True,
     ) -> ProjectThreadModel:
-        """Create or update mapping by unique chat+project key."""
+        """Create or update mapping by unique chat+thread key."""
         async with self.db.get_connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO project_threads (
-                    project_slug, chat_id, message_thread_id, topic_name, is_active
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, project_slug) DO UPDATE SET
-                    message_thread_id = excluded.message_thread_id,
+                    project_slug, chat_id, message_thread_id, topic_name,
+                    is_active, managed_by_sync
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_thread_id) DO UPDATE SET
+                    project_slug = excluded.project_slug,
                     topic_name = excluded.topic_name,
                     is_active = excluded.is_active,
+                    managed_by_sync = excluded.managed_by_sync,
                     updated_at = CURRENT_TIMESTAMP
             """,
-                (project_slug, chat_id, message_thread_id, topic_name, is_active),
+                (
+                    project_slug,
+                    chat_id,
+                    message_thread_id,
+                    topic_name,
+                    is_active,
+                    managed_by_sync,
+                ),
             )
             await conn.commit()
 
-        mapping = await self.get_by_chat_project(
-            chat_id=chat_id, project_slug=project_slug
-        )
-        if not mapping:
-            raise RuntimeError("Failed to upsert project thread mapping")
-        return mapping
+            # Confirm — don't filter by is_active since we may have set it False
+            cursor = await conn.execute(
+                """
+                SELECT * FROM project_threads
+                WHERE chat_id = ? AND message_thread_id = ?
+            """,
+                (chat_id, message_thread_id),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                raise RuntimeError("Failed to upsert project thread mapping")
+            return ProjectThreadModel.from_row(row)
 
     async def deactivate_missing_projects(
         self, chat_id: int, active_project_slugs: List[str]
@@ -328,7 +364,11 @@ class ProjectThreadRepository:
     async def list_stale_active_mappings(
         self, chat_id: int, active_project_slugs: List[str]
     ) -> List[ProjectThreadModel]:
-        """List active mappings that are no longer enabled/present."""
+        """List sync-managed active mappings whose project is no longer enabled.
+
+        User-adopted topics (managed_by_sync=FALSE) and scratchpad topics
+        (project_slug IS NULL) are never considered stale.
+        """
         async with self.db.get_connection() as conn:
             if active_project_slugs:
                 placeholders = ",".join("?" for _ in active_project_slugs)
@@ -336,6 +376,8 @@ class ProjectThreadRepository:
                     SELECT * FROM project_threads
                     WHERE chat_id = ?
                       AND is_active = TRUE
+                      AND managed_by_sync = TRUE
+                      AND project_slug IS NOT NULL
                       AND project_slug NOT IN ({placeholders})
                     ORDER BY project_slug ASC
                 """
@@ -345,7 +387,10 @@ class ProjectThreadRepository:
                 cursor = await conn.execute(
                     """
                     SELECT * FROM project_threads
-                    WHERE chat_id = ? AND is_active = TRUE
+                    WHERE chat_id = ?
+                      AND is_active = TRUE
+                      AND managed_by_sync = TRUE
+                      AND project_slug IS NOT NULL
                     ORDER BY project_slug ASC
                 """,
                     (chat_id,),
@@ -353,16 +398,18 @@ class ProjectThreadRepository:
             rows = await cursor.fetchall()
             return [ProjectThreadModel.from_row(row) for row in rows]
 
-    async def set_active(self, chat_id: int, project_slug: str, is_active: bool) -> int:
-        """Set active flag for a mapping by chat+project."""
+    async def set_active_by_thread(
+        self, chat_id: int, message_thread_id: int, is_active: bool
+    ) -> int:
+        """Set active flag for a mapping by chat+thread."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
                 """
                 UPDATE project_threads
                 SET is_active = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND project_slug = ?
+                WHERE chat_id = ? AND message_thread_id = ?
             """,
-                (is_active, chat_id, project_slug),
+                (is_active, chat_id, message_thread_id),
             )
             await conn.commit()
             return cursor.rowcount

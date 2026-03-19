@@ -384,8 +384,8 @@ class TestProjectThreadRepository:
         assert len(stale) == 1
         assert stale[0].project_slug == "app2"
 
-    async def test_set_active_updates_flag(self, project_thread_repo):
-        """set_active toggles mapping active flag."""
+    async def test_set_active_by_thread_updates_flag(self, project_thread_repo):
+        """set_active_by_thread toggles mapping active flag."""
         await project_thread_repo.upsert_mapping(
             project_slug="app1",
             chat_id=-1001234567890,
@@ -394,9 +394,9 @@ class TestProjectThreadRepository:
             is_active=True,
         )
 
-        changed = await project_thread_repo.set_active(
+        changed = await project_thread_repo.set_active_by_thread(
             chat_id=-1001234567890,
-            project_slug="app1",
+            message_thread_id=111,
             is_active=False,
         )
 
