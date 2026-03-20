@@ -6,6 +6,7 @@ an acknowledgement loop: the AgentHandler publishes ScheduledJobOutcome
 after processing, and the scheduler updates job status accordingly.
 """
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,7 @@ from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped
 from ..events.bus import Event, EventBus
 from ..events.types import ScheduledEvent, ScheduledJobOutcome
 from ..storage.database import DatabaseManager
+from .alerts import clear_alert, write_alert
 
 logger = structlog.get_logger()
 
@@ -69,6 +71,9 @@ class JobScheduler:
         skill_name: Optional[str] = None,
         created_by: int = 0,
         model: Optional[str] = None,
+        priority: Optional[str] = None,
+        on_failure: Optional[str] = None,
+        relevance_hours: Optional[int] = None,
     ) -> str:
         """Add a new scheduled job (recurring or one-shot).
 
@@ -104,8 +109,9 @@ class JobScheduler:
             trigger = CronTrigger.from_crontab(cron_expression)
 
         work_dir = working_directory or self.default_working_directory
+        job_id = str(uuid.uuid4())
 
-        job = self._scheduler.add_job(
+        self._scheduler.add_job(
             self._fire_event,
             trigger=trigger,
             kwargs={
@@ -115,23 +121,16 @@ class JobScheduler:
                 "target_chat_ids": target_chat_ids or [],
                 "skill_name": skill_name,
                 "model": model,
-                "job_id": None,  # filled in below
+                "job_id": job_id,
                 "one_shot": one_shot,
             },
+            id=job_id,
             name=job_name,
-        )
-
-        # Patch the job_id into kwargs now that APScheduler assigned one
-        job.modify(
-            kwargs={
-                **job.kwargs,
-                "job_id": job.id,
-            }
         )
 
         # Persist to database
         await self._save_job(
-            job_id=job.id,
+            job_id=job_id,
             job_name=job_name,
             cron_expression=cron_expression or "",
             prompt=prompt,
@@ -141,17 +140,20 @@ class JobScheduler:
             created_by=created_by,
             model=model,
             run_at=run_at,
+            priority=priority or "medium",
+            on_failure=on_failure,
+            relevance_hours=relevance_hours,
         )
 
         schedule_desc = run_at if one_shot else cron_expression
         logger.info(
             "Scheduled job added",
-            job_id=job.id,
+            job_id=job_id,
             job_name=job_name,
             schedule=schedule_desc,
             one_shot=one_shot,
         )
-        return str(job.id)
+        return job_id
 
     async def remove_job(self, job_id: str) -> bool:
         """Remove a scheduled job."""
@@ -189,14 +191,12 @@ class JobScheduler:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
         # For one-shot jobs, mark as fired and track the attempt
         if one_shot and job_id:
-            await self._update_job_status(
-                job_id, "fired", increment_attempts=True
-            )
+            await self._update_job_status(job_id, "fired", increment_attempts=True)
 
         # Only populate job_id for one-shot jobs — this is what triggers
         # the ack loop. Cron jobs must NOT get acked (would be soft-deleted).
         event = ScheduledEvent(
-            job_id=job_id if one_shot else "",
+            job_id=(job_id or "") if one_shot else "",
             job_name=job_name,
             prompt=prompt,
             working_directory=Path(working_directory),
@@ -227,6 +227,13 @@ class JobScheduler:
                 "One-shot job delivered, cleaning up",
                 job_id=event.job_id,
             )
+            # Clear any existing alert for this job before deleting
+            job = await self._get_job(event.job_id)
+            if job:
+                work_dir = Path(
+                    job.get("working_directory", str(self.default_working_directory))
+                )
+                clear_alert(work_dir, event.job_id)
             await self._delete_job(event.job_id)
         else:
             logger.warning(
@@ -234,9 +241,14 @@ class JobScheduler:
                 job_id=event.job_id,
                 error=event.error,
             )
-            await self._update_job_status(
-                event.job_id, "failed", error=event.error
-            )
+            await self._update_job_status(event.job_id, "failed", error=event.error)
+            # Write alert to workspace
+            job = await self._get_job(event.job_id)
+            if job:
+                work_dir = Path(
+                    job.get("working_directory", str(self.default_working_directory))
+                )
+                write_alert(work_dir, job, f"Delivery failed: {event.error}")
 
     # -- Startup recovery --
 
@@ -277,13 +289,22 @@ class JobScheduler:
             if run_dt > datetime.now(UTC):
                 continue  # Still in the future, handled by normal scheduling
             if run_dt < cutoff:
-                # Too old to recover — mark expired and clean up
+                # Too old to recover — mark expired, alert, and clean up
                 logger.info(
                     "Expiring stale one-shot job",
                     job_id=job["job_id"],
                     run_at=run_at,
                 )
                 await self._update_job_status(job["job_id"], "expired")
+                work_dir = Path(
+                    job.get("working_directory", str(self.default_working_directory))
+                )
+                write_alert(
+                    work_dir,
+                    job,
+                    f"Job expired — was due {run_at}, now past the "
+                    f"{RECOVERY_WINDOW_HOURS}h recovery window",
+                )
                 await self._delete_job(job["job_id"])
                 continue
 
@@ -296,11 +317,12 @@ class JobScheduler:
                     job_id=job["job_id"],
                     attempts=attempts,
                 )
-                await self._update_job_status(
-                    job["job_id"],
-                    "failed",
-                    error=f"Exhausted {MAX_ONE_SHOT_ATTEMPTS} delivery attempts",
+                error_msg = f"Exhausted {MAX_ONE_SHOT_ATTEMPTS} delivery attempts"
+                await self._update_job_status(job["job_id"], "failed", error=error_msg)
+                work_dir = Path(
+                    job.get("working_directory", str(self.default_working_directory))
                 )
+                write_alert(work_dir, job, error_msg)
                 continue
 
             reason = {
@@ -373,11 +395,23 @@ class JobScheduler:
             )
         )
 
-        logger.info(
-            "One-shot job recovery complete", recovered_count=len(recovered)
-        )
+        logger.info("One-shot job recovery complete", recovered_count=len(recovered))
 
     # -- Database operations --
+
+    async def _get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single job by ID (active or inactive)."""
+        try:
+            async with self.db_manager.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT * FROM scheduled_jobs WHERE job_id = ?",
+                    (job_id,),
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception:
+            logger.exception("Failed to fetch job", job_id=job_id)
+            return None
 
     async def _load_jobs_from_db(self) -> None:
         """Load persisted jobs and re-register them with APScheduler."""
@@ -403,9 +437,7 @@ class JobScheduler:
                             continue
                         trigger = DateTrigger(run_date=run_dt)
                     else:
-                        trigger = CronTrigger.from_crontab(
-                            row_dict["cron_expression"]
-                        )
+                        trigger = CronTrigger.from_crontab(row_dict["cron_expression"])
 
                     # Parse target_chat_ids from stored string
                     chat_ids_str = row_dict.get("target_chat_ids", "")
@@ -461,6 +493,9 @@ class JobScheduler:
         created_by: int,
         model: Optional[str] = None,
         run_at: Optional[str] = None,
+        priority: str = "medium",
+        on_failure: Optional[str] = None,
+        relevance_hours: Optional[int] = None,
     ) -> None:
         """Persist a job definition to the database."""
         chat_ids_str = ",".join(str(cid) for cid in target_chat_ids)
@@ -470,8 +505,8 @@ class JobScheduler:
                 INSERT OR REPLACE INTO scheduled_jobs
                 (job_id, job_name, cron_expression, prompt, target_chat_ids,
                  working_directory, skill_name, created_by, is_active, model,
-                 run_at, status, attempts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', 0)
+                 run_at, status, attempts, priority, on_failure, relevance_hours)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', 0, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -484,6 +519,9 @@ class JobScheduler:
                     created_by,
                     model,
                     run_at,
+                    priority,
+                    on_failure,
+                    relevance_hours,
                 ),
             )
             await conn.commit()

@@ -107,7 +107,9 @@ def _make_can_use_tool_callback(
                     if not valid:
                         decision = "deny"
                         error_msg = error
-                        return PermissionResultDeny(message=error or "Invalid file path")
+                        return PermissionResultDeny(
+                            message=error or "Invalid file path"
+                        )
 
             # Bash directory boundary validation
             if tool_name in _BASH_TOOLS:
@@ -207,7 +209,8 @@ class ClaudeSDKManager:
         ):
             api_port = self.config.api_server_port
             api_secret = self.config.webhook_api_secret
-            append_parts.append(f"""## Scheduler API
+            append_parts.append(
+                f"""## Scheduler API
 
 You can create, list, and remove scheduled jobs using these HTTP endpoints on the local API server. Use WebFetch to call them.
 
@@ -223,7 +226,12 @@ Provide exactly one of `cron_expression` (recurring) or `run_at` (one-shot).
 
 Recurring: {{"name": "daily-standup", "cron_expression": "0 9 * * 1-5", "prompt": "Give me a morning status update", "description": "Optional description", "model": "haiku (optional — defaults to bot config)"}}
 
-One-shot: {{"name": "remind-meeting", "run_at": "2026-03-21T14:00:00+00:00", "prompt": "Reminder: team meeting in 30 minutes"}}
+One-shot: {{"name": "remind-meeting", "run_at": "2026-03-21T14:00:00+00:00", "prompt": "Reminder: team meeting in 30 minutes", "priority": "high", "on_failure": "Tell the user they missed the meeting reminder", "relevance_hours": 2}}
+
+Optional fields for all jobs:
+- `priority`: "low", "medium" (default), "high", or "critical" — controls urgency in failure alerts
+- `on_failure`: Instructions for an agent if this job fails (written into workspace alert file)
+- `relevance_hours`: How many hours after scheduled time the job still matters. Past this window, failure alerts say to clear and move on.
 
 Response: {{"status": "created", "job_id": "<id>"}}
 
@@ -237,8 +245,9 @@ DELETE http://localhost:{api_port}/scheduler/jobs/<job_id>
 
 Response: {{"status": "deleted", "job_id": "<id>"}}
 
-Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every 30 min), "0 0 * * 0" (weekly Sunday midnight). One-shot jobs auto-delete after firing.
-""")
+Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every 30 min), "0 0 * * 0" (weekly Sunday midnight). One-shot jobs auto-delete after confirmed delivery. If delivery fails, an alert is written to the workspace's `.claude/scheduler-alerts.md` file.
+"""
+            )
 
         # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
         # tools so the SDK does not restrict tool usage (e.g. MCP tools).

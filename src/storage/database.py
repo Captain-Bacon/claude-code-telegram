@@ -376,6 +376,15 @@ class DatabaseManager:
                 ALTER TABLE scheduled_jobs ADD COLUMN fired_at TEXT DEFAULT NULL;
                 """,
             ),
+            (
+                9,
+                """
+                -- Job alert metadata: priority, failure instructions, relevance window
+                ALTER TABLE scheduled_jobs ADD COLUMN priority TEXT DEFAULT 'medium';
+                ALTER TABLE scheduled_jobs ADD COLUMN on_failure TEXT DEFAULT NULL;
+                ALTER TABLE scheduled_jobs ADD COLUMN relevance_hours INTEGER DEFAULT NULL;
+                """,
+            ),
         ]
 
     async def _init_pool(self):

@@ -116,6 +116,9 @@ class TestSchedulerAPICreateJob:
             cron_expression="0 9 * * 1-5",
             run_at=None,
             model=None,
+            priority=None,
+            on_failure=None,
+            relevance_hours=None,
         )
 
     async def test_create_job_with_model(
@@ -143,6 +146,9 @@ class TestSchedulerAPICreateJob:
             cron_expression="0 8 * * *",
             run_at=None,
             model="haiku",
+            priority=None,
+            on_failure=None,
+            relevance_hours=None,
         )
 
     async def test_create_job_with_description(
@@ -261,11 +267,45 @@ class TestSchedulerAPICreateJob:
             cron_expression=None,
             run_at="2026-03-21T14:00:00+00:00",
             model=None,
+            priority=None,
+            on_failure=None,
+            relevance_hours=None,
         )
 
-    async def test_create_job_both_schedules_rejected(
-        self, app: FastAPI
+    async def test_create_one_shot_job_with_alert_fields(
+        self, app: FastAPI, mock_scheduler: MagicMock
     ) -> None:
+        """One-shot job with priority, on_failure, and relevance_hours."""
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/scheduler/jobs",
+                json={
+                    "name": "remind-meeting",
+                    "run_at": "2026-03-21T14:00:00+00:00",
+                    "prompt": "Team meeting in 30 minutes",
+                    "priority": "critical",
+                    "on_failure": "Tell the user they missed the meeting",
+                    "relevance_hours": 2,
+                },
+                headers={"Authorization": AUTH_HEADER},
+            )
+
+        assert response.status_code == 200
+
+        mock_scheduler.add_job.assert_called_once_with(
+            job_name="remind-meeting",
+            prompt="Team meeting in 30 minutes",
+            cron_expression=None,
+            run_at="2026-03-21T14:00:00+00:00",
+            model=None,
+            priority="critical",
+            on_failure="Tell the user they missed the meeting",
+            relevance_hours=2,
+        )
+
+    async def test_create_job_both_schedules_rejected(self, app: FastAPI) -> None:
         """Providing both cron_expression and run_at returns 422."""
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"

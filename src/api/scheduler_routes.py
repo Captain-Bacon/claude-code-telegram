@@ -38,6 +38,22 @@ class CreateJobRequest(BaseModel):
         None,
         description='Claude model to use (e.g. "haiku", "sonnet"). Defaults to bot config.',
     )
+    priority: Optional[str] = Field(
+        None,
+        description='Alert priority if the job fails: "low", "medium" (default), '
+        '"high", or "critical".',
+    )
+    on_failure: Optional[str] = Field(
+        None,
+        description="Instructions for an agent if this job fails. Written into the "
+        "workspace alert file. E.g. 'Retry the job' or 'Notify the user that X "
+        "didn't happen'.",
+    )
+    relevance_hours: Optional[int] = Field(
+        None,
+        description="How many hours after the scheduled time this job still matters. "
+        "After this window, a failure alert tells the agent to just clear it.",
+    )
 
     @model_validator(mode="after")
     def _require_exactly_one_schedule(self) -> "CreateJobRequest":
@@ -118,6 +134,9 @@ def create_scheduler_router(
                 cron_expression=body.cron_expression,
                 run_at=body.run_at,
                 model=body.model,
+                priority=body.priority,
+                on_failure=body.on_failure,
+                relevance_hours=body.relevance_hours,
             )
         except Exception as e:
             logger.error("Failed to create scheduled job", error=str(e))
