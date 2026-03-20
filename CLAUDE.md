@@ -86,7 +86,7 @@ context.bot_data["security_validator"]
 - `src/security/` -- Auth (whitelist/token), input validators, rate limiter, audit logging
 - `src/events/` -- EventBus (async pub/sub), event types, AgentHandler
 - `src/api/` -- FastAPI webhook server
-- `src/scheduler/` -- APScheduler cron + one-shot jobs (`run_at` OR `cron_expression`, not both), SQLite persistence
+- `src/scheduler/` -- APScheduler cron + one-shot jobs (`run_at` OR `cron_expression`, not both), SQLite persistence, `alerts.py` writes failed-job alerts to `.claude/scheduler-alerts.md` (auto-included in system prompt via CLAUDE.md @-include)
 - `src/notifications/` -- NotificationService, rate-limited Telegram delivery
 
 ### Security Model
