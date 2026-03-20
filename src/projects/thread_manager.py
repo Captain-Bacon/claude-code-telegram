@@ -191,13 +191,8 @@ class ProjectThreadManager:
                 result.failed += 1
                 return True
             result.reopened += 1
-        else:
-            usable_status = await self._ensure_topic_usable(bot, mapping)
-            if usable_status == "unusable":
-                return False
-            if usable_status == "failed":
-                result.failed += 1
-                return True
+        # Active topics: skip probe. If a topic was deleted while offline,
+        # we'll discover it during rename or first message send.
 
         topic_name = mapping.topic_name
         if mapping.topic_name != project.name:
@@ -260,30 +255,6 @@ class ProjectThreadManager:
             project_name=project.name,
         )
         result.created += 1
-
-    async def _ensure_topic_usable(self, bot: Bot, mapping: ProjectThreadModel) -> str:
-        """Ensure mapped topic is usable. Returns ok|unusable|failed."""
-        try:
-            await self._call_sync_api(
-                lambda: bot.reopen_forum_topic(
-                    chat_id=mapping.chat_id,
-                    message_thread_id=mapping.message_thread_id,
-                ),
-            )
-            return "ok"
-        except TelegramError as e:
-            if self._is_topic_unusable_error(e):
-                return "unusable"
-            # Topic already open — Telegram returns "Topic_not_modified"
-            if "not_modified" in str(e).lower():
-                return "ok"
-            logger.warning(
-                "Could not verify topic usability",
-                chat_id=mapping.chat_id,
-                message_thread_id=mapping.message_thread_id,
-                error=str(e),
-            )
-            return "failed"
 
     async def _reopen_topic_if_possible(
         self, bot: Bot, mapping: ProjectThreadModel
@@ -468,5 +439,6 @@ class ProjectThreadManager:
             "thread not found",
             "invalid message thread id",
             "forum topic not found",
+            "topic_id_invalid",
         ]
         return any(marker in text for marker in markers)

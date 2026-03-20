@@ -319,10 +319,10 @@ async def test_sync_create_sends_bootstrap_message(tmp_path: Path, db_manager) -
     assert kwargs["message_thread_id"] == 101
 
 
-async def test_sync_recreates_active_mapping_when_topic_unusable(
+async def test_sync_skips_probe_for_active_topics(
     tmp_path: Path, db_manager
 ) -> None:
-    """Active mapping with unusable topic is recreated and remapped."""
+    """Active topics are reused without probing — no reopenForumTopic call."""
     approved = tmp_path / "projects"
     approved.mkdir()
     (approved / "app1").mkdir()
@@ -345,21 +345,17 @@ async def test_sync_recreates_active_mapping_when_topic_unusable(
 
     manager = ProjectThreadManager(registry, repo, sync_action_interval_seconds=0.0)
     bot = AsyncMock()
-    bot.reopen_forum_topic = AsyncMock(
-        side_effect=TelegramError("Bad Request: topic deleted")
-    )
-    bot.create_forum_topic = AsyncMock(
-        return_value=SimpleNamespace(message_thread_id=2002)
-    )
+    bot.reopen_forum_topic = AsyncMock()
     bot.send_message = AsyncMock()
 
     result = await manager.sync_topics(bot, chat_id=42)
     mapping = await repo.get_by_chat_project(42, "app1")
 
-    assert result.created == 1
-    assert result.reused == 0
+    assert result.reused == 1
+    assert result.created == 0
+    bot.reopen_forum_topic.assert_not_called()
     assert mapping is not None
-    assert mapping.message_thread_id == 2002
+    assert mapping.message_thread_id == 1001
 
 
 async def test_sync_reopen_inactive_mapping(tmp_path: Path, db_manager) -> None:
