@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy. Prompt architecture switched to preset+append (anchor bead `zpg` tracks remaining verification + CLAUDE.md thinning — blocked on `j73` user testing). Topic model decoupled from repos. Scheduler gained one-shot jobs + resilience + workspace alert system across recent sessions — bead `7mn` is an independent review to verify alignment before further scheduler work. Test coverage for new topic paths is thin (bead `tlw`).
+Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy. Prompt architecture switched to preset+append (anchor bead `zpg` tracks remaining verification + CLAUDE.md thinning — blocked on `j73` user testing). Topic model decoupled from repos. Scheduler has one-shot jobs + resilience + workspace alert system + 23 lifecycle tests — bead `k4i` is an independent review of the fix session before further scheduler work. Test coverage for new topic paths is thin (bead `tlw`).
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -44,14 +44,14 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - ScheduledEvent `job_id` field is only populated for one-shot jobs — this gates the ack loop. If changed, cron jobs get soft-deleted after first success.
 - Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from all three turn paths). To change how responses are formatted or sent — edit delivery.py, not callers.
 - HeartbeatPin creation gated by `settings.enable_heartbeat_pin` in all three turn paths. Downstream code handles `heartbeat_pin=None`.
-- Scheduler alert file (`.claude/scheduler-alerts.md`) is @-included in CLAUDE.md line 3, written by `src/scheduler/alerts.py`, read by `sdk_integration.py` for system prompt injection. Change any of these three → check the other two.
+- Scheduler alert file (`.claude/scheduler-alerts.md`) is @-included in CLAUDE.md line 3, written by `src/scheduler/alerts.py`. The @-include is the ONLY injection mechanism — `sdk_integration.py` does NOT read the file. Change either CLAUDE.md @-include or alerts.py write path → check the other.
 
 <!-- Verify before trusting: claims that could be stale -->
 ## Verify Before Trusting
 
 - HeartbeatPin in group chats — compiles and passes tests but pin/unpin/delete permissions not tested against live Telegram groups
 - AgentHandler rewire to PersistentClientManager tested via mocks only, not integration tested
-- Scheduler API endpoints tested but not integration tested with running bot. One-shot job delivery ack loop and startup recovery are unit-tested at route level only — `job.modify(kwargs=...)` pattern for patching job_id untested at runtime. Alert system (`alerts.py`) has 14 unit tests but not verified end-to-end: does a failed one-shot actually produce an alert file that appears in the next session's system prompt?
+- Scheduler API endpoints tested but not integration tested with running bot. One-shot lifecycle (fire → ack → delete, fire → fail → retry) has 23 unit tests with real DB + event bus. Alert file write/clear tested. NOT verified end-to-end: does a failed one-shot actually produce an alert that appears in the next session's system prompt via the @-include? Bead `k4i` includes this as a review item.
 - Architecture doc diagrams haven't been rendered with mmdc — valid Mermaid syntax but not visually verified
 - Topic decoupling (migration v6, thread_manager, orchestrator routing) — code reviewed and bugs fixed, but new paths (auto-adopt, /repo thread mode, managed_by_sync stale exclusion) have zero test coverage (bead `tlw`). Not integration tested against live bot.
 
