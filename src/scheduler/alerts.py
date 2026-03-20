@@ -10,7 +10,7 @@ no context beyond this file must be able to act on it.
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import structlog
 
@@ -46,9 +46,8 @@ def _format_alert(job: Dict[str, Any], reason: str) -> str:
     now = datetime.now(UTC).isoformat()
 
     lines = [
-        f"## ALERT: {job_name}",
+        f"## ALERT: {job_name} (`{job_id}`)",
         f"**Priority**: {priority.upper()}",
-        f"**Job ID**: `{job_id}`",
         f"**What failed**: {reason}",
         f"**Scheduled for**: {run_at}",
         f"**Alert written at**: {now}",
@@ -67,9 +66,7 @@ def _format_alert(job: Dict[str, Any], reason: str) -> str:
 
     lines.append("")
     lines.append("**Original job prompt**:")
-    # Truncate very long prompts
-    prompt_display = prompt[:500] + "..." if len(prompt) > 500 else prompt
-    lines.append(f"> {prompt_display}")
+    lines.append(f"> {prompt}")
     lines.append("")
 
     if on_failure:
@@ -152,25 +149,31 @@ def clear_alert(working_directory: Path, job_id: str) -> bool:
         current_section: List[str] = []
         found = False
 
+        # Track which section we're in and whether its header matches
+        current_header_matches = False
+
         for line in content.split("\n"):
             if line.startswith("## ALERT:"):
+                # Flush previous section
                 if current_section:
-                    section_text = "\n".join(current_section)
-                    if f"`{job_id}`" in section_text:
+                    if current_header_matches:
                         found = True
                     else:
-                        sections.append(section_text)
+                        sections.append("\n".join(current_section))
+                # Check ONLY the header line for the job_id — matching
+                # the full body would false-positive if a job_id string
+                # appeared in another alert's prompt or error message.
+                current_header_matches = f"`{job_id}`" in line
                 current_section = [line]
             else:
                 current_section.append(line)
 
         # Don't forget the last section
         if current_section:
-            section_text = "\n".join(current_section)
-            if f"`{job_id}`" in section_text:
+            if current_header_matches:
                 found = True
             else:
-                sections.append(section_text)
+                sections.append("\n".join(current_section))
 
         if not found:
             return False

@@ -114,13 +114,15 @@ class TestWriteAlert:
         assert "First failure" in content
         assert "Second failure" in content
 
-    def test_truncates_long_prompts(self, workspace: Path, sample_job: dict) -> None:
-        """Very long prompts are truncated in the alert."""
-        sample_job["prompt"] = "x" * 600
+    def test_preserves_full_prompt(self, workspace: Path, sample_job: dict) -> None:
+        """Long prompts are included in full — agent needs full context to act."""
+        long_prompt = "x" * 2000
+        sample_job["prompt"] = long_prompt
         write_alert(workspace, sample_job, "Delivery failed")
 
         content = (workspace / ALERT_FILENAME).read_text()
-        assert "..." in content
+        assert long_prompt in content
+        assert "..." not in content
 
 
 class TestClearAlert:
@@ -160,6 +162,33 @@ class TestClearAlert:
         content = (workspace / ALERT_FILENAME).read_text()
         assert "daily-standup" not in content
         assert "weekly-review" in content
+
+    def test_clear_matches_header_not_body(
+        self, workspace: Path, sample_job: dict
+    ) -> None:
+        """Clearing only matches job_id in the header, not in prompt/error text."""
+        # Job A's prompt mentions Job B's ID — clearing B must not remove A
+        job_a = {
+            **sample_job,
+            "job_id": "job-aaa",
+            "job_name": "job-a",
+            "prompt": "Check status of job-bbb",
+        }
+        job_b = {
+            **sample_job,
+            "job_id": "job-bbb",
+            "job_name": "job-b",
+            "prompt": "Simple task",
+        }
+        write_alert(workspace, job_a, "Failed")
+        write_alert(workspace, job_b, "Failed")
+
+        clear_alert(workspace, "job-bbb")
+
+        content = (workspace / ALERT_FILENAME).read_text()
+        assert "job-a" in content
+        assert "Check status of job-bbb" in content  # A's prompt preserved
+        assert "## ALERT: job-b" not in content  # B's header gone
 
     def test_empties_file_when_last_alert_cleared(
         self, workspace: Path, sample_job: dict
