@@ -74,21 +74,11 @@ class JobScheduler:
         priority: Optional[str] = None,
         on_failure: Optional[str] = None,
         relevance_hours: Optional[int] = None,
+        description: Optional[str] = None,
     ) -> str:
         """Add a new scheduled job (recurring or one-shot).
 
         Provide exactly one of cron_expression or run_at.
-
-        Args:
-            job_name: Human-readable job name.
-            prompt: The prompt to send to Claude when the job fires.
-            cron_expression: Cron-style schedule (e.g. "0 9 * * 1-5").
-            run_at: ISO 8601 timestamp for a one-shot job.
-            target_chat_ids: Telegram chat IDs to send the response to.
-            working_directory: Working directory for Claude execution.
-            skill_name: Optional skill to invoke.
-            created_by: Telegram user ID of the creator.
-            model: Claude model to use (e.g. "haiku", "sonnet"). None = default.
 
         Returns:
             The job ID.
@@ -143,6 +133,7 @@ class JobScheduler:
             priority=priority or "medium",
             on_failure=on_failure,
             relevance_hours=relevance_hours,
+            description=description,
         )
 
         schedule_desc = run_at if one_shot else cron_expression
@@ -241,14 +232,16 @@ class JobScheduler:
                 job_id=event.job_id,
                 error=event.error,
             )
-            await self._update_job_status(event.job_id, "failed", error=event.error)
-            # Write alert to workspace
+            # Write alert BEFORE updating status — if we crash between
+            # these two operations, a duplicate alert on recovery is
+            # better than a silent failure with no alert at all.
             job = await self._get_job(event.job_id)
             if job:
                 work_dir = Path(
                     job.get("working_directory", str(self.default_working_directory))
                 )
                 write_alert(work_dir, job, f"Delivery failed: {event.error}")
+            await self._update_job_status(event.job_id, "failed", error=event.error)
 
     # -- Startup recovery --
 
@@ -496,6 +489,7 @@ class JobScheduler:
         priority: str = "medium",
         on_failure: Optional[str] = None,
         relevance_hours: Optional[int] = None,
+        description: Optional[str] = None,
     ) -> None:
         """Persist a job definition to the database."""
         chat_ids_str = ",".join(str(cid) for cid in target_chat_ids)
@@ -505,8 +499,9 @@ class JobScheduler:
                 INSERT OR REPLACE INTO scheduled_jobs
                 (job_id, job_name, cron_expression, prompt, target_chat_ids,
                  working_directory, skill_name, created_by, is_active, model,
-                 run_at, status, attempts, priority, on_failure, relevance_hours)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', 0, ?, ?, ?)
+                 run_at, status, attempts, priority, on_failure, relevance_hours,
+                 description)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', 0, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -522,6 +517,7 @@ class JobScheduler:
                     priority,
                     on_failure,
                     relevance_hours,
+                    description,
                 ),
             )
             await conn.commit()

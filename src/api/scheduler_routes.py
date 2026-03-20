@@ -137,6 +137,7 @@ def create_scheduler_router(
                 priority=body.priority,
                 on_failure=body.on_failure,
                 relevance_hours=body.relevance_hours,
+                description=body.description,
             )
         except Exception as e:
             logger.error("Failed to create scheduled job", error=str(e))

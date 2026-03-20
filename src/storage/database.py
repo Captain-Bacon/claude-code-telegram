@@ -385,6 +385,13 @@ class DatabaseManager:
                 ALTER TABLE scheduled_jobs ADD COLUMN relevance_hours INTEGER DEFAULT NULL;
                 """,
             ),
+            (
+                10,
+                """
+                -- Job description for human context
+                ALTER TABLE scheduled_jobs ADD COLUMN description TEXT DEFAULT NULL;
+                """,
+            ),
         ]
 
     async def _init_pool(self):

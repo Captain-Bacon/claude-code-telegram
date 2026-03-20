@@ -119,6 +119,7 @@ class TestSchedulerAPICreateJob:
             priority=None,
             on_failure=None,
             relevance_hours=None,
+            description=None,
         )
 
     async def test_create_job_with_model(
@@ -149,6 +150,7 @@ class TestSchedulerAPICreateJob:
             priority=None,
             on_failure=None,
             relevance_hours=None,
+            description=None,
         )
 
     async def test_create_job_with_description(
@@ -270,6 +272,7 @@ class TestSchedulerAPICreateJob:
             priority=None,
             on_failure=None,
             relevance_hours=None,
+            description=None,
         )
 
     async def test_create_one_shot_job_with_alert_fields(
@@ -303,6 +306,7 @@ class TestSchedulerAPICreateJob:
             priority="critical",
             on_failure="Tell the user they missed the meeting",
             relevance_hours=2,
+            description=None,
         )
 
     async def test_create_job_both_schedules_rejected(self, app: FastAPI) -> None:
