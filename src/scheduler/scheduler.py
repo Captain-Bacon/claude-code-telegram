@@ -193,8 +193,10 @@ class JobScheduler:
                 job_id, "fired", increment_attempts=True
             )
 
+        # Only populate job_id for one-shot jobs — this is what triggers
+        # the ack loop. Cron jobs must NOT get acked (would be soft-deleted).
         event = ScheduledEvent(
-            job_id=job_id or "",
+            job_id=job_id if one_shot else "",
             job_name=job_name,
             prompt=prompt,
             working_directory=Path(working_directory),
