@@ -1,7 +1,7 @@
 <!-- State of play: 2-5 lines of narrative about where the project is headed -->
 ## State of Play
 
-Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy. Prompt architecture switched to preset+append (anchor bead `zpg` tracks remaining verification + CLAUDE.md thinning — blocked on `j73` user testing). Topic model decoupled from repos — topics are flexible conversations, not rigid 1:1 repo mappings. Code reviewed and bug-fixed (sync reclaim, redundant API calls). Markdown table rendering added to HTML formatter. Test coverage for new topic paths is thin (bead `tlw`).
+Core bot stable — delivery pipeline hardened, architecture documented (docs/architecture.md), media handlers queue when busy. Prompt architecture switched to preset+append (anchor bead `zpg` tracks remaining verification + CLAUDE.md thinning — blocked on `j73` user testing). Topic model decoupled from repos. Scheduler supports one-shot jobs — active resilience review in beads `8ll`, `2o7` (check before modifying scheduler). Test coverage for new topic paths is thin (bead `tlw`).
 
 <!-- System shape: architecture at a glance -->
 ## System Shape
@@ -18,8 +18,9 @@ Telegram -> PTB middleware (security -> auth -> rate limit)
     -> StreamSession class: src/bot/stream_handler.py (callable, flush, cleanup, state)
     -> HeartbeatPin: src/bot/utils/heartbeat_pin.py (pinned liveness message during turns)
 
-Scheduler -> HTTP endpoints on FastAPI server -> Claude creates/lists/removes cron jobs via WebFetch
+Scheduler -> HTTP endpoints on FastAPI server -> Claude creates/lists/removes jobs via WebFetch
   -> APScheduler fires -> ScheduledEvent -> EventBus -> AgentHandler -> Claude -> NotificationService
+  -> One-shot jobs: AgentHandler publishes ScheduledJobOutcome -> scheduler updates status / cleans up
 ```
 
 One persistent client per Telegram thread (keyed by chat_id:thread_id or chat_id:user_id). State machine: idle -> busy -> draining (if injections occurred) -> idle. Orchestrator queues messages when busy — injection only used by AgentHandler (webhook/scheduler path).
@@ -40,6 +41,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 - main.py initialization order: scheduler -> API server, persistent_manager depends on sdk_manager.
 - `/repo` in thread mode updates the topic's DB mapping via `adopt_topic()` AND mutates `_thread_context` dict. If adding a new command that switches directories in thread mode, follow the same pattern (orchestrator.py `agentic_repo`).
 - AgentHandler uses PersistentClientManager with synthetic state keys (`webhook:{provider}:{id}`, `scheduled:{job_id}`).
+- ScheduledEvent `job_id` field is only populated for one-shot jobs — this gates the ack loop. If changed, cron jobs get soft-deleted after first success.
 - Response delivery goes through `deliver_turn_result` in `src/bot/delivery.py` (called from all three turn paths). To change how responses are formatted or sent — edit delivery.py, not callers.
 - HeartbeatPin creation gated by `settings.enable_heartbeat_pin` in all three turn paths. Downstream code handles `heartbeat_pin=None`.
 
@@ -48,7 +50,7 @@ Dependencies injected via context.bot_data dict, wired in main.py.
 
 - HeartbeatPin in group chats — compiles and passes tests but pin/unpin/delete permissions not tested against live Telegram groups
 - AgentHandler rewire to PersistentClientManager tested via mocks only, not integration tested
-- Scheduler API endpoints tested but not integration tested with running bot
+- Scheduler API endpoints tested but not integration tested with running bot. One-shot job delivery ack loop and startup recovery are unit-tested at route level only — `job.modify(kwargs=...)` pattern for patching job_id untested at runtime
 - Architecture doc diagrams haven't been rendered with mmdc — valid Mermaid syntax but not visually verified
 - Topic decoupling (migration v6, thread_manager, orchestrator routing) — code reviewed and bugs fixed, but new paths (auto-adopt, /repo thread mode, managed_by_sync stale exclusion) have zero test coverage (bead `tlw`). Not integration tested against live bot.
 
