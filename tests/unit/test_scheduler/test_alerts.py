@@ -124,6 +124,33 @@ class TestWriteAlert:
         assert long_prompt in content
         assert "..." not in content
 
+    def test_multiline_prompt_blockquoted(
+        self, workspace: Path, sample_job: dict
+    ) -> None:
+        """Multi-line prompts have every line blockquoted so they can't
+        break the ## ALERT: section delimiter used by clear_alert."""
+        sample_job["prompt"] = "line one\n## ALERT: fake header\nline three"
+        write_alert(workspace, sample_job, "Delivery failed")
+
+        content = (workspace / ALERT_FILENAME).read_text()
+        # Every prompt line should be blockquoted
+        assert "> line one" in content
+        assert "> ## ALERT: fake header" in content
+        assert "> line three" in content
+        # Only ONE real alert header should exist
+        assert content.count("## ALERT:") == 2  # 1 real header + 1 in blockquote
+
+    def test_multiline_on_failure_blockquoted(
+        self, workspace: Path, sample_job: dict
+    ) -> None:
+        """Multi-line on_failure instructions are blockquoted."""
+        sample_job["on_failure"] = "Step 1\n## ALERT: not a real header\nStep 3"
+        write_alert(workspace, sample_job, "Delivery failed")
+
+        content = (workspace / ALERT_FILENAME).read_text()
+        assert "> Step 1" in content
+        assert "> ## ALERT: not a real header" in content
+
 
 class TestClearAlert:
     def test_removes_matching_alert(self, workspace: Path, sample_job: dict) -> None:
@@ -189,6 +216,32 @@ class TestClearAlert:
         assert "job-a" in content
         assert "Check status of job-bbb" in content  # A's prompt preserved
         assert "## ALERT: job-b" not in content  # B's header gone
+
+    def test_clear_survives_prompt_with_section_delimiter(
+        self, workspace: Path, sample_job: dict
+    ) -> None:
+        """Clearing works correctly even when a prompt contains ## ALERT: on a line."""
+        evil_job = {
+            **sample_job,
+            "job_id": "job-evil",
+            "job_name": "evil-prompt",
+            "prompt": "Do the thing\n## ALERT: fake (`job-safe`)\nMore text",
+        }
+        safe_job = {
+            **sample_job,
+            "job_id": "job-safe",
+            "job_name": "safe-job",
+            "prompt": "Innocent task",
+        }
+        write_alert(workspace, evil_job, "Failed")
+        write_alert(workspace, safe_job, "Failed")
+
+        # Clearing safe-job must not be confused by the fake header in evil's prompt
+        clear_alert(workspace, "job-safe")
+
+        content = (workspace / ALERT_FILENAME).read_text()
+        assert "evil-prompt" in content  # evil-job preserved
+        assert "## ALERT: safe-job" not in content  # safe-job's real header gone
 
     def test_empties_file_when_last_alert_cleared(
         self, workspace: Path, sample_job: dict

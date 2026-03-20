@@ -32,6 +32,11 @@ Run `date` to check the current time before making decisions.
 """
 
 
+def _blockquote(text: str) -> str:
+    """Prefix every line with '> ' so user content can't break section parsing."""
+    return "\n".join(f"> {line}" for line in text.split("\n"))
+
+
 def _format_alert(job: Dict[str, Any], reason: str) -> str:
     """Format a single job alert as an imperative agent briefing."""
     job_name = job.get("job_name", "unknown")
@@ -55,7 +60,7 @@ def _format_alert(job: Dict[str, Any], reason: str) -> str:
     ]
 
     if last_error:
-        lines.append(f"**Last error**: {last_error}")
+        lines.append(f"**Last error**: {_blockquote(last_error)}")
 
     if relevance_hours:
         lines.append(
@@ -66,12 +71,12 @@ def _format_alert(job: Dict[str, Any], reason: str) -> str:
 
     lines.append("")
     lines.append("**Original job prompt**:")
-    lines.append(f"> {prompt}")
+    lines.append(_blockquote(prompt))
     lines.append("")
 
     if on_failure:
         lines.append("**Recovery instructions** (from job creator):")
-        lines.append(on_failure)
+        lines.append(_blockquote(on_failure))
         lines.append("")
     else:
         lines.append(
