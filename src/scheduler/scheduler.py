@@ -4,6 +4,7 @@ Wraps APScheduler's AsyncIOScheduler and publishes ScheduledEvents
 to the event bus when jobs fire.
 """
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,7 @@ from apscheduler.schedulers.asyncio import (
     AsyncIOScheduler,  # type: ignore[import-untyped]
 )
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
+from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
 
 from ..events.bus import EventBus
 from ..events.types import ScheduledEvent
@@ -48,20 +50,24 @@ class JobScheduler:
     async def add_job(
         self,
         job_name: str,
-        cron_expression: str,
         prompt: str,
+        cron_expression: Optional[str] = None,
+        run_at: Optional[str] = None,
         target_chat_ids: Optional[List[int]] = None,
         working_directory: Optional[Path] = None,
         skill_name: Optional[str] = None,
         created_by: int = 0,
         model: Optional[str] = None,
     ) -> str:
-        """Add a new scheduled job.
+        """Add a new scheduled job (recurring or one-shot).
+
+        Provide exactly one of cron_expression or run_at.
 
         Args:
             job_name: Human-readable job name.
-            cron_expression: Cron-style schedule (e.g. "0 9 * * 1-5").
             prompt: The prompt to send to Claude when the job fires.
+            cron_expression: Cron-style schedule (e.g. "0 9 * * 1-5").
+            run_at: ISO 8601 timestamp for a one-shot job.
             target_chat_ids: Telegram chat IDs to send the response to.
             working_directory: Working directory for Claude execution.
             skill_name: Optional skill to invoke.
@@ -71,7 +77,21 @@ class JobScheduler:
         Returns:
             The job ID.
         """
-        trigger = CronTrigger.from_crontab(cron_expression)
+        if cron_expression and run_at:
+            raise ValueError("Provide cron_expression or run_at, not both")
+        if not cron_expression and not run_at:
+            raise ValueError("Provide either cron_expression or run_at")
+
+        one_shot = run_at is not None
+        if run_at:
+            run_dt = datetime.fromisoformat(run_at)
+            if run_dt.tzinfo is None:
+                run_dt = run_dt.replace(tzinfo=UTC)
+            trigger: CronTrigger | DateTrigger = DateTrigger(run_date=run_dt)
+        else:
+            assert cron_expression is not None
+            trigger = CronTrigger.from_crontab(cron_expression)
+
         work_dir = working_directory or self.default_working_directory
 
         job = self._scheduler.add_job(
@@ -84,28 +104,41 @@ class JobScheduler:
                 "target_chat_ids": target_chat_ids or [],
                 "skill_name": skill_name,
                 "model": model,
+                "job_id": None,  # filled in below
+                "one_shot": one_shot,
             },
             name=job_name,
+        )
+
+        # Patch the job_id into kwargs now that APScheduler assigned one
+        job.modify(
+            kwargs={
+                **job.kwargs,
+                "job_id": job.id,
+            }
         )
 
         # Persist to database
         await self._save_job(
             job_id=job.id,
             job_name=job_name,
-            cron_expression=cron_expression,
+            cron_expression=cron_expression or "",
             prompt=prompt,
             target_chat_ids=target_chat_ids or [],
             working_directory=str(work_dir),
             skill_name=skill_name,
             created_by=created_by,
             model=model,
+            run_at=run_at,
         )
 
+        schedule_desc = run_at if one_shot else cron_expression
         logger.info(
             "Scheduled job added",
             job_id=job.id,
             job_name=job_name,
-            cron=cron_expression,
+            schedule=schedule_desc,
+            one_shot=one_shot,
         )
         return str(job.id)
 
@@ -137,6 +170,8 @@ class JobScheduler:
         target_chat_ids: List[int],
         skill_name: Optional[str],
         model: Optional[str] = None,
+        job_id: Optional[str] = None,
+        one_shot: bool = False,
     ) -> None:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
         event = ScheduledEvent(
@@ -152,9 +187,14 @@ class JobScheduler:
             "Scheduled job fired",
             job_name=job_name,
             event_id=event.id,
+            one_shot=one_shot,
         )
 
         await self.event_bus.publish(event)
+
+        if one_shot and job_id:
+            logger.info("One-shot job completed, auto-removing", job_id=job_id)
+            await self._delete_job(job_id)
 
     async def _load_jobs_from_db(self) -> None:
         """Load persisted jobs and re-register them with APScheduler."""
@@ -168,7 +208,26 @@ class JobScheduler:
             for row in rows:
                 row_dict = dict(row)
                 try:
-                    trigger = CronTrigger.from_crontab(row_dict["cron_expression"])
+                    run_at = row_dict.get("run_at")
+                    one_shot = bool(run_at)
+
+                    if run_at:
+                        run_dt = datetime.fromisoformat(run_at)
+                        if run_dt.tzinfo is None:
+                            run_dt = run_dt.replace(tzinfo=UTC)
+                        # Skip expired one-shot jobs
+                        if run_dt <= datetime.now(UTC):
+                            logger.info(
+                                "Removing expired one-shot job",
+                                job_id=row_dict["job_id"],
+                            )
+                            await self._delete_job(row_dict["job_id"])
+                            continue
+                        trigger = DateTrigger(run_date=run_dt)
+                    else:
+                        trigger = CronTrigger.from_crontab(
+                            row_dict["cron_expression"]
+                        )
 
                     # Parse target_chat_ids from stored string
                     chat_ids_str = row_dict.get("target_chat_ids", "")
@@ -188,6 +247,8 @@ class JobScheduler:
                             "target_chat_ids": chat_ids,
                             "skill_name": row_dict.get("skill_name"),
                             "model": row_dict.get("model"),
+                            "job_id": row_dict["job_id"],
+                            "one_shot": one_shot,
                         },
                         id=row_dict["job_id"],
                         name=row_dict["job_name"],
@@ -197,6 +258,7 @@ class JobScheduler:
                         "Loaded scheduled job from DB",
                         job_id=row_dict["job_id"],
                         job_name=row_dict["job_name"],
+                        one_shot=one_shot,
                     )
                 except Exception:
                     logger.exception(
@@ -220,6 +282,7 @@ class JobScheduler:
         skill_name: Optional[str],
         created_by: int,
         model: Optional[str] = None,
+        run_at: Optional[str] = None,
     ) -> None:
         """Persist a job definition to the database."""
         chat_ids_str = ",".join(str(cid) for cid in target_chat_ids)
@@ -228,8 +291,9 @@ class JobScheduler:
                 """
                 INSERT OR REPLACE INTO scheduled_jobs
                 (job_id, job_name, cron_expression, prompt, target_chat_ids,
-                 working_directory, skill_name, created_by, is_active, model)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 working_directory, skill_name, created_by, is_active, model,
+                 run_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     job_id,
@@ -241,6 +305,7 @@ class JobScheduler:
                     skill_name,
                     created_by,
                     model,
+                    run_at,
                 ),
             )
             await conn.commit()

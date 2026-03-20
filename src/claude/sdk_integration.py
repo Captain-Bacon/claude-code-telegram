@@ -209,7 +209,7 @@ class ClaudeSDKManager:
             api_secret = self.config.webhook_api_secret
             append_parts.append(f"""## Scheduler API
 
-You can create, list, and remove scheduled cron jobs using these HTTP endpoints on the local API server. Use WebFetch to call them.
+You can create, list, and remove scheduled jobs using these HTTP endpoints on the local API server. Use WebFetch to call them.
 
 **Authentication**: Include the header `Authorization: Bearer {api_secret}` with every request.
 
@@ -219,21 +219,25 @@ You can create, list, and remove scheduled cron jobs using these HTTP endpoints 
 POST http://localhost:{api_port}/scheduler/jobs
 Content-Type: application/json
 
-Body: {{"name": "daily-standup", "cron_expression": "0 9 * * 1-5", "prompt": "Give me a morning status update", "description": "Optional description", "model": "haiku (optional — defaults to bot config)"}}
+Provide exactly one of `cron_expression` (recurring) or `run_at` (one-shot).
+
+Recurring: {{"name": "daily-standup", "cron_expression": "0 9 * * 1-5", "prompt": "Give me a morning status update", "description": "Optional description", "model": "haiku (optional — defaults to bot config)"}}
+
+One-shot: {{"name": "remind-meeting", "run_at": "2026-03-21T14:00:00+00:00", "prompt": "Reminder: team meeting in 30 minutes"}}
 
 Response: {{"status": "created", "job_id": "<id>"}}
 
 ### List all jobs
 GET http://localhost:{api_port}/scheduler/jobs
 
-Response: [{{"job_id": "<id>", "name": "...", "cron_expression": "...", "prompt": "...", "next_run_time": "..."}}]
+Response: [{{"job_id": "<id>", "name": "...", "cron_expression": "...", "run_at": "...", "prompt": "...", "next_run_time": "..."}}]
 
 ### Remove a job
 DELETE http://localhost:{api_port}/scheduler/jobs/<job_id>
 
 Response: {{"status": "deleted", "job_id": "<id>"}}
 
-Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every 30 min), "0 0 * * 0" (weekly Sunday midnight).
+Cron expression examples: "0 9 * * 1-5" (weekdays at 9am), "*/30 * * * *" (every 30 min), "0 0 * * 0" (weekly Sunday midnight). One-shot jobs auto-delete after firing.
 """)
 
         # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed

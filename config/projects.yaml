@@ -8,6 +8,10 @@ projects:
     name: "Telegram Workspace"
     path: "claude_strategic_workspaces/telegram"
 
+  - slug: telegram2
+    name: "Telegram 2"
+    path: "claude_strategic_workspaces/telegram2"
+
   - slug: claude-strategic-workspaces
     name: "Strategic Workspaces"
     path: "claude_strategic_workspaces"

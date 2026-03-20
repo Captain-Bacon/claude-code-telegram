@@ -112,8 +112,9 @@ class TestSchedulerAPICreateJob:
 
         mock_scheduler.add_job.assert_called_once_with(
             job_name="daily-standup",
-            cron_expression="0 9 * * 1-5",
             prompt="Give me a morning update",
+            cron_expression="0 9 * * 1-5",
+            run_at=None,
             model=None,
         )
 
@@ -138,8 +139,9 @@ class TestSchedulerAPICreateJob:
         assert response.status_code == 200
         mock_scheduler.add_job.assert_called_once_with(
             job_name="spam-filter",
-            cron_expression="0 8 * * *",
             prompt="Categorise today's spam emails",
+            cron_expression="0 8 * * *",
+            run_at=None,
             model="haiku",
         )
 
@@ -227,6 +229,71 @@ class TestSchedulerAPICreateJob:
             response = await client.post(
                 "/scheduler/jobs",
                 json={"name": "test"},
+                headers={"Authorization": AUTH_HEADER},
+            )
+
+        assert response.status_code == 422
+
+    async def test_create_one_shot_job(
+        self, app: FastAPI, mock_scheduler: MagicMock
+    ) -> None:
+        """One-shot job with run_at instead of cron_expression."""
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/scheduler/jobs",
+                json={
+                    "name": "remind-meeting",
+                    "run_at": "2026-03-21T14:00:00+00:00",
+                    "prompt": "Team meeting in 30 minutes",
+                },
+                headers={"Authorization": AUTH_HEADER},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "created"
+
+        mock_scheduler.add_job.assert_called_once_with(
+            job_name="remind-meeting",
+            prompt="Team meeting in 30 minutes",
+            cron_expression=None,
+            run_at="2026-03-21T14:00:00+00:00",
+            model=None,
+        )
+
+    async def test_create_job_both_schedules_rejected(
+        self, app: FastAPI
+    ) -> None:
+        """Providing both cron_expression and run_at returns 422."""
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/scheduler/jobs",
+                json={
+                    "name": "bad-job",
+                    "cron_expression": "0 9 * * 1-5",
+                    "run_at": "2026-03-21T14:00:00+00:00",
+                    "prompt": "test",
+                },
+                headers={"Authorization": AUTH_HEADER},
+            )
+
+        assert response.status_code == 422
+
+    async def test_create_job_no_schedule_rejected(self, app: FastAPI) -> None:
+        """Providing neither cron_expression nor run_at returns 422."""
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/scheduler/jobs",
+                json={
+                    "name": "bad-job",
+                    "prompt": "test",
+                },
                 headers={"Authorization": AUTH_HEADER},
             )
 

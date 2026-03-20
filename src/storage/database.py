@@ -359,6 +359,13 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                7,
+                """
+                -- Add one-shot job support: run_at timestamp fires once then auto-deletes
+                ALTER TABLE scheduled_jobs ADD COLUMN run_at TEXT DEFAULT NULL;
+                """,
+            ),
         ]
 
     async def _init_pool(self):
