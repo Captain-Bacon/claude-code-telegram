@@ -65,6 +65,9 @@ class JobResponse(BaseModel):
     prompt: str
     description: Optional[str] = None
     model: Optional[str] = None
+    status: Optional[str] = None
+    attempts: Optional[int] = None
+    last_error: Optional[str] = None
     next_run_time: Optional[str] = None
 
 
@@ -157,6 +160,9 @@ def create_scheduler_router(
                     "prompt": job.get("prompt", ""),
                     "description": job.get("description"),
                     "model": job.get("model"),
+                    "status": job.get("status"),
+                    "attempts": job.get("attempts"),
+                    "last_error": job.get("last_error"),
                     "next_run_time": next_run,
                 }
             )

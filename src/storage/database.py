@@ -366,6 +366,16 @@ class DatabaseManager:
                 ALTER TABLE scheduled_jobs ADD COLUMN run_at TEXT DEFAULT NULL;
                 """,
             ),
+            (
+                8,
+                """
+                -- One-shot job resilience: track delivery status for acknowledgement loop
+                ALTER TABLE scheduled_jobs ADD COLUMN status TEXT DEFAULT 'pending';
+                ALTER TABLE scheduled_jobs ADD COLUMN attempts INTEGER DEFAULT 0;
+                ALTER TABLE scheduled_jobs ADD COLUMN last_error TEXT DEFAULT NULL;
+                ALTER TABLE scheduled_jobs ADD COLUMN fired_at TEXT DEFAULT NULL;
+                """,
+            ),
         ]
 
     async def _init_pool(self):

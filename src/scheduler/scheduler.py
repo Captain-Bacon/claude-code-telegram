@@ -1,10 +1,12 @@
-"""Job scheduler for recurring agent tasks.
+"""Job scheduler for recurring and one-shot agent tasks.
 
 Wraps APScheduler's AsyncIOScheduler and publishes ScheduledEvents
-to the event bus when jobs fire.
+to the event bus when jobs fire. One-shot jobs track delivery via
+an acknowledgement loop: the AgentHandler publishes ScheduledJobOutcome
+after processing, and the scheduler updates job status accordingly.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,15 +17,22 @@ from apscheduler.schedulers.asyncio import (
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
 from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
 
-from ..events.bus import EventBus
-from ..events.types import ScheduledEvent
+from ..events.bus import Event, EventBus
+from ..events.types import ScheduledEvent, ScheduledJobOutcome
 from ..storage.database import DatabaseManager
 
 logger = structlog.get_logger()
 
+MAX_ONE_SHOT_ATTEMPTS = 3
+RECOVERY_WINDOW_HOURS = 24
+
 
 class JobScheduler:
-    """Cron scheduler that publishes ScheduledEvents to the event bus."""
+    """Scheduler that publishes ScheduledEvents to the event bus.
+
+    One-shot jobs go through a delivery lifecycle:
+    pending -> fired -> delivered (auto-cleaned) or failed (visible).
+    """
 
     def __init__(
         self,
@@ -37,10 +46,12 @@ class JobScheduler:
         self._scheduler = AsyncIOScheduler()
 
     async def start(self) -> None:
-        """Load persisted jobs and start the scheduler."""
+        """Load persisted jobs, recover failures, and start the scheduler."""
+        self.event_bus.subscribe(ScheduledJobOutcome, self._handle_outcome)
         await self._load_jobs_from_db()
         self._scheduler.start()
         logger.info("Job scheduler started")
+        await self._recover_one_shot_jobs()
 
     async def stop(self) -> None:
         """Shutdown the scheduler gracefully."""
@@ -162,6 +173,8 @@ class JobScheduler:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    # -- Firing and acknowledgement --
+
     async def _fire_event(
         self,
         job_name: str,
@@ -174,7 +187,14 @@ class JobScheduler:
         one_shot: bool = False,
     ) -> None:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
+        # For one-shot jobs, mark as fired and track the attempt
+        if one_shot and job_id:
+            await self._update_job_status(
+                job_id, "fired", increment_attempts=True
+            )
+
         event = ScheduledEvent(
+            job_id=job_id or "",
             job_name=job_name,
             prompt=prompt,
             working_directory=Path(working_directory),
@@ -186,15 +206,176 @@ class JobScheduler:
         logger.info(
             "Scheduled job fired",
             job_name=job_name,
+            job_id=job_id,
             event_id=event.id,
             one_shot=one_shot,
         )
 
         await self.event_bus.publish(event)
 
-        if one_shot and job_id:
-            logger.info("One-shot job completed, auto-removing", job_id=job_id)
-            await self._delete_job(job_id)
+    async def _handle_outcome(self, event: Event) -> None:
+        """Process delivery acknowledgement from AgentHandler."""
+        if not isinstance(event, ScheduledJobOutcome):
+            return
+        if not event.job_id:
+            return
+
+        if event.delivered:
+            logger.info(
+                "One-shot job delivered, cleaning up",
+                job_id=event.job_id,
+            )
+            await self._delete_job(event.job_id)
+        else:
+            logger.warning(
+                "One-shot job delivery failed",
+                job_id=event.job_id,
+                error=event.error,
+            )
+            await self._update_job_status(
+                event.job_id, "failed", error=event.error
+            )
+
+    # -- Startup recovery --
+
+    async def _recover_one_shot_jobs(self) -> None:
+        """Find missed or failed one-shot jobs and re-fire them.
+
+        Called after startup. Publishes a notification summarising
+        any recovered jobs so the agent and user are aware.
+        """
+        cutoff = datetime.now(UTC) - timedelta(hours=RECOVERY_WINDOW_HOURS)
+        recovered: List[Dict[str, Any]] = []
+
+        try:
+            async with self.db_manager.get_connection() as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM scheduled_jobs
+                    WHERE is_active = 1
+                      AND run_at IS NOT NULL
+                      AND status IN ('pending', 'fired', 'failed')
+                    """,
+                )
+                rows = list(await cursor.fetchall())
+        except Exception:
+            return
+
+        for row in rows:
+            job = dict(row)
+            run_at = job.get("run_at")
+            if not run_at:
+                continue
+
+            run_dt = datetime.fromisoformat(run_at)
+            if run_dt.tzinfo is None:
+                run_dt = run_dt.replace(tzinfo=UTC)
+
+            # Only recover jobs within the window
+            if run_dt > datetime.now(UTC):
+                continue  # Still in the future, handled by normal scheduling
+            if run_dt < cutoff:
+                # Too old to recover — mark expired and clean up
+                logger.info(
+                    "Expiring stale one-shot job",
+                    job_id=job["job_id"],
+                    run_at=run_at,
+                )
+                await self._update_job_status(job["job_id"], "expired")
+                await self._delete_job(job["job_id"])
+                continue
+
+            status = job.get("status", "pending")
+            attempts = job.get("attempts", 0)
+
+            if attempts >= MAX_ONE_SHOT_ATTEMPTS:
+                logger.warning(
+                    "One-shot job exhausted retries",
+                    job_id=job["job_id"],
+                    attempts=attempts,
+                )
+                await self._update_job_status(
+                    job["job_id"],
+                    "failed",
+                    error=f"Exhausted {MAX_ONE_SHOT_ATTEMPTS} delivery attempts",
+                )
+                continue
+
+            reason = {
+                "pending": "missed while offline",
+                "fired": "unconfirmed delivery (restart during processing)",
+                "failed": "retrying after delivery failure",
+            }.get(status, status)
+
+            logger.info(
+                "Recovering one-shot job",
+                job_id=job["job_id"],
+                job_name=job["job_name"],
+                reason=reason,
+            )
+
+            chat_ids_str = job.get("target_chat_ids", "")
+            chat_ids = (
+                [int(x) for x in chat_ids_str.split(",") if x.strip()]
+                if chat_ids_str
+                else []
+            )
+
+            recovered.append(
+                {
+                    "job_id": job["job_id"],
+                    "job_name": job["job_name"],
+                    "run_at": run_at,
+                    "reason": reason,
+                    "prompt": job["prompt"],
+                    "working_directory": job["working_directory"],
+                    "target_chat_ids": chat_ids,
+                    "skill_name": job.get("skill_name"),
+                    "model": job.get("model"),
+                }
+            )
+
+        if not recovered:
+            return
+
+        # Re-fire each recovered job
+        for job in recovered:
+            await self._fire_event(
+                job_name=job["job_name"],
+                prompt=job["prompt"],
+                working_directory=job["working_directory"],
+                target_chat_ids=job["target_chat_ids"],
+                skill_name=job["skill_name"],
+                model=job["model"],
+                job_id=job["job_id"],
+                one_shot=True,
+            )
+
+        # Publish a summary notification so the agent and user know
+        summary_lines = [
+            f"- {j['job_name']} (was due {j['run_at']}): {j['reason']}"
+            for j in recovered
+        ]
+        summary = (
+            "SYSTEM: Recovered one-shot jobs on startup:\n"
+            + "\n".join(summary_lines)
+            + "\n\nOriginal prompts have been re-delivered."
+        )
+
+        await self.event_bus.publish(
+            ScheduledEvent(
+                job_name="system:recovery-notification",
+                prompt=summary,
+                working_directory=self.default_working_directory,
+                target_chat_ids=[],
+            )
+        )
+
+        logger.info(
+            "One-shot job recovery complete", recovered_count=len(recovered)
+        )
+
+    # -- Database operations --
 
     async def _load_jobs_from_db(self) -> None:
         """Load persisted jobs and re-register them with APScheduler."""
@@ -215,13 +396,8 @@ class JobScheduler:
                         run_dt = datetime.fromisoformat(run_at)
                         if run_dt.tzinfo is None:
                             run_dt = run_dt.replace(tzinfo=UTC)
-                        # Skip expired one-shot jobs
+                        # Past one-shot jobs handled by _recover_one_shot_jobs
                         if run_dt <= datetime.now(UTC):
-                            logger.info(
-                                "Removing expired one-shot job",
-                                job_id=row_dict["job_id"],
-                            )
-                            await self._delete_job(row_dict["job_id"])
                             continue
                         trigger = DateTrigger(run_date=run_dt)
                     else:
@@ -292,8 +468,8 @@ class JobScheduler:
                 INSERT OR REPLACE INTO scheduled_jobs
                 (job_id, job_name, cron_expression, prompt, target_chat_ids,
                  working_directory, skill_name, created_by, is_active, model,
-                 run_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                 run_at, status, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', 0)
                 """,
                 (
                     job_id,
@@ -308,6 +484,36 @@ class JobScheduler:
                     run_at,
                 ),
             )
+            await conn.commit()
+
+    async def _update_job_status(
+        self,
+        job_id: str,
+        status: str,
+        error: Optional[str] = None,
+        increment_attempts: bool = False,
+    ) -> None:
+        """Update a job's delivery status."""
+        async with self.db_manager.get_connection() as conn:
+            if increment_attempts:
+                await conn.execute(
+                    """
+                    UPDATE scheduled_jobs
+                    SET status = ?, last_error = ?, attempts = attempts + 1,
+                        fired_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (status, error, datetime.now(UTC).isoformat(), job_id),
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE scheduled_jobs
+                    SET status = ?, last_error = ?
+                    WHERE job_id = ?
+                    """,
+                    (status, error, job_id),
+                )
             await conn.commit()
 
     async def _delete_job(self, job_id: str) -> None:

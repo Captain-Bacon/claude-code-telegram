@@ -11,7 +11,12 @@ import structlog
 
 from ..claude.persistent import PersistentClientManager
 from .bus import Event, EventBus
-from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
+from .types import (
+    AgentResponseEvent,
+    ScheduledEvent,
+    ScheduledJobOutcome,
+    WebhookEvent,
+)
 
 logger = structlog.get_logger()
 
@@ -129,12 +134,29 @@ class AgentHandler:
                             originating_event_id=event.id,
                         )
                     )
-        except Exception:
+
+            # Acknowledge successful delivery
+            if event.job_id:
+                await self.event_bus.publish(
+                    ScheduledJobOutcome(
+                        job_id=event.job_id, delivered=True
+                    )
+                )
+        except Exception as exc:
             logger.exception(
                 "Agent execution failed for scheduled event",
                 job_id=event.job_id,
                 event_id=event.id,
             )
+            # Report failure so the scheduler can track and retry
+            if event.job_id:
+                await self.event_bus.publish(
+                    ScheduledJobOutcome(
+                        job_id=event.job_id,
+                        delivered=False,
+                        error=str(exc),
+                    )
+                )
 
     def _build_webhook_prompt(self, event: WebhookEvent) -> str:
         """Build a Claude prompt from a webhook event."""

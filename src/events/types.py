@@ -53,3 +53,13 @@ class AgentResponseEvent(Event):
     reply_to_message_id: Optional[int] = None
     source: str = "agent"
     originating_event_id: Optional[str] = None
+
+
+@dataclass
+class ScheduledJobOutcome(Event):
+    """Delivery result for a scheduled job, published by AgentHandler."""
+
+    job_id: str = ""
+    delivered: bool = False
+    error: str = ""
+    source: str = "agent"
