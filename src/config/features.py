@@ -77,6 +77,11 @@ class FeatureFlags:
         """Check if streaming drafts via sendMessageDraft is enabled."""
         return self.settings.enable_stream_drafts
 
+    @property
+    def tts_enabled(self) -> bool:
+        """Check if text-to-speech (/speak) is enabled."""
+        return self.settings.enable_tts
+
     def is_feature_enabled(self, feature_name: str) -> bool:
         """Generic feature check by name."""
         feature_map = {
@@ -91,6 +96,7 @@ class FeatureFlags:
             "voice_messages": self.voice_messages_enabled,
             "heartbeat_pin": self.heartbeat_pin_enabled,
             "stream_drafts": self.stream_drafts_enabled,
+            "tts": self.tts_enabled,
         }
         return feature_map.get(feature_name, False)
 
@@ -117,4 +123,6 @@ class FeatureFlags:
             features.append("heartbeat_pin")
         if self.stream_drafts_enabled:
             features.append("stream_drafts")
+        if self.tts_enabled:
+            features.append("tts")
         return features

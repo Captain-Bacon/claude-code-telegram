@@ -88,8 +88,8 @@ def deps():
     }
 
 
-def test_agentic_registers_8_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, model, restart, stop commands."""
+def test_agentic_registers_9_commands(agentic_settings, deps):
+    """Agentic mode registers start, new, status, verbose, repo, model, restart, stop, speak commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -106,7 +106,7 @@ def test_agentic_registers_8_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 8
+    assert len(cmd_handlers) == 9
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
@@ -115,6 +115,7 @@ def test_agentic_registers_8_commands(agentic_settings, deps):
     assert frozenset({"model"}) in commands
     assert frozenset({"restart"}) in commands
     assert frozenset({"stop"}) in commands
+    assert frozenset({"speak"}) in commands
 
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
@@ -145,11 +146,11 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 8 bot commands."""
+    """Agentic mode returns 9 bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 8
+    assert len(commands) == 9
     cmd_names = [c.command for c in commands]
     assert cmd_names == [
         "start",
@@ -160,6 +161,7 @@ async def test_agentic_bot_commands(agentic_settings, deps):
         "model",
         "restart",
         "stop",
+        "speak",
     ]
 
 
@@ -1291,7 +1293,9 @@ class TestMediaQueuesWhenBusy:
 
         on_busy = AsyncMock()
 
-        with patch("src.bot.media_handlers.deliver_turn_result", new_callable=AsyncMock):
+        with patch(
+            "src.bot.media_handlers.deliver_turn_result", new_callable=AsyncMock
+        ):
             await _handle_media_message(
                 settings=agentic_settings,
                 update=update,

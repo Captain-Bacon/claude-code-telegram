@@ -261,6 +261,10 @@ async def deliver_turn_result(
             else:
                 formatted_messages.append(FormattedMessage(ctx_warn, parse_mode="HTML"))
 
+    # Cache raw response text for /speak command
+    if claude_response is not None and error_messages is None:
+        context.user_data["_last_bot_response"] = claude_response.content
+
     # Finalize progress message — always edit to final state
     elapsed = int(time.time() - start_time)
     try:

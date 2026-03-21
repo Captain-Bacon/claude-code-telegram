@@ -222,6 +222,21 @@ class Settings(BaseSettings):
         ge=1,
         le=200,
     )
+    # Text-to-speech (/speak command)
+    enable_tts: bool = Field(
+        False, description="Enable /speak command for text-to-speech"
+    )
+    tts_model: str = Field(
+        "mlx-community/chatterbox-4bit",
+        description="mlx-audio TTS model identifier (swappable via config)",
+    )
+    tts_max_text_length: int = Field(
+        4000,
+        description="Maximum text length for TTS synthesis (characters)",
+        ge=100,
+        le=10000,
+    )
+
     agentic_mode: bool = Field(
         True,
         description="Conversational agentic mode (default) vs classic command mode",

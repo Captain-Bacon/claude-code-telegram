@@ -76,7 +76,7 @@ context.bot_data["security_validator"]
 - `src/bot/orchestrator.py` -- MessageOrchestrator: handler registration, commands, agentic_text, message queuing, thread routing
 - `src/bot/delivery.py` -- Response delivery: turn result formatting, image sending, context warnings, stall callback factory
 - `src/bot/media_handlers.py` -- Telegram-facing document/photo/voice handlers (routes to media/ for processing)
-- `src/bot/media/` -- Voice transcription (Parakeet MLX), image processing
+- `src/bot/media/` -- Voice transcription (Parakeet MLX), image processing, TTS synthesis (mlx-audio)
 - `src/bot/middleware/` -- Auth, rate limit, security input validation
 - `src/bot/stream_handler.py` -- `StreamSession` class: callable stream callback with `text_was_sent`, `flush_succeeded` properties and `flush_pending()`, `delete_thinking()` methods. `make_stream_callback()` returns `StreamSession` (not `Optional[Callable]`). All three turn paths (agentic_text, _drain_queue, _handle_media_message) share the same pattern.
 - `src/bot/utils/` -- Formatting (HTML escape, message chunking), error formatting, `HeartbeatPin` (pinned liveness message during turns)
@@ -113,7 +113,9 @@ Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). 0 = quiet, 1 = tool na
 
 Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`mistral`|`openai`|`parakeet`, default `mistral`), `MISTRAL_API_KEY`, `OPENAI_API_KEY`, `PARAKEET_MODEL`. Parakeet runs locally on Apple Silicon via MLX — no API key needed. Implementation in `src/bot/media/voice_handler.py`.
 
-Feature flags in `src/config/features.py` control: MCP, voice messages, API server, scheduler, heartbeat pin, stream drafts.
+Text-to-speech: `ENABLE_TTS` (default false), `TTS_MODEL` (default `mlx-community/chatterbox-4bit`), `TTS_MAX_TEXT_LENGTH` (default 4000). Requires `pip install "claude-code-telegram[tts]"` (mlx-audio). Local Apple Silicon inference via mlx-audio. Implementation in `src/bot/media/tts_handler.py`, text adaptation in `src/bot/media/text_adapter.py`.
+
+Feature flags in `src/config/features.py` control: MCP, voice messages, API server, scheduler, heartbeat pin, stream drafts, TTS.
 
 ### DateTime Convention
 
@@ -130,7 +132,7 @@ All datetimes use timezone-aware UTC: `datetime.now(UTC)` (not `datetime.utcnow(
 
 ## Adding a New Bot Command
 
-Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`, `/stop`. If `ENABLE_PROJECT_THREADS=true`: `/sync_topics`.
+Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`, `/stop`, `/speak`. If `ENABLE_PROJECT_THREADS=true`: `/sync_topics`.
 
 1. Add handler function in `src/bot/orchestrator.py`
 2. Register in `MessageOrchestrator._register_agentic_handlers()`

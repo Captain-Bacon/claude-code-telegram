@@ -53,11 +53,11 @@ from .stream_handler import (
     make_stream_callback,
 )
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
-from .utils.heartbeat_pin import HeartbeatPin
 from .utils.error_format import (
     _format_error_message,
     _update_working_directory_from_claude_response,
 )
+from .utils.heartbeat_pin import HeartbeatPin
 from .utils.html_format import escape_html
 from .utils.image_extractor import ImageAttachment
 
@@ -475,6 +475,7 @@ class MessageOrchestrator:
             ("model", self.agentic_model),
             ("restart", restart_command),
             ("stop", self.agentic_stop),
+            ("speak", self.agentic_speak),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_topics", sync_topics))
@@ -552,6 +553,7 @@ class MessageOrchestrator:
             BotCommand("model", "Switch Claude model"),
             BotCommand("restart", "Restart the bot"),
             BotCommand("stop", "Cancel the current Claude request"),
+            BotCommand("speak", "Read last response aloud"),
         ]
         if self.settings.enable_project_threads:
             commands.append(BotCommand("sync_topics", "Sync project topics"))
@@ -802,6 +804,72 @@ class MessageOrchestrator:
             discarded_queued=len(queued),
         )
 
+    async def agentic_speak(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Convert the last bot response to speech and send as voice message."""
+        assert update.message is not None
+
+        from ..config.features import FeatureFlags
+
+        if not FeatureFlags(self.settings).tts_enabled:
+            await update.message.reply_text(
+                "Text-to-speech is not available. "
+                "Set ENABLE_TTS=true and install mlx-audio: "
+                'pip install "claude-code-telegram[tts]"'
+            )
+            return
+
+        last_response = context.user_data.get("_last_bot_response")
+        if not last_response:
+            await update.message.reply_text(
+                "No recent response to speak. Send a message first, then /speak."
+            )
+            return
+
+        from .media.text_adapter import adapt_for_speech
+        from .media.tts_handler import TTSHandler
+
+        chat = update.message.chat
+        await chat.send_action("record_voice")
+        progress_msg = await update.message.reply_text("Generating speech...")
+
+        try:
+            adapted_text = adapt_for_speech(
+                last_response,
+                max_length=self.settings.tts_max_text_length,
+            )
+
+            if not adapted_text.strip():
+                await progress_msg.edit_text(
+                    "Nothing to speak \u2014 the response was all code/tables."
+                )
+                return
+
+            tts = TTSHandler(config=self.settings)
+            result = await tts.synthesise(adapted_text)
+
+            await progress_msg.edit_text("Sending voice message...")
+
+            await chat.send_voice(
+                voice=result.audio_bytes,
+                duration=int(result.duration_seconds),
+                reply_to_message_id=update.message.message_id,
+            )
+
+            await progress_msg.delete()
+
+        except Exception as e:
+            logger.error(
+                "TTS synthesis failed",
+                error=str(e),
+                user_id=update.effective_user.id,
+            )
+            await progress_msg.edit_text(
+                f"Speech generation failed: {escape_html(str(e)[:200])}",
+                parse_mode="HTML",
+            )
+
     # ------------------------------------------------------------------
     # Message queuing (ceq) — queue messages while Claude is busy
     # ------------------------------------------------------------------
@@ -813,6 +881,7 @@ class MessageOrchestrator:
 
         Returns an async callable: (state_key, prompt, images, placeholder_id) -> None
         """
+
         async def _on_busy(
             state_key: str,
             prompt: str,
@@ -947,13 +1016,17 @@ class MessageOrchestrator:
             start_time = time.time()
             mcp_images: List[ImageAttachment] = []
 
-            heartbeat_pin = HeartbeatPin(
-                bot=context.bot,  # type: ignore[union-attr]
-                chat_id=chat.id,
-                message_thread_id=(
-                    update.message.message_thread_id if update.message else None
-                ),
-            ) if self.settings.enable_heartbeat_pin else None
+            heartbeat_pin = (
+                HeartbeatPin(
+                    bot=context.bot,  # type: ignore[union-attr]
+                    chat_id=chat.id,
+                    message_thread_id=(
+                        update.message.message_thread_id if update.message else None
+                    ),
+                )
+                if self.settings.enable_heartbeat_pin
+                else None
+            )
 
             on_stream = make_stream_callback(
                 self.settings,
@@ -1115,11 +1188,15 @@ class MessageOrchestrator:
             )
 
         # Pinned heartbeat showing live tool activity
-        heartbeat_pin = HeartbeatPin(
-            bot=context.bot,
-            chat_id=chat.id,
-            message_thread_id=update.message.message_thread_id,
-        ) if self.settings.enable_heartbeat_pin else None
+        heartbeat_pin = (
+            HeartbeatPin(
+                bot=context.bot,
+                chat_id=chat.id,
+                message_thread_id=update.message.message_thread_id,
+            )
+            if self.settings.enable_heartbeat_pin
+            else None
+        )
 
         on_stream = make_stream_callback(
             self.settings,
