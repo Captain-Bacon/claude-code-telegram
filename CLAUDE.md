@@ -132,7 +132,7 @@ All datetimes use timezone-aware UTC: `datetime.now(UTC)` (not `datetime.utcnow(
 
 ## Adding a New Bot Command
 
-Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`, `/stop`, `/speak`. If `ENABLE_PROJECT_THREADS=true`: `/sync_topics`.
+Commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`, `/model`, `/restart`, `/stop`, `/speak`, `/checkin`. If `ENABLE_PROJECT_THREADS=true`: `/sync_topics`.
 
 1. Add handler function in `src/bot/orchestrator.py`
 2. Register in `MessageOrchestrator._register_agentic_handlers()`

@@ -9,6 +9,7 @@ orchestrator instance state (_message_queues, _state_key).
 
 import asyncio
 import os
+import shutil
 import signal
 import time
 from dataclasses import dataclass
@@ -62,6 +63,28 @@ from .utils.html_format import escape_html
 from .utils.image_extractor import ImageAttachment
 
 logger = structlog.get_logger()
+
+_CHECKIN_PROMPT = """\
+Shift into PA mode. This is a check-in — the user wants a status picture.
+
+Review whatever data you have access to:
+- Inbox and email summaries
+- Outstanding tasks and reminders
+- Upcoming deadlines or scheduled items
+- Anything flagged or overdue
+
+Be concise and actionable. Lead with what needs attention, then what's informational. \
+Skip anything with no updates. If data sources are unavailable or stale, say so briefly \
+rather than guessing.
+
+{sync_context}"""
+
+
+def _build_checkin_prompt(sync_context: str) -> str:
+    """Build the PA check-in prompt, optionally with sync status."""
+    return _CHECKIN_PROMPT.format(
+        sync_context=sync_context if sync_context else ""
+    ).strip()
 
 
 @dataclass
@@ -476,6 +499,7 @@ class MessageOrchestrator:
             ("restart", restart_command),
             ("stop", self.agentic_stop),
             ("speak", self.agentic_speak),
+            ("checkin", self.agentic_checkin),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_topics", sync_topics))
@@ -554,6 +578,7 @@ class MessageOrchestrator:
             BotCommand("restart", "Restart the bot"),
             BotCommand("stop", "Cancel the current Claude request"),
             BotCommand("speak", "Read last response aloud"),
+            BotCommand("checkin", "PA check-in (add 'sync' for fresh data)"),
         ]
         if self.settings.enable_project_threads:
             commands.append(BotCommand("sync_topics", "Sync project topics"))
@@ -869,6 +894,196 @@ class MessageOrchestrator:
                 f"Speech generation failed: {escape_html(str(e)[:200])}",
                 parse_mode="HTML",
             )
+
+    async def _run_pa_sync(self) -> str:
+        """Run pa-sync and return status context for the checkin prompt.
+
+        Every code path returns a string (never raises) so the checkin
+        always proceeds regardless of sync outcome.
+        """
+        if not shutil.which("pa-sync"):
+            return "[pa-sync not found on PATH — skipping sync, using existing data]"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pa-sync",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=60.0
+            )
+
+            if proc.returncode == 0:
+                return "[Data sync completed successfully]"
+            else:
+                snippet = stderr.decode("utf-8", errors="replace")[:200]
+                return (
+                    f"[pa-sync exited with code {proc.returncode}: "
+                    f"{snippet} — proceeding with existing data]"
+                )
+        except asyncio.TimeoutError:
+            return "[pa-sync timed out after 60s — proceeding with existing data]"
+        except Exception as e:
+            return f"[pa-sync failed: {str(e)[:150]} — proceeding with existing data]"
+
+    async def agentic_checkin(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Activate PA mode — review tasks, inbox, reminders."""
+        assert update.message is not None
+        assert update.effective_user is not None
+
+        user_id = update.effective_user.id
+        args = update.message.text.split()[1:] if update.message.text else []
+        do_sync = len(args) > 0 and args[0].lower() == "sync"
+
+        chat = update.message.chat
+        await chat.send_action("typing")
+
+        persistent_manager: Optional[PersistentClientManager] = context.bot_data.get(  # type: ignore[union-attr]
+            "persistent_manager"
+        )
+        if not persistent_manager:
+            await update.message.reply_text(
+                "Claude integration not available. Check configuration."
+            )
+            return
+
+        state_key = self._state_key(update)
+
+        # Run sync before busy check so the full prompt (with sync result)
+        # gets queued if Claude happens to be busy.
+        sync_context = ""
+        if do_sync:
+            sync_context = await self._run_pa_sync()
+
+        prompt = _build_checkin_prompt(sync_context)
+
+        # Check state AFTER sync — avoids stale state when sync takes time.
+        client_state = persistent_manager.get_client_state(state_key)
+        if client_state in ("busy", "draining"):
+            await self._enqueue_message(
+                state_key=state_key,
+                message_text=prompt,
+                update=update,
+            )
+            return
+
+        verbose_level = _get_verbose_level(self.settings, context)
+        progress_msg = await update.message.reply_text(
+            "Syncing and checking in..." if do_sync else "Checking in..."
+        )
+
+        current_dir = context.user_data.get(  # type: ignore[union-attr]
+            "current_directory", self.settings.approved_directory
+        )
+
+        tool_log: List[Dict[str, Any]] = []
+        start_time = time.time()
+        mcp_images: List[ImageAttachment] = []
+
+        heartbeat_pin = (
+            HeartbeatPin(
+                bot=context.bot,
+                chat_id=chat.id,
+                message_thread_id=update.message.message_thread_id,
+            )
+            if self.settings.enable_heartbeat_pin
+            else None
+        )
+
+        on_stream = make_stream_callback(
+            self.settings,
+            verbose_level,
+            progress_msg,
+            tool_log,
+            start_time,
+            mcp_images=mcp_images,
+            approved_directory=self.settings.approved_directory,
+            draft_streamer=None,
+            telegram_update=update,
+            heartbeat_pin=heartbeat_pin,
+        )
+
+        on_stall = make_stall_callback(progress_msg)
+
+        error_messages = None
+        claude_response = None
+        success = True
+        try:
+            claude_response = await persistent_manager.send_message(
+                state_key=state_key,
+                prompt=prompt,
+                working_directory=current_dir,
+                stream_callback=on_stream,
+                stall_callback=on_stall,
+                model=context.user_data.get("claude_model"),  # type: ignore[union-attr]
+            )
+
+            if claude_response is None:
+                if heartbeat_pin:
+                    try:
+                        await heartbeat_pin.cleanup()
+                    except Exception:
+                        pass
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                return
+
+            context.user_data["claude_session_id"] = claude_response.session_id  # type: ignore[index]
+            _update_working_directory_from_claude_response(
+                claude_response, context, self.settings, user_id
+            )
+
+        except asyncio.CancelledError:
+            success = False
+            from .utils.formatting import FormattedMessage
+
+            error_messages = [FormattedMessage("Stopped.", parse_mode="HTML")]
+        except Exception as e:
+            success = False
+            from .utils.formatting import FormattedMessage
+
+            error_messages = [
+                FormattedMessage(_format_error_message(e), parse_mode="HTML")
+            ]
+        finally:
+            if heartbeat_pin:
+                try:
+                    await heartbeat_pin.cleanup()
+                except Exception:
+                    pass
+            try:
+                await flush_stream_callback(on_stream)
+            except Exception:
+                pass
+
+        await deliver_turn_result(
+            settings=self.settings,
+            update=update,
+            context=context,
+            claude_response=claude_response,
+            on_stream=on_stream,
+            progress_msg=progress_msg,
+            start_time=start_time,
+            mcp_images=mcp_images,
+            success=success,
+            error_messages=error_messages,
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")  # type: ignore[union-attr]
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="checkin",
+                args=["sync"] if do_sync else [],
+                success=success,
+            )
+
+        await self._drain_queue(state_key, update, context)
 
     # ------------------------------------------------------------------
     # Message queuing (ceq) — queue messages while Claude is busy
