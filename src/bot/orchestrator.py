@@ -9,7 +9,6 @@ orchestrator instance state (_message_queues, _state_key).
 
 import asyncio
 import os
-import shutil
 import signal
 import time
 from dataclasses import dataclass
@@ -77,13 +76,21 @@ Be concise and actionable. Lead with what needs attention, then what's informati
 Skip anything with no updates. If data sources are unavailable or stale, say so briefly \
 rather than guessing.
 
-{sync_context}"""
+{sync_data}"""
 
 
-def _build_checkin_prompt(sync_context: str) -> str:
-    """Build the PA check-in prompt, optionally with sync status."""
+def _read_sync_summary(sync_engine_dir: str) -> str:
+    """Read the sync engine's session summary if available."""
+    summary_path = Path(sync_engine_dir) / "deltas" / ".session-summary.md"
+    if summary_path.exists():
+        return summary_path.read_text().strip()
+    return ""
+
+
+def _build_checkin_prompt(sync_data: str) -> str:
+    """Build the PA check-in prompt, including sync data if available."""
     return _CHECKIN_PROMPT.format(
-        sync_context=sync_context if sync_context else ""
+        sync_data=sync_data if sync_data else ""
     ).strip()
 
 
@@ -895,37 +902,46 @@ class MessageOrchestrator:
                 parse_mode="HTML",
             )
 
-    async def _run_pa_sync(self) -> str:
-        """Run pa-sync and return status context for the checkin prompt.
+    async def _run_sync_engine(self) -> bool:
+        """Run the sync engine's session-sync.sh script.
 
-        Every code path returns a string (never raises) so the checkin
-        always proceeds regardless of sync outcome.
+        Returns True on success, False on any failure. Never raises.
         """
-        if not shutil.which("pa-sync"):
-            return "[pa-sync not found on PATH — skipping sync, using existing data]"
+        sync_dir = self.settings.sync_engine_dir
+        if not sync_dir:
+            return False
+
+        script = Path(sync_dir) / "session-sync.sh"
+        if not script.exists():
+            logger.warning("Sync script not found", path=str(script))
+            return False
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "pa-sync",
+                str(script),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=str(sync_dir),
             )
-            stdout, stderr = await asyncio.wait_for(
+            _stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=60.0
             )
 
-            if proc.returncode == 0:
-                return "[Data sync completed successfully]"
-            else:
+            if proc.returncode != 0:
                 snippet = stderr.decode("utf-8", errors="replace")[:200]
-                return (
-                    f"[pa-sync exited with code {proc.returncode}: "
-                    f"{snippet} — proceeding with existing data]"
+                logger.warning(
+                    "Sync engine failed",
+                    returncode=proc.returncode,
+                    stderr=snippet,
                 )
+                return False
+            return True
         except asyncio.TimeoutError:
-            return "[pa-sync timed out after 60s — proceeding with existing data]"
+            logger.warning("Sync engine timed out after 60s")
+            return False
         except Exception as e:
-            return f"[pa-sync failed: {str(e)[:150]} — proceeding with existing data]"
+            logger.warning("Sync engine error", error=str(e)[:150])
+            return False
 
     async def agentic_checkin(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -951,14 +967,28 @@ class MessageOrchestrator:
             return
 
         state_key = self._state_key(update)
+        sync_dir = self.settings.sync_engine_dir
 
-        # Run sync before busy check so the full prompt (with sync result)
-        # gets queued if Claude happens to be busy.
-        sync_context = ""
+        # Run sync before busy check so fresh data gets queued if
+        # Claude happens to be busy.
+        sync_status = ""
         if do_sync:
-            sync_context = await self._run_pa_sync()
+            if not sync_dir:
+                sync_status = "[Sync not configured — set SYNC_ENGINE_DIR]"
+            elif await self._run_sync_engine():
+                sync_status = "[Data synced successfully]"
+            else:
+                sync_status = "[Sync failed — using existing data]"
 
-        prompt = _build_checkin_prompt(sync_context)
+        # Read the summary file (available in both modes if sync
+        # engine has run at least once before).
+        sync_data = ""
+        if sync_dir:
+            sync_data = _read_sync_summary(sync_dir)
+        if sync_status:
+            sync_data = f"{sync_status}\n\n{sync_data}".strip()
+
+        prompt = _build_checkin_prompt(sync_data)
 
         # Check state AFTER sync — avoids stale state when sync takes time.
         client_state = persistent_manager.get_client_state(state_key)

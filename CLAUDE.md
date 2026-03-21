@@ -115,6 +115,8 @@ Voice transcription: `ENABLE_VOICE_MESSAGES` (default true), `VOICE_PROVIDER` (`
 
 Text-to-speech: `ENABLE_TTS` (default false), `TTS_MODEL` (default `mlx-community/chatterbox-4bit`), `TTS_MAX_TEXT_LENGTH` (default 4000). Requires `pip install "claude-code-telegram[tts]"` (mlx-audio). Local Apple Silicon inference via mlx-audio. Implementation in `src/bot/media/tts_handler.py`, text adaptation in `src/bot/media/text_adapter.py`.
 
+Sync engine: `SYNC_ENGINE_DIR` (optional, path to sync-engine directory). Required for `/checkin sync` to pull fresh email/calendar/tasks data. Points to the directory containing `session-sync.sh` and `deltas/`. Without it, `/checkin` still works but only reviews what's already in the workspace.
+
 Feature flags in `src/config/features.py` control: MCP, voice messages, API server, scheduler, heartbeat pin, stream drafts, TTS.
 
 ### DateTime Convention

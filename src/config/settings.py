@@ -237,6 +237,12 @@ class Settings(BaseSettings):
         le=10000,
     )
 
+    sync_engine_dir: Optional[str] = Field(
+        None,
+        description="Path to sync-engine directory (session-sync.sh, deltas/). "
+        "Required for /checkin sync. If unset, sync is unavailable.",
+    )
+
     agentic_mode: bool = Field(
         True,
         description="Conversational agentic mode (default) vs classic command mode",
