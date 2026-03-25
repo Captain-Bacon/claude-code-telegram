@@ -28,7 +28,7 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import StreamEvent
 
 from .exceptions import ClaudeProcessError
-from .sdk_integration import ClaudeSDKManager, ClaudeResponse, StreamUpdate
+from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 
 logger = structlog.get_logger()
 
@@ -210,11 +210,28 @@ class PersistentClientManager:
             await self._disconnect_entry(entry)
             entry = None
 
+        # Detect zombie: collector died but entry wasn't cleaned up
+        if entry is not None and entry.collector_task and entry.collector_task.done():
+            exc = (
+                entry.collector_task.exception()
+                if not entry.collector_task.cancelled()
+                else None
+            )
+            logger.warning(
+                "client.zombie_detected",
+                state_key=state_key,
+                collector_exception=str(exc) if exc else "none",
+                state=entry.state,
+                session_id=entry.session_id,
+            )
+            if entry.session_id:
+                self._saved_sessions[state_key] = entry.session_id
+            self._clients.pop(state_key, None)
+            entry = None
+
         # Create client if needed
         if entry is None:
-            entry = await self._create_client(
-                state_key, working_directory, model=model
-            )
+            entry = await self._create_client(state_key, working_directory, model=model)
 
         # Lock the state-check → query() section to prevent race
         # between concurrent send_message calls on the same entry.
@@ -395,7 +412,10 @@ class PersistentClientManager:
                         transport = getattr(proc, "_transport", None)
                         if transport:
                             subprocess_proc = getattr(transport, "_process", None)
-                            if subprocess_proc and subprocess_proc.returncode is not None:
+                            if (
+                                subprocess_proc
+                                and subprocess_proc.returncode is not None
+                            ):
                                 cli_alive = False
                 except Exception:
                     pass  # Best effort — don't crash the watchdog
@@ -446,8 +466,7 @@ class PersistentClientManager:
         to_remove = [
             key
             for key, entry in self._clients.items()
-            if entry.state == "idle"
-            and (now - entry.last_activity) > max_idle_seconds
+            if entry.state == "idle" and (now - entry.last_activity) > max_idle_seconds
         ]
         for key in to_remove:
             entry = self._clients.get(key)
@@ -529,7 +548,11 @@ class PersistentClientManager:
 
         # Log what we're actually sending to the CLI subprocess
         sys_prompt = getattr(options, "system_prompt", None)
-        sys_prompt_type = "preset+append" if isinstance(sys_prompt, dict) else "string" if isinstance(sys_prompt, str) else "none"
+        sys_prompt_type = (
+            "preset+append"
+            if isinstance(sys_prompt, dict)
+            else "string" if isinstance(sys_prompt, str) else "none"
+        )
         logger.info(
             "client.created",
             state_key=state_key,
@@ -598,13 +621,19 @@ class PersistentClientManager:
                 except MessageParseError as e:
                     # Promoted to INFO — unparseable messages include
                     # rate_limit_event and other signals we must not ignore
-                    raw_keys = list(raw_data.keys()) if isinstance(raw_data, dict) else [type(raw_data).__name__]
+                    raw_keys = (
+                        list(raw_data.keys())
+                        if isinstance(raw_data, dict)
+                        else [type(raw_data).__name__]
+                    )
                     logger.info(
                         "sdk.unparseable",
                         state_key=entry.state_key,
                         error=str(e),
                         raw_keys=raw_keys,
-                        raw_type=raw_data.get("type") if isinstance(raw_data, dict) else None,
+                        raw_type=(
+                            raw_data.get("type") if isinstance(raw_data, dict) else None
+                        ),
                         msg_num=msg_count,
                     )
                     continue
@@ -705,7 +734,11 @@ class PersistentClientManager:
                         state=entry.state,
                         pending_turns=entry.pending_turns,
                         content_summary=content_summary,
-                        raw_keys=list(raw_data.keys()) if isinstance(raw_data, dict) else None,
+                        raw_keys=(
+                            list(raw_data.keys())
+                            if isinstance(raw_data, dict)
+                            else None
+                        ),
                     )
 
                 # Collect message for response building
@@ -713,6 +746,23 @@ class PersistentClientManager:
                     turn.messages.append(message)
                     if isinstance(message, ResultMessage):
                         turn.result_raw_data.update(raw_data)
+
+            # Loop ended normally — CLI exited cleanly without raising.
+            # This is the silent death path: no exception, no cancellation,
+            # the subprocess just stopped producing messages.
+            logger.warning(
+                "collector.ended",
+                state_key=entry.state_key,
+                messages_processed=msg_count,
+                state=entry.state,
+                pending_turns=entry.pending_turns,
+                has_turn=entry.current_turn is not None,
+                session_id=entry.session_id,
+            )
+            await self._handle_client_death(
+                entry,
+                RuntimeError("CLI subprocess exited cleanly (iterator exhausted)"),
+            )
 
         except asyncio.CancelledError:
             logger.info(
@@ -760,9 +810,17 @@ class PersistentClientManager:
             entry.pending_turns = 0
             entry._injection_count = 0
 
-            # Extract session_id if present
+            # Extract session_id if present, detect unexpected changes
             result_session_id = getattr(result, "session_id", None)
             if result_session_id:
+                if entry.session_id and entry.session_id != result_session_id:
+                    logger.warning(
+                        "session.changed",
+                        state_key=entry.state_key,
+                        old_session_id=entry.session_id,
+                        new_session_id=result_session_id,
+                        context="drain_completion",
+                    )
                 entry.session_id = result_session_id
 
             logger.info(
@@ -782,18 +840,25 @@ class PersistentClientManager:
             return
 
         # Build the response
-        response = self._build_persistent_response(
-            entry, turn, result, raw_data
-        )
+        response = self._build_persistent_response(entry, turn, result, raw_data)
 
         # Update entry state
         entry.pending_turns = max(0, entry.pending_turns - 1)
         entry.last_activity = time.time()
         entry._interrupted = False
 
-        # Extract session_id from first result
+        # Extract session_id, detect unexpected changes
         result_session_id = getattr(result, "session_id", None)
         if result_session_id:
+            if entry.session_id and entry.session_id != result_session_id:
+                logger.warning(
+                    "session.changed",
+                    state_key=entry.state_key,
+                    old_session_id=entry.session_id,
+                    new_session_id=result_session_id,
+                    context="turn_completion",
+                    api_calls=turn.api_call_count,
+                )
             entry.session_id = result_session_id
 
         # Resolve the turn's future
@@ -805,8 +870,14 @@ class PersistentClientManager:
             entry._watchdog_task.cancel()
 
         # Per-turn token summary — the key diagnostic for cost analysis
-        total_in = turn.total_input_tokens + turn.total_cache_read_tokens + turn.total_cache_creation_tokens
-        cache_pct = (turn.total_cache_read_tokens / total_in * 100) if total_in > 0 else 0
+        total_in = (
+            turn.total_input_tokens
+            + turn.total_cache_read_tokens
+            + turn.total_cache_creation_tokens
+        )
+        cache_pct = (
+            (turn.total_cache_read_tokens / total_in * 100) if total_in > 0 else 0
+        )
 
         # Decide next state: if injections occurred, expect continuation
         if entry._injection_count > 0:
@@ -970,11 +1041,7 @@ class PersistentClientManager:
 
         # Count turns
         num_turns = len(
-            [
-                m
-                for m in turn.messages
-                if isinstance(m, (UserMessage, AssistantMessage))
-            ]
+            [m for m in turn.messages if isinstance(m, (UserMessage, AssistantMessage))]
         )
 
         # Interrupted detection
@@ -1008,17 +1075,40 @@ class PersistentClientManager:
         if entry._drain_timeout_task and not entry._drain_timeout_task.done():
             entry._drain_timeout_task.cancel()
 
+        # Extract subprocess exit code for diagnostics
+        exit_code = None
+        try:
+            proc = getattr(entry.client, "_query", None)
+            if proc:
+                transport = getattr(proc, "_transport", None)
+                if transport:
+                    subprocess_proc = getattr(transport, "_process", None)
+                    if subprocess_proc:
+                        exit_code = subprocess_proc.returncode
+        except Exception:
+            pass
+
         turn = entry.current_turn
         logger.error(
             "client.death",
             state_key=entry.state_key,
             error=str(error),
             error_type=type(error).__name__,
+            exit_code=exit_code,
             had_active_turn=turn is not None,
             last_message_type=turn.last_message_type if turn else None,
             api_calls_at_death=turn.api_call_count if turn else 0,
             elapsed_ms=int((time.time() - turn.started_at) * 1000) if turn else 0,
         )
+
+        # Save session_id so reconnection can attempt resume
+        if entry.session_id:
+            self._saved_sessions[entry.state_key] = entry.session_id
+            logger.info(
+                "Saved session for resume after death",
+                state_key=entry.state_key,
+                session_id=entry.session_id,
+            )
 
         error_response = PersistentResponse(
             content=f"Client error: {error}",
@@ -1064,7 +1154,9 @@ class PersistentClientManager:
                 content = getattr(message, "content", [])
                 if content and isinstance(content, list):
                     block_types = [type(b).__name__ for b in content]
-                    return f"{msg_type}: {len(content)} blocks ({', '.join(block_types)})"
+                    return (
+                        f"{msg_type}: {len(content)} blocks ({', '.join(block_types)})"
+                    )
                 return f"{msg_type}: empty"
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
@@ -1072,7 +1164,9 @@ class PersistentClientManager:
                 return f"{msg_type}: {length} chars"
             elif isinstance(message, ResultMessage):
                 result_text = getattr(message, "result", "")
-                return f"{msg_type}: result={len(result_text) if result_text else 0} chars"
+                return (
+                    f"{msg_type}: result={len(result_text) if result_text else 0} chars"
+                )
             elif isinstance(message, StreamEvent):
                 event = getattr(message, "event", None) or {}
                 return f"{msg_type}: {event.get('type', 'unknown')}"
